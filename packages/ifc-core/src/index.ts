@@ -20,6 +20,7 @@ export * from './topology/PolyMesh';
 export * from './topology/BooleanCSGKernel';
 export * from './topology/SweepKernel';
 export * from './topology/RevolveKernel';
+export * from './topology/OpeningVoidSolver';
 
 // Types and DTOs
 export * from './types/GuidUtils';

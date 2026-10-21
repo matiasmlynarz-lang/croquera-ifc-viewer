@@ -7,7 +7,7 @@
 
 import './styles/viewer.css';
 import * as THREE from 'three';
-import { Viewer3D, type RenderedElementRecord } from '@croquera/ifc-viewer';
+import { Viewer3D, type RenderedElementRecord, MaterialManager } from '@croquera/ifc-viewer';
 import { GuidSearchEngine } from '@croquera/ifc-viewer';
 import { MeasureTool, type MeasurementResult } from '@croquera/ifc-viewer';
 import { CroqueraBridge } from '@croquera/ifc-viewer';
@@ -268,7 +268,10 @@ async function loadIfcFile(file: File): Promise<void> {
   try {
     await workerCore.process(request, (response: IfcWorkerResponse) => {
       if (response.type === 'STAGE_SPATIAL_HIERARCHY') {
-        statusText.textContent = `Spatial hierarchy loaded (${response.spatialNodes.length} nodes).`;
+        if (response.materials && response.materials.length > 0) {
+          MaterialManager.getInstance().registerMaterials(response.materials);
+        }
+        statusText.textContent = `Spatial hierarchy loaded (${response.spatialNodes.length} nodes, ${response.materials?.length || 0} materials).`;
       } else if (response.type === 'STAGE_BOUNDS_AABB') {
         const boundsPayload = response as Stage2BoundsPayload;
         // Early camera auto-framing on overall model bounding box (< 500 ms)
@@ -322,6 +325,10 @@ function showElementProperties(el: RenderedElementRecord | null): void {
     <div class="prop-row">
       <span class="prop-label">STEP ID</span>
       <span class="prop-value">#${el.stepId}</span>
+    </div>
+    <div class="prop-row">
+      <span class="prop-label">Material</span>
+      <span class="prop-value">${el.mesh.userData?.materialId || 'Default Clay'}</span>
     </div>
   `;
 

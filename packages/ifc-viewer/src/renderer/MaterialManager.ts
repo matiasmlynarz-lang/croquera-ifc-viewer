@@ -13,9 +13,13 @@ import type { MaterialRecord } from '@croquera/ifc-core';
 export class MaterialManager {
   private static instance: MaterialManager | null = null;
   private materialCache: Map<string, THREE.Material> = new Map();
+  private materialRecordsMap: Map<string, MaterialRecord> = new Map();
 
   // Clay base architectural material
   private readonly defaultClayMaterial: THREE.MeshStandardMaterial;
+
+  // Opening translucent material (subtle cyan/sky volume)
+  private readonly openingMaterial: THREE.MeshStandardMaterial;
 
   // Selection highlight material (Croquera technical blue #2563EB)
   private readonly selectionMaterial: THREE.MeshStandardMaterial;
@@ -29,6 +33,16 @@ export class MaterialManager {
       roughness: 0.85,
       metalness: 0.05,
       side: THREE.FrontSide,
+    });
+
+    this.openingMaterial = new THREE.MeshStandardMaterial({
+      color: 0x38bdf8,
+      roughness: 0.5,
+      metalness: 0.1,
+      transparent: true,
+      opacity: 0.25,
+      depthWrite: false,
+      side: THREE.DoubleSide,
     });
 
     this.selectionMaterial = new THREE.MeshStandardMaterial({
@@ -57,8 +71,21 @@ export class MaterialManager {
     return MaterialManager.instance;
   }
 
+  public registerMaterials(materials: MaterialRecord[]): void {
+    for (const m of materials) {
+      if (m.id) {
+        this.materialRecordsMap.set(m.id, m);
+        this.getOrCreateMaterial(m);
+      }
+    }
+  }
+
   public getDefaultClay(): THREE.MeshStandardMaterial {
     return this.defaultClayMaterial;
+  }
+
+  public getOpeningMaterial(): THREE.MeshStandardMaterial {
+    return this.openingMaterial;
   }
 
   public getSelectionMaterial(): THREE.MeshStandardMaterial {
@@ -67,6 +94,18 @@ export class MaterialManager {
 
   public getHoverMaterial(): THREE.MeshStandardMaterial {
     return this.hoverMaterial;
+  }
+
+  public getMaterialById(materialId?: string | null): THREE.Material {
+    if (!materialId) return this.defaultClayMaterial;
+    const cached = this.materialCache.get(materialId);
+    if (cached) return cached;
+
+    const record = this.materialRecordsMap.get(materialId);
+    if (record) {
+      return this.getOrCreateMaterial(record);
+    }
+    return this.defaultClayMaterial;
   }
 
   public getOrCreateMaterial(record?: MaterialRecord | null): THREE.Material {

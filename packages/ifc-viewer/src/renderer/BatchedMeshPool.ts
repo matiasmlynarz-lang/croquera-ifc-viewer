@@ -67,7 +67,12 @@ export class BatchedMeshPool {
     });
 
     for (const el of elements) {
-      if (el.hidden || !el.positions || el.positions.length === 0) {
+      if (!el.positions || el.positions.length === 0) {
+        continue;
+      }
+
+      const isOpening = el.ifcType === 'IfcOpeningElement' || Boolean(el.isOpeningGeometry);
+      if (el.hidden && !isOpening) {
         continue;
       }
 
@@ -86,7 +91,15 @@ export class BatchedMeshPool {
 
       geometry.computeBoundingBox();
 
-      const mat = this.materialManager.getDefaultClay();
+      let mat: THREE.Material;
+      if (isOpening) {
+        mat = this.materialManager.getOpeningMaterial();
+      } else if (el.materialId) {
+        mat = this.materialManager.getMaterialById(el.materialId);
+      } else {
+        mat = this.materialManager.getDefaultClay();
+      }
+
       const mesh = new THREE.Mesh(geometry, mat);
       mesh.name = el.id;
       mesh.userData = {
@@ -98,6 +111,8 @@ export class BatchedMeshPool {
         parentId: el.parentId,
         storeyId: el.storeyId,
         psets: el.psets,
+        materialId: el.materialId,
+        isOpening,
       };
 
       if (el.transform && el.transform.length === 16) {

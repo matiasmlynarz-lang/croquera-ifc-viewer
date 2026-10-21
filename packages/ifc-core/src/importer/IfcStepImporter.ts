@@ -13,6 +13,7 @@ import { BooleanCSGKernel } from '../topology/BooleanCSGKernel';
 import { PolygonClipping } from '../topology/PolygonClipping';
 import { SweepKernel } from '../topology/SweepKernel';
 import { RevolveKernel } from '../topology/RevolveKernel';
+import { OpeningVoidSolver } from '../topology/OpeningVoidSolver';
 import { Vec3 } from '../math/Vec3';
 import { Plane } from '../math/Plane';
 import { GuidUtils } from '../types/GuidUtils';
@@ -1133,9 +1134,9 @@ export class IfcStepImporter {
             if (openingPolyMesh && openingPolyMesh.faces.size > 0) {
               const childGeoId = GuidUtils.createIfcGuid();
               const clonedMesh = openingPolyMesh.clone(childGeoId);
-              for (const f of clonedMesh.faces.values()) f.hidden = true;
+              for (const f of clonedMesh.faces.values()) f.hidden = false;
               clonedMesh.rebuildTopology();
-              for (const e of clonedMesh.edges.values()) e.hidden = true;
+              for (const e of clonedMesh.edges.values()) e.hidden = false;
 
               const geo = clonedMesh.toThreeGeometry();
               const edgeGeo = clonedMesh.toEdgeGeometry();
@@ -1184,7 +1185,7 @@ export class IfcStepImporter {
                 indices: new Uint32Array(0),
                 edgesBuffer: new Float32Array(0),
                 brepData: null,
-                hidden: true,
+                hidden: false,
               });
 
               currentChunkElements.push({
@@ -1202,7 +1203,7 @@ export class IfcStepImporter {
                 indices,
                 edgesBuffer,
                 brepData,
-                hidden: true,
+                hidden: false,
                 isOpeningGeometry: true,
                 openingGroupId: openingGroupEntity.id,
                 hostIds: hostGuid ? [hostGuid] : [],
@@ -1246,6 +1247,7 @@ export class IfcStepImporter {
               for (const child of children) {
                 if (child.polyMesh && child.polyMesh.faces.size > 0) {
                   const mesh = child.polyMesh;
+                  this.carveOpeningsIntoMesh(rec.id, mesh);
                   const geo = mesh.toThreeGeometry();
                   const edgeGeo = mesh.toEdgeGeometry();
                   const posAttr = geo.attributes.position;
@@ -1289,6 +1291,7 @@ export class IfcStepImporter {
               }
             } else if (rootEntity.polyMesh && rootEntity.polyMesh.faces.size > 0) {
               const mesh = rootEntity.polyMesh;
+              this.carveOpeningsIntoMesh(rec.id, mesh);
               const geo = mesh.toThreeGeometry();
               const edgeGeo = mesh.toEdgeGeometry();
               const posAttr = geo.attributes.position;
@@ -1361,6 +1364,29 @@ export class IfcStepImporter {
     }
 
     return allChunks;
+  }
+
+  /**
+   * Talla los vanos asociados (IfcOpeningElement) sobre la malla B-Rep del elemento anfitrión.
+   */
+  private carveOpeningsIntoMesh(hostStepId: number, hostMesh: PolyMesh): void {
+    const openingStepIds = this.hostToOpeningsStepMap.get(hostStepId);
+    if (!openingStepIds || openingStepIds.size === 0) return;
+
+    for (const opStepId of openingStepIds) {
+      const opRec = this.records.get(opStepId);
+      if (!opRec) continue;
+      const opEntity = this.rebuildProductEntity(opRec, null, this.elemPsetsMap.get(opStepId));
+      if (opEntity && opEntity.polyMesh && opEntity.polyMesh.faces.size > 0) {
+        OpeningVoidSolver.carveVoidIntoHost(
+          hostMesh,
+          opEntity.polyMesh,
+          opEntity.id,
+          new THREE.Matrix4(),
+          true
+        );
+      }
+    }
   }
 
   /**
