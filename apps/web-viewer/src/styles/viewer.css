@@ -1,0 +1,399 @@
+/* ==========================================================================
+   CROQUERA IFC VIEWER — Soft-Clay Neumorphic Design System (Pillar IV)
+   Zero informal graphics, strictly technical architectural UI.
+   ========================================================================== */
+
+:root {
+  --bg-primary: #f0f1f5;
+  --bg-surface: #f0f1f5;
+  --bg-elevated: #f8f9fc;
+  --text-primary: #1e293b;
+  --text-secondary: #64748b;
+  --text-muted: #94a3b8;
+  --accent-blue: #2563eb;
+  --accent-blue-hover: #1d4ed8;
+  --accent-red: #ef4444;
+  --border-subtle: #e2e8f0;
+
+  /* Neumorphic tactile shadows */
+  --shadow-elevated: 4px 4px 10px #d1d5db, -4px -4px 10px #ffffff;
+  --shadow-pressed: inset 2px 2px 5px #d1d5db, inset -2px -2px 5px #ffffff;
+  --shadow-floating: 8px 8px 20px #cbd5e1, -8px -8px 20px #ffffff;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  user-select: none;
+}
+
+body, html, #app {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ─── Main Layout ─────────────────────────────────────────────── */
+.viewer-layout {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.viewport-container {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+}
+
+/* ─── Top Floating HUD Bar ────────────────────────────────────── */
+.top-hud {
+  position: absolute;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  background: var(--bg-surface);
+  border-radius: 12px;
+  box-shadow: var(--shadow-floating);
+  border: 1px solid rgba(255, 255, 255, 0.7);
+}
+
+.app-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: var(--text-primary);
+  font-size: 12px;
+  text-transform: uppercase;
+  padding-right: 8px;
+  border-right: 1px solid var(--border-subtle);
+}
+
+.brand-icon {
+  width: 16px;
+  height: 16px;
+  fill: var(--accent-blue);
+}
+
+/* ─── Buttons & Inputs ────────────────────────────────────────── */
+.btn-tactile {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  background: var(--bg-surface);
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: 8px;
+  box-shadow: var(--shadow-elevated);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  outline: none;
+}
+
+.btn-tactile:hover {
+  transform: translateY(-1px);
+  color: var(--accent-blue);
+}
+
+.btn-tactile:active, .btn-tactile.active {
+  box-shadow: var(--shadow-pressed);
+  transform: translateY(0);
+  color: var(--accent-blue);
+}
+
+.btn-tactile.btn-accent {
+  background: var(--accent-blue);
+  color: #ffffff;
+  border: none;
+  box-shadow: 2px 2px 8px rgba(37, 99, 235, 0.35);
+}
+
+.btn-tactile.btn-accent:hover {
+  background: var(--accent-blue-hover);
+  color: #ffffff;
+}
+
+.btn-tactile.btn-accent:active {
+  box-shadow: inset 1px 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+.search-container {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.search-input {
+  width: 240px;
+  padding: 7px 12px 7px 32px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+  background: var(--bg-surface);
+  border: none;
+  border-radius: 8px;
+  box-shadow: var(--shadow-pressed);
+  outline: none;
+  transition: width 0.2s ease, box-shadow 0.2s ease;
+}
+
+.search-input:focus {
+  width: 320px;
+  box-shadow: inset 2px 2px 5px #cbd5e1, inset -2px -2px 5px #ffffff, 0 0 0 2px var(--accent-blue);
+}
+
+.search-icon {
+  position: absolute;
+  left: 10px;
+  width: 14px;
+  height: 14px;
+  fill: var(--text-muted);
+  pointer-events: none;
+}
+
+/* ─── Search Results Flyout ───────────────────────────────────── */
+.search-results-flyout {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  background: var(--bg-surface);
+  border-radius: 8px;
+  box-shadow: var(--shadow-floating);
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  max-height: 280px;
+  overflow-y: auto;
+  z-index: 20;
+  display: none;
+}
+
+.search-results-flyout.visible {
+  display: block;
+}
+
+.search-result-item {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.search-result-item:last-child {
+  border-bottom: none;
+}
+
+.search-result-item:hover {
+  background: #e2e8f0;
+}
+
+.result-name {
+  font-weight: 600;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.result-meta {
+  font-size: 10px;
+  color: var(--text-muted);
+  display: flex;
+  gap: 8px;
+}
+
+/* ─── Status & Benchmark HUD (Bottom-Left) ────────────────────── */
+.status-hud {
+  position: absolute;
+  bottom: 16px;
+  left: 16px;
+  z-index: 10;
+  padding: 8px 14px;
+  background: var(--bg-surface);
+  border-radius: 10px;
+  box-shadow: var(--shadow-elevated);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #10b981;
+}
+
+.status-dot.loading {
+  background: var(--accent-blue);
+  animation: pulse-dot 1s infinite alternate;
+}
+
+@keyframes pulse-dot {
+  from { opacity: 0.4; }
+  to { opacity: 1; }
+}
+
+/* ─── Element Properties Floating Card (Bottom-Right) ────────── */
+.properties-card {
+  position: absolute;
+  bottom: 16px;
+  right: 16px;
+  width: 320px;
+  max-height: 480px;
+  background: var(--bg-surface);
+  border-radius: 12px;
+  box-shadow: var(--shadow-floating);
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  z-index: 10;
+  display: none;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.properties-card.visible {
+  display: flex;
+}
+
+.card-header {
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--bg-elevated);
+}
+
+.card-title {
+  font-weight: 700;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.card-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.card-close:hover {
+  color: var(--text-primary);
+}
+
+.card-body {
+  padding: 12px 14px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.prop-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+}
+
+.prop-label {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.prop-value {
+  color: var(--text-primary);
+  font-weight: 600;
+  font-family: monospace;
+}
+
+.psets-section {
+  margin-top: 6px;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 6px;
+}
+
+.pset-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+/* ─── Measurement Badge (Center-Top under HUD) ────────────────── */
+.measurement-badge {
+  position: absolute;
+  top: 72px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-surface);
+  padding: 6px 14px;
+  border-radius: 8px;
+  box-shadow: var(--shadow-elevated);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent-red);
+  z-index: 10;
+  display: none;
+  border: 1px solid rgba(239, 68, 68, 0.2);
+}
+
+.measurement-badge.visible {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ─── Drag & Drop Overlay ─────────────────────────────────────── */
+.drop-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(240, 241, 245, 0.88);
+  backdrop-filter: blur(4px);
+  z-index: 100;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.drop-overlay.active {
+  display: flex;
+}
+
+.drop-box {
+  padding: 40px 60px;
+  background: var(--bg-surface);
+  border: 2px dashed var(--accent-blue);
+  border-radius: 16px;
+  box-shadow: var(--shadow-floating);
+  text-align: center;
+  font-weight: 600;
+  color: var(--accent-blue);
+  font-size: 15px;
+}

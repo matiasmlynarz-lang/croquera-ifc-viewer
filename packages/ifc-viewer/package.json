@@ -1,0 +1,35 @@
+{
+  "name": "@croquera/ifc-viewer",
+  "version": "0.1.0",
+  "description": "Buffer-first Three.js GPU rendering engine and tools for IFC models",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@croquera/ifc-core": "^0.1.0",
+    "three": "^0.174.0",
+    "three-mesh-bvh": "^0.9.15"
+  },
+  "devDependencies": {
+    "@types/three": "^0.174.0"
+  },
+  "keywords": [
+    "ifc-viewer",
+    "threejs",
+    "bim-viewer",
+    "webgl",
+    "mesh-bvh"
+  ],
+  "author": "Croquera Team",
+  "license": "Apache-2.0"
+}

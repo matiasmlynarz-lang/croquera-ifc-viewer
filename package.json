@@ -1,0 +1,22 @@
+{
+  "name": "croquera-ifc-viewer-monorepo",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=apps/web-viewer",
+    "build": "npm run build --workspaces",
+    "test": "vitest run",
+    "typecheck": "tsc --build --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/three": "^0.174.0",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.0",
+    "vitest": "^4.1.11"
+  }
+}
