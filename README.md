@@ -11,7 +11,7 @@
 > **One of the fastest web-based IFC viewers in the market.**  
 > *Uno de los visualizadores IFC en navegador más rápidos del mercado.*
 
-An ultra-performant, zero-dependency, open-source IFC 4.3 viewer designed for instant in-browser loading, zero-copy GPU tessellation, GUID search, and high-precision spatial measurements.
+An ultra-performant, 100% client-side, open-source IFC 4.3 viewer designed for instant in-browser loading, zero-copy GPU tessellation, GUID search, and high-precision spatial measurements.
 
 **Live Demo / Demostración en Vivo:**  
 [https://www.vivemejor.cl/croquera/viewer/](https://www.vivemejor.cl/croquera/viewer/)
@@ -36,20 +36,21 @@ Try it directly in your browser with zero installation:
 
 ### Performance & Benchmarks
 
-`croquera-ifc-viewer` prioritizes **early model availability and interactive responsiveness**, while recognizing that compiled native engines (such as IFCLite's Rust/WASM) offer higher raw throughput in pure geometric computation.
+> **Architectural Takeaway:** **Croquera prioritizes early model availability and interactive responsiveness; IFCLite delivers higher raw throughput in pure geometric computation.**
 
-For an interactive 3D viewer, the most critical user experience factor is how quickly the user can inspect, orbit, and navigate the model:
+For an interactive 3D web viewer, the most critical user experience factor is how quickly the user can inspect, orbit, and navigate the model envelope:
 
-| Model | File Size | Entities | STEP Ingestion & Indexing | Time-to-First-Frame (AABB) | Total End-to-End |
+| Model | File Size | Entities | STEP Ingestion (Index) | Time-to-First-Frame (Croquera AABB) | Total End-to-End |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **EmergenciaNorte_Base** *(Building)* | 4.81 MB | 80,397 | **Croquera: 25 ms** (12x faster)<br>IFCLite: 302 ms | **Croquera: 54 ms**<br>IFCLite: > 300 ms | **1.63 s** (Croquera)<br>1.48 s (IFCLite) |
-| **Luminarias_Original** *(MEP)* | 5.75 MB | 91,204 | **Croquera: 35 ms** (11.7x faster)<br>IFCLite: 410 ms | **Croquera: 3 ms**<br>IFCLite: > 400 ms | **358 ms** (Croquera)<br>506 ms (IFCLite) |
-| **model_6_arc** *(Architecture)* | 535.8 MB | 10,906,295 | **Croquera: 1.56 s** (24.2x faster)<br>IFCLite: 37.97 s | **Croquera: 76 ms** (Ready in 1.6 s)<br>IFCLite: > 38 s | **57.2 s** (Croquera)<br>55.2 s (IFCLite) |
-| **VespucioNorte** *(Infrastructure)* | 924.6 MB | 16,786,443 | **Croquera: 2.70 s** (22.1x faster)<br>IFCLite: 59.92 s | **Croquera: 470 ms** (Ready in 3.1 s)<br>IFCLite: > 60 s | **3.0 min** (Croquera)<br>2.9 min (IFCLite) |
+| **Hospital Facility** *(EmergenciaNorte)* | 4.81 MB | 80,397 | **Croquera: 25 ms** (12x faster)<br>IFCLite: 302 ms | **54 ms** | **1.63 s** (Croquera)<br>1.48 s (IFCLite) |
+| **MEP Array** *(Luminarias)* | 5.75 MB | 91,204 | **Croquera: 35 ms** (11.7x faster)<br>IFCLite: 410 ms | **3 ms** | **358 ms** (Croquera)<br>506 ms (IFCLite) |
+| **High-Rise Complex** *(model_6_arc)* | 535.8 MB | 10,906,295 | **Croquera: 1.56 s** (24.2x faster)<br>IFCLite: 37.97 s | **76 ms** (Ready in 1.6 s) | **57.2 s** (Croquera)<br>55.2 s (IFCLite) |
+| **Civil Highway** *(VespucioNorte)* | 924.6 MB | 16,786,443 | **Croquera: 2.70 s** (22.1x faster)<br>IFCLite: 59.92 s | **470 ms** (Ready in 3.1 s) | **3.0 min** (Croquera)<br>2.9 min (IFCLite) |
 
-> **Architectural Takeaway:** Croquera prioritizes early model availability; IFCLite offers higher raw throughput in pure geometric computation. By indexing gigabyte-scale models in 2.7 seconds instead of 60 seconds, Croquera delivers an interactive camera and spatial hierarchy almost immediately, while geometry streams progressively in the background.
->
-> *Note: Croquera outputs consolidated semantic elements (`IfcProduct`), whereas IFCLite emits granular batch primitives (`MeshData`). Full methodology and metrics in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).*
+> **Environment & Measurement Notice:**  
+> - **Execution Environment:** Measurements reflect isolated core engine execution in Node.js v24 (V8 CLI) under identical 64-bit hardware conditions. In-browser performance introduces WebGL GPU upload and multi-threaded Web Worker variables.
+> - **Time-to-First-Frame (TTFF):** Croquera pre-computes project-wide AABB bounds in 2 ms to 470 ms, enabling instant camera framing. IFCLite yields batches progressively; its first-batch latency was not isolated as a standalone metric in this CLI harness.
+> - **Metrics:** Croquera reports consolidated semantic products (`IfcProduct`), whereas IFCLite emits granular batch primitives (`MeshData`). Full methodology and details in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ### Packages
 - **`@croquera/ifc-core`**: Decoupled IFC 4.3 streaming parser, topological B-Rep solver, and geometry evaluation engine.
@@ -85,10 +86,10 @@ Pruébalo directamente en el navegador sin instalar dependencias:
 - **Puente Directo:** Botón "Editar en Croquera" para continuar modelando en [Croquera.com](https://croquera.com) con un solo clic.
 
 ### Rendimiento y Benchmarks
+- **Tesis de Diseño:** Croquera prioriza la disponibilidad temprana del modelo en pantalla; IFCLite ofrece mayor rendimiento en el cálculo geométrico puro.
 - **Ingesta ultrarrápida (22x a 24x más veloz):** `ChunkedStreamScanner` indexa 16,7 millones de entidades en **2,7 segundos** (frente a 60 s en parsers tradicionales).
-- **Cámara lista en segundos (Time-to-First-Frame):** Encuadre AABB instantáneo (< 500 ms promedio, 3,1 s sobre 1 GB) para que el usuario navegue de inmediato mientras las mallas se descargan en segundo plano.
-- **Perfil de Teselación:** Los motores nativos (Rust/WASM) calculan mallas triangulares 1,5x a 3,2x más rápido, pero la ingesta plana de Croquera absorbe esa diferencia logrando tiempos globales equivalentes y visualización instantánea.
-- Detalles metodológicos completos y comparativa de los 7 modelos en [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+- **Cámara lista en segundos (Time-to-First-Frame):** Encuadre AABB instantáneo (< 500 ms promedio, 3,1 s sobre 1 GB) para navegar el envolvente de inmediato mientras la geometría se descarga asíncronamente.
+- **Aviso de Entorno:** Medición sobre Node.js v24 (V8 CLI) en condiciones idénticas de 64 bits. Metodología documentada y comparativa en [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ---
 

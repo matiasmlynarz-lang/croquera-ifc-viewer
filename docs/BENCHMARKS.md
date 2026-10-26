@@ -1,6 +1,6 @@
 # Performance & Benchmarks — Croquera IFC Viewer vs. IFCLite
 
-This document provides a comprehensive, reproducible benchmark comparing the performance profile of **`croquera-ifc-viewer`** (`@croquera/ifc-core`) against **`ifclite`** (`@ifc-lite/parser` v9.6.0 and `@ifc-lite/geometry` v7.9.0 Rust/WASM) across models ranging from micro components (30 KB) to gigabyte-scale infrastructure (925 MB).
+This document provides a documented benchmark methodology and comparative performance analysis of **`croquera-ifc-viewer`** (`@croquera/ifc-core`) against **`ifclite`** (`@ifc-lite/parser` v9.6.0 and `@ifc-lite/geometry` v7.9.0 Rust/WASM) across models ranging from micro components (30 KB) to gigabyte-scale infrastructure (925 MB).
 
 ---
 
@@ -13,7 +13,7 @@ This document provides a comprehensive, reproducible benchmark comparing the per
 - **Early Interactive Availability (< 3.2 s on 1 GB):** Croquera extracts project-wide bounding boxes (AABB) and spatial references in **2 ms to 470 ms**. Even on a 924 MB highway model, the camera is positioned and the viewport is interactive in **3.1 seconds**, while geometry batches stream in progressively.
 - **22x–24x Faster STEP Parsing & Ingestion on Giant Models:** On datasets with over 10 to 16 million records (`model_6_arc.ifc` and `VespucioNorte.ifc`), Croquera's `ChunkedStreamScanner` indexes the complete file in **1.5 to 2.7 seconds**, compared to **38 to 60 seconds** required by traditional parsers.
 - **Pure Geometric Computation:** Compiled native engines (such as IFCLite's Rust/WASM kernel) execute pure mesh tessellation **1.5x to 3.2x faster** once parsed (17.3 s vs 55.6 s on 536 MB; 116.3 s vs 178.8 s on 925 MB).
-- **Fault-Tolerant Geometry Extraction:** Croquera reliably processes orphan components or direct BIM exports that lack explicit `IfcBuildingStorey` spatial containers, where other engines fail to emit geometry.
+- **Spatial Container Handling:** IFCLite requires products to be housed within standard `IfcBuildingStorey` spatial containers (emitting 0 meshes on isolated components like `Ventana_A.ifc`). Croquera processes valid B-Rep and CSG geometries regardless of spatial container hierarchy.
 
 ---
 
@@ -77,13 +77,13 @@ Traditional STEP parsers allocate dynamic objects or hash tables per entity. In 
 This enables scanning and indexing **6.2 million entities per second**, achieving a **22x to 24x speedup** over traditional WebAssembly tokenizers.
 
 ### 2. Time-to-First-Frame (TTFF)
-Users judge viewer responsiveness by how quickly the model appears on screen:
-- **Croquera 3-Stage Pipeline:**
-  1. `STAGE_BOUNDS_AABB` (< 100 ms average, 470 ms on 925 MB): The camera immediately frames the building envelope.
-  2. `STAGE_GEOMETRY_CHUNK`: Geometry batches stream directly into GPU memory with progressive progress updates.
-  3. `STAGE_INSTANCE_BATCH`: Instanced repetitions are drawn via `THREE.InstancedMesh`.
-- **Monolithic Parsers:**
-  Require completing the full entity parsing pass before yielding spatial coordinates, forcing the user to wait up to 60 seconds before seeing any visual feedback.
+- **Bounding Box Pre-Pass vs. Batch Streaming:**
+  - **Croquera 3-Stage Pipeline:**
+    1. `STAGE_BOUNDS_AABB` (< 100 ms average, 470 ms on 925 MB): The camera immediately frames the project envelope.
+    2. `STAGE_GEOMETRY_CHUNK`: Geometry batches stream directly into GPU memory with progressive progress updates.
+    3. `STAGE_INSTANCE_BATCH`: Instanced repetitions are drawn via `THREE.InstancedMesh`.
+  - **IFCLite Streaming Pipeline:**
+    Streams `MeshData` batches progressively as they are processed by the worker pool. First visual appearance depends on the initial parsing and worker scheduling.
 
 ### 3. Early Interactive Availability vs. Pure Geometric Throughput
 - **Geometric Computation:** In pure mesh calculation, IFCLite's Rust/WASM kernel exhibits higher raw tessellation throughput (1.5x to 3.2x faster than Croquera's TypeScript kernel on massive datasets).
@@ -91,9 +91,11 @@ Users judge viewer responsiveness by how quickly the model appears on screen:
 
 ---
 
-## Reproducing the Benchmark
+## Documented Methodology & Benchmark Harness
 
-The repository includes a dedicated benchmark CLI to reproduce these measurements:
+The measurements reported above were collected on real-world engineering projects (including hospital facilities and civil highway corridors). Because several of these datasets are proprietary project models, they are not bundled in this public repository.
+
+To allow developers to verify the methodology and execute benchmarks on their own local models, the repository includes a standalone CLI harness:
 
 ```bash
 # Clone the repository
@@ -103,9 +105,9 @@ cd croquera-ifc-viewer
 # Install dependencies
 npm install
 
-# Run benchmark on a specific IFC model
-npm run benchmark -- "path/to/model.ifc"
+# Run benchmark on any local IFC model
+npm run benchmark -- "path/to/your_model.ifc"
 
-# Run benchmark with expanded heap for massive files (> 500 MB)
-npm run benchmark:large -- "path/to/model.ifc"
+# Run benchmark with expanded heap for massive models (> 500 MB)
+npm run benchmark:large -- "path/to/your_large_model.ifc"
 ```
