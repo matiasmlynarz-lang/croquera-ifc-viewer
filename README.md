@@ -1,5 +1,13 @@
 # croquera-ifc-viewer
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/badge/Release-v0.1.0-brightgreen.svg)](https://github.com/matiasmlynarz-lang/croquera-ifc-viewer/releases)
+[![IFC Standard](https://img.shields.io/badge/IFC_Standard-4.3_%7C_2x3-00557f.svg)](https://technical.buildingsmart.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6.svg?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Three.js](https://img.shields.io/badge/Three.js-0.174-black.svg?logo=threedotjs&logoColor=white)](https://threejs.org/)
+[![Web Workers](https://img.shields.io/badge/Web_Workers-Multi--Threaded-6366F1.svg)](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API)
+[![Live Demo](https://img.shields.io/badge/Live_Demo-Online-2563EB.svg)](https://www.vivemejor.cl/croquera/viewer/)
+
 > **The fastest web-based IFC viewer in the market.**  
 > *El visualizador IFC en navegador más rápido del mercado.*
 
