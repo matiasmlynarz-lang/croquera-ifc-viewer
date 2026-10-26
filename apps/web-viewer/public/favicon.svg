@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <mask id="cutout">
+      <!-- 1. Base sólida blanca (deja pasar todo el color azul) -->
+      <rect width="512" height="512" fill="#FFFFFF"/>
+
+      <!-- 2. Hueco del centro (R = 88) -->
+      <circle cx="256" cy="256" r="88" fill="#000000"/>
+
+      <!-- 3. Canal horizontal hacia la derecha -->
+      <rect x="256" y="224" width="256" height="64" fill="#000000"/>
+
+      <!-- 4. Canal circular interior fino (ancho exacto de 15px) -->
+      <circle cx="256" cy="256" r="157.5" fill="none" stroke="#000000" stroke-width="15"/>
+
+      <!-- 5. Canal circular exterior fino (ancho exacto de 15px) -->
+      <circle cx="256" cy="256" r="232.5" fill="none" stroke="#000000" stroke-width="15"/>
+
+      <!-- 6. Corte diagonal a 45° que genera el palito/colita de la Q -->
+      <line x1="375" y1="375" x2="445" y2="445" stroke="#000000" stroke-width="15" stroke-linecap="square"/>
+    </mask>
+  </defs>
+
+  <!-- Círculo azul principal recortado con precisión matemática -->
+  <circle cx="256" cy="256" r="255" fill="#2563EB" mask="url(#cutout)"/>
+</svg>
