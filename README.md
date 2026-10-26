@@ -8,6 +8,8 @@ An ultra-performant, zero-dependency, open-source IFC 4.3 viewer designed for in
 **Live Demo / Demostración en Vivo:**  
 [https://www.vivemejor.cl/croquera/viewer/](https://www.vivemejor.cl/croquera/viewer/)
 
+![croquera-ifc-viewer Preview](docs/images/croquera-viewer-preview.png)
+
 ---
 
 ## English
