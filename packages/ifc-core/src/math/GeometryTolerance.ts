@@ -32,8 +32,11 @@ const IMPORTED_VERTEX_WELD = 1e-3; // 1 mm
 const COLLINEAR_DOT_TOLERANCE = 0.999;
 const TANGENT_CONNECT_TOLERANCE = 0.05;
 const EDGE_EXTENSION_RAY_MARGIN = 5.0;
+const OPENING_PIERCING_EXTENSION_MARGIN = 0.02; // 20 mm extension margin for coplanar / tangential void piercing checks
+const COS_CREASE_THRESHOLD = 0.99619; // cos(5 deg) threshold for architectural crease edges
 
 export const GeometryTolerance = {
+  COS_CREASE_THRESHOLD,
   MATH_EPSILON,
   COINCIDENT_POINT,
   COINCIDENT_POINT_SQ,
@@ -62,6 +65,7 @@ export const GeometryTolerance = {
   COLLINEAR_DOT_TOLERANCE,
   TANGENT_CONNECT_TOLERANCE,
   EDGE_EXTENSION_RAY_MARGIN,
+  OPENING_PIERCING_EXTENSION_MARGIN,
 
   relativeEpsilon(magnitude: number): number {
     return Math.max(MATH_EPSILON, Math.abs(magnitude) * 1e-9);

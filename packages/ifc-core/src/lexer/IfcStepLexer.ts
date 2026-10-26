@@ -1,14 +1,14 @@
 /**
- * IfcStepLexer — Tokenizador de alta velocidad en memoria para archivos STEP ISO-10303-21.
+ * IfcStepLexer — High-speed in-memory tokenizer for ISO-10303-21 STEP files.
  *
- * Implementa un escaneo lineal con puntero directo sobre el búfer de texto,
- * evitando expresiones regulares pesadas para procesar archivos grandes en milisegundos.
+ * Implements a linear scan with a direct pointer over the text buffer,
+ * avoiding heavy regular expressions to process large files in milliseconds.
  */
 
 export enum StepTokenType {
   REF = 'REF',           // #123
   WORD = 'WORD',         // IFCWALL, HEADER, ENDSEC, etc.
-  STRING = 'STRING',     // 'texto' (con escape '')
+  STRING = 'STRING',     // 'text' (with '' escape)
   ENUM = 'ENUM',         // .TRUE., .ELEMENT., .T., etc.
   NUMBER = 'NUMBER',     // 123, -4.56, 1.E-05
   NULL = 'NULL',         // $
@@ -47,19 +47,19 @@ export class IfcStepLexer {
   }
 
   /**
-   * Salta espacios en blanco y comentarios /* ... *\/
+   * Skips whitespace and /* ... *\/ comments.
    */
   private skipWhitespaceAndComments(): void {
     while (this.pos < this.length) {
       const ch = this.buffer.charCodeAt(this.pos);
 
-      // Espacios en blanco: ' ', '\t', '\r', '\n'
+      // Whitespace: ' ', '\t', '\r', '\n'
       if (ch === 32 || ch === 9 || ch === 13 || ch === 10) {
         this.pos++;
         continue;
       }
 
-      // Comentarios STEP: /* ... */
+      // STEP comments: /* ... */
       if (ch === 47 /* '/' */ && this.pos + 1 < this.length && this.buffer.charCodeAt(this.pos + 1) === 42 /* '*' */) {
         this.pos += 2;
         while (this.pos + 1 < this.length) {
@@ -77,7 +77,7 @@ export class IfcStepLexer {
   }
 
   /**
-   * Lee y retorna el siguiente token del flujo.
+   * Reads and returns the next token from the stream.
    */
   public nextToken(): StepToken {
     this.skipWhitespaceAndComments();
@@ -89,7 +89,7 @@ export class IfcStepLexer {
     const start = this.pos;
     const ch = this.buffer.charCodeAt(this.pos);
 
-    // Delimitadores de un solo carácter
+    // Single character delimiters
     if (ch === 40 /* '(' */) {
       this.pos++;
       return { type: StepTokenType.LPAREN, value: '(', start, end: this.pos };
@@ -119,7 +119,7 @@ export class IfcStepLexer {
       return { type: StepTokenType.ASTERISK, value: '*', start, end: this.pos };
     }
 
-    // Referencias de entidad: #123
+    // Entity references: #123
     if (ch === 35 /* '#' */) {
       this.pos++;
       const numStart = this.pos;
@@ -135,7 +135,7 @@ export class IfcStepLexer {
       return { type: StepTokenType.REF, value: refNum, start, end: this.pos };
     }
 
-    // Cadenas de texto: '...' (con escape '')
+    // Text strings: '...' (with '' escape)
     if (ch === 39 /* '\'' */) {
       this.pos++;
       let str = '';
@@ -157,13 +157,13 @@ export class IfcStepLexer {
       return { type: StepTokenType.STRING, value: IfcStepLexer.decodeIsoStepString(str), start, end: this.pos };
     }
 
-    // Enumeraciones / Booleanos: .TRUE., .ELEMENT., .T.
+    // Enumerations / Booleans: .TRUE., .ELEMENT., .T.
     if (ch === 46 /* '.' */) {
-      // Puede ser un número que empiece por punto (ej. .5) o un enum (ej. .T.)
+      // Can be a number starting with a dot (e.g. .5) or an enum (e.g. .T.)
       if (this.pos + 1 < this.length) {
         const nextC = this.buffer.charCodeAt(this.pos + 1);
         if (nextC >= 48 && nextC <= 57) {
-          // Es un número
+          // It is a number
           return this.readNumber(start);
         }
       }
@@ -181,7 +181,7 @@ export class IfcStepLexer {
       return { type: StepTokenType.ENUM, value: enumVal, start, end: this.pos };
     }
 
-    // Números (con signo opcional)
+    // Numbers (with optional sign)
     if (
       (ch >= 48 && ch <= 57) || // '0'-'9'
       ((ch === 43 /* '+' */ || ch === 45 /* '-' */) && this.pos + 1 < this.length && (
@@ -192,7 +192,7 @@ export class IfcStepLexer {
       return this.readNumber(start);
     }
 
-    // Palabras / Identificadores (IFCWALL, HEADER, ISO-10303-21, etc.)
+    // Words / Identifiers (IFCWALL, HEADER, ISO-10303-21, etc.)
     if (
       (ch >= 65 && ch <= 90) || // 'A'-'Z'
       (ch >= 97 && ch <= 122) || // 'a'-'z'
@@ -205,7 +205,7 @@ export class IfcStepLexer {
           (c >= 97 && c <= 122) ||
           (c >= 48 && c <= 57) ||
           c === 95 || // '_'
-          c === 45 // '-' (para ISO-10303-21)
+          c === 45 // '-' (for ISO-10303-21)
         ) {
           this.pos++;
         } else {
@@ -216,7 +216,7 @@ export class IfcStepLexer {
       return { type: StepTokenType.WORD, value: word, start, end: this.pos };
     }
 
-    // Carácter desconocido: avanzar
+    // Unknown character: advance
     this.pos++;
     return { type: StepTokenType.WORD, value: this.buffer[start], start, end: this.pos };
   }
@@ -253,12 +253,12 @@ export class IfcStepLexer {
   }
 
   /**
-   * Decodifica secuencias de escape de texto ISO-10303-21 (\X2\...\X0\, \X4\...\X0\, \S\c, \\).
+   * Decodes ISO-10303-21 text escape sequences (\X2\...\X0\, \X4\...\X0\, \S\c, \\).
    */
   public static decodeIsoStepString(s: string): string {
     if (!s || !s.includes('\\')) return s;
 
-    // 1. Decodificar \X2\HHHH...\X0\ (16-bit UCS-2 / UTF-16)
+    // 1. Decode \X2\HHHH...\X0\ (16-bit UCS-2 / UTF-16)
     let result = s.replace(/\\X2\\([0-9A-Fa-f]+)\\X0\\/g, (_, hexGroup) => {
       let decoded = '';
       for (let i = 0; i + 4 <= hexGroup.length; i += 4) {
@@ -268,7 +268,7 @@ export class IfcStepLexer {
       return decoded;
     });
 
-    // 2. Decodificar \X4\HHHHHHHH...\X0\ (32-bit UCS-4)
+    // 2. Decode \X4\HHHHHHHH...\X0\ (32-bit UCS-4)
     result = result.replace(/\\X4\\([0-9A-Fa-f]+)\\X0\\/g, (_, hexGroup) => {
       let decoded = '';
       for (let i = 0; i + 8 <= hexGroup.length; i += 8) {
@@ -278,13 +278,13 @@ export class IfcStepLexer {
       return decoded;
     });
 
-    // 3. Decodificar \S\c (carácter con bit alto 0x80)
+    // 3. Decode \S\c (character with high bit 0x80)
     result = result.replace(/\\S\\(.)/g, (_, char) => {
       const code = char.charCodeAt(0) + 128;
       return String.fromCharCode(code);
     });
 
-    // 4. Decodificar doble barra invertida \\ -> \
+    // 4. Decode double backslash \\ -> \
     result = result.replace(/\\\\/g, '\\');
 
     return result;

@@ -1,16 +1,16 @@
 /**
- * IfcStreamingParser — Parser de flujo e indexación por offsets para archivos STEP ISO-10303-21.
+ * IfcStreamingParser — Stream and offset-indexing parser for STEP ISO-10303-21 files.
  *
- * Diseñado para resolver OOM (Out-of-Memory) en archivos masivos (e.g. ElManzano.ifc con 7.1M entidades)
- * indexando únicamente los offsets de inicio/fin y tipo de cada entidad en O(N) sin instanciar
- * el árbol completo de objetos AST en memoria.
+ * Designed to address OOM (Out-of-Memory) on massive files (e.g. ElManzano.ifc with 7.1M entities)
+ * by indexing only start/end offsets and entity types in O(N) without instantiating
+ * the complete AST object tree in memory.
  *
- * Cumplimiento normativo (NORMAS_DESARROLLO_CROQUERA.md):
- * - Norma 6: Sin tolerancias literales.
- * - Norma 7: Complejidad acotada O(N) en escaneo lineal, O(1) de memoria por entidad bajo demanda.
- * - Norma 11: Cobertura de casos degenerados (archivo truncado, vacío, sin HEADER, entidad malformada).
- * - Norma 13: Cero supresión silenciosa de errores en streaming (D4).
- * - Norma 16: Paridad funcional con IfcStepParser verificada mediante tests (D5).
+ * Compliance (NORMAS_DESARROLLO_CROQUERA.md):
+ * - Rule 6: No literal tolerances.
+ * - Rule 7: Bounded O(N) complexity for linear scan, O(1) memory per entity on demand.
+ * - Rule 11: Degenerate case coverage (truncated file, empty, missing HEADER, malformed entity).
+ * - Rule 13: Zero silent suppression of errors in streaming (D4).
+ * - Rule 16: Functional parity with IfcStepParser verified via tests (D5).
  */
 
 import { IfcStepLexer, StepTokenType, type StepToken } from '../lexer/IfcStepLexer';
@@ -70,7 +70,7 @@ export class IfcStreamingParser implements IIfcStreamingParser {
   }
 
   /**
-   * Parsea exclusivamente la sección HEADER (< 1 KB) sin tocar la sección DATA.
+   * Parses exclusively the HEADER section (< 1 KB) without touching the DATA section.
    */
   public parseHeader(): StepHeaderRecord[] {
     this.headerRecords = [];
@@ -79,12 +79,12 @@ export class IfcStreamingParser implements IIfcStreamingParser {
     const lexer = new IfcStepLexer(this.buffer);
     let token = lexer.nextToken();
 
-    // 1. Escanear hasta la palabra HEADER
+    // 1. Scan until the HEADER keyword
     let headerFound = false;
     while (token.type !== StepTokenType.EOF) {
       if (token.type === StepTokenType.WORD && token.value.toUpperCase() === 'HEADER') {
         headerFound = true;
-        // Consumir ';' opcional tras HEADER
+        // Consume optional ';' after HEADER
         const semi = lexer.nextToken();
         if (semi.type !== StepTokenType.SEMICOLON) {
           lexer.setPos(semi.start);
@@ -92,7 +92,7 @@ export class IfcStreamingParser implements IIfcStreamingParser {
         break;
       }
       if (token.type === StepTokenType.WORD && token.value.toUpperCase() === 'DATA') {
-        // Archivo sin HEADER, saltar directo a DATA
+        // File without HEADER, skip directly to DATA
         this.headerEndPos = token.start;
         return this.headerRecords;
       }
@@ -104,7 +104,7 @@ export class IfcStreamingParser implements IIfcStreamingParser {
       return this.headerRecords;
     }
 
-    // 2. Parsear registros del HEADER hasta ENDSEC;
+    // 2. Parse HEADER records until ENDSEC;
     while (true) {
       const lineStart = lexer.getPos();
       token = lexer.nextToken();
@@ -132,7 +132,7 @@ export class IfcStreamingParser implements IIfcStreamingParser {
               rawLine,
             });
           } catch (err: any) {
-            console.warn(`[IfcStreamingParser] Cabecera HEADER truncada o malformada en registro ${typeName}: ${err?.message || err}`);
+            console.warn(`[IfcStreamingParser] Truncated or malformed HEADER in record ${typeName}: ${err?.message || err}`);
             break;
           }
         }
@@ -143,8 +143,8 @@ export class IfcStreamingParser implements IIfcStreamingParser {
   }
 
   /**
-   * Escaneo rápido O(N) de la sección DATA.
-   * Construye el índice de offsets y el índice por tipo sin crear objetos AST para los parámetros.
+   * Fast O(N) scan of the DATA section.
+   * Builds offset index and type index without creating AST parameter objects.
    */
   public scanDataSection(): void {
     if (this.isDataScanned) return;
@@ -157,16 +157,16 @@ export class IfcStreamingParser implements IIfcStreamingParser {
     const len = this.length;
     const buf = this.buffer;
 
-    // 1. Localizar la sección DATA
+    // 1. Locate the DATA section
     let dataFound = false;
     while (pos < len) {
-      // Salto rápido de espacios
+      // Fast whitespace skip
       const ch = buf.charCodeAt(pos);
       if (ch === 32 || ch === 9 || ch === 13 || ch === 10) {
         pos++;
         continue;
       }
-      // Comentarios /* ... */
+      // Comments /* ... */
       if (ch === 47 && pos + 1 < len && buf.charCodeAt(pos + 1) === 42) {
         pos += 2;
         while (pos + 1 < len) {
@@ -179,14 +179,14 @@ export class IfcStreamingParser implements IIfcStreamingParser {
         continue;
       }
 
-      // Comprobar palabra DATA
+      // Check DATA keyword
       if (
-        (ch === 68 || ch === 100) && // 'D' o 'd'
+        (ch === 68 || ch === 100) && // 'D' or 'd'
         pos + 4 <= len &&
         buf.slice(pos, pos + 4).toUpperCase() === 'DATA'
       ) {
         pos += 4;
-        // Consumir parámetros opcionales y el ';' final de DATA;
+        // Consume optional parameters and trailing ';' of DATA;
         while (pos < len) {
           const c = buf.charCodeAt(pos);
           pos++;
@@ -205,9 +205,9 @@ export class IfcStreamingParser implements IIfcStreamingParser {
       return;
     }
 
-    // 2. Escaneo lineal de entidades #ID = TYPE(...) ;
+    // 2. Linear scan of entities #ID = TYPE(...) ;
     while (pos < len) {
-      // Saltar espacios en blanco y comentarios
+      // Skip whitespace and comments
       while (pos < len) {
         const c = buf.charCodeAt(pos);
         if (c === 32 || c === 9 || c === 13 || c === 10) {
@@ -232,24 +232,24 @@ export class IfcStreamingParser implements IIfcStreamingParser {
 
       const firstChar = buf.charCodeAt(pos);
 
-      // Detectar fin de sección DATA: ENDSEC
+      // Detect end of DATA section: ENDSEC
       if (
-        (firstChar === 69 || firstChar === 101) && // 'E' o 'e'
+        (firstChar === 69 || firstChar === 101) && // 'E' or 'e'
         pos + 6 <= len &&
         buf.slice(pos, pos + 6).toUpperCase() === 'ENDSEC'
       ) {
         pos += 6;
-        while (pos < len && buf.charCodeAt(pos) !== 59) pos++; // hasta ';'
-        if (pos < len) pos++; // consumir ';'
+        while (pos < len && buf.charCodeAt(pos) !== 59) pos++; // until ';'
+        if (pos < len) pos++; // consume ';'
         break;
       }
 
-      // La entidad debe iniciar con '#'
+      // Entity must start with '#'
       if (firstChar === 35) { // '#'
         const entityStart = pos;
         pos++;
 
-        // Leer entityId entero
+        // Read integer entityId
         let entityId = 0;
         let hasDigits = false;
         while (pos < len) {
@@ -264,12 +264,12 @@ export class IfcStreamingParser implements IIfcStreamingParser {
         }
 
         if (!hasDigits) {
-          // Carácter '#' huérfano o malformado
+          // Orphan or malformed '#' character
           pos++;
           continue;
         }
 
-        // Saltar espacios hasta '='
+        // Skip whitespace until '='
         while (pos < len) {
           const c = buf.charCodeAt(pos);
           if (c === 32 || c === 9 || c === 13 || c === 10) pos++;
@@ -277,21 +277,21 @@ export class IfcStreamingParser implements IIfcStreamingParser {
         }
 
         if (pos >= len || buf.charCodeAt(pos) !== 61) { // '='
-          // Entidad sintácticamente rota, saltar hasta el siguiente ';'
+          // Syntactically broken entity, skip to next ';'
           while (pos < len && buf.charCodeAt(pos) !== 59) pos++;
           if (pos < len) pos++;
           continue;
         }
-        pos++; // consumir '='
+        pos++; // consume '='
 
-        // Saltar espacios hasta nombre del tipo
+        // Skip whitespace until type name
         while (pos < len) {
           const c = buf.charCodeAt(pos);
           if (c === 32 || c === 9 || c === 13 || c === 10) pos++;
           else break;
         }
 
-        // Leer tipo IFC
+        // Read IFC type
         const typeStart = pos;
         while (pos < len) {
           const c = buf.charCodeAt(pos);
@@ -308,21 +308,21 @@ export class IfcStreamingParser implements IIfcStreamingParser {
         }
         const typeName = buf.slice(typeStart, pos).toUpperCase();
 
-        // Saltar cuerpo de parámetros respetando cadenas '...' y comentarios /* ... */
+        // Skip parameter body respecting strings '...' and comments /* ... */
         while (pos < len) {
           const c = buf.charCodeAt(pos);
           if (c === 59) { // ';'
-            pos++; // consumir ';'
+            pos++; // consume ';'
             break;
           }
-          if (c === 39) { // comilla simple '
+          if (c === 39) { // single quote '
             pos++;
             while (pos < len) {
               if (buf.charCodeAt(pos) === 39) {
                 if (pos + 1 < len && buf.charCodeAt(pos + 1) === 39) {
-                  pos += 2; // comilla escapada ''
+                  pos += 2; // escaped quote ''
                 } else {
-                  pos++; // fin de cadena
+                  pos++; // end of string
                   break;
                 }
               } else {
@@ -365,7 +365,7 @@ export class IfcStreamingParser implements IIfcStreamingParser {
         }
         list.push(entityId);
       } else {
-        // Carácter desconocido fuera de entidad, avanzar
+        // Unknown character outside entity, advance
         pos++;
       }
     }
@@ -374,7 +374,7 @@ export class IfcStreamingParser implements IIfcStreamingParser {
   }
 
   /**
-   * Comprueba si una entidad existe en el índice de offsets.
+   * Checks whether an entity exists in the offset index.
    */
   public hasRecord(id: number): boolean {
     if (!this.isDataScanned) this.scanDataSection();
@@ -382,7 +382,7 @@ export class IfcStreamingParser implements IIfcStreamingParser {
   }
 
   /**
-   * Obtiene el tipo IFC de una entidad por ID sin parsear sus parámetros.
+   * Retrieves the IFC type of an entity by ID without parsing its parameters.
    */
   public getRecordType(id: number): string | undefined {
     if (!this.isDataScanned) this.scanDataSection();
@@ -390,7 +390,7 @@ export class IfcStreamingParser implements IIfcStreamingParser {
   }
 
   /**
-   * Parsea y devuelve una única entidad bajo demanda en O(1) de memoria.
+   * Parses and returns a single entity on demand in O(1) memory.
    */
   public getRecordOnDemand(stepId: number): StepRecord | undefined {
     if (!this.isDataScanned) this.scanDataSection();
@@ -402,16 +402,16 @@ export class IfcStreamingParser implements IIfcStreamingParser {
   }
 
   /**
-   * Alias de compatibilidad con IfcStepParser.getRecord.
+   * Compatibility alias for IfcStepParser.getRecord.
    */
   public getRecord(id: number): StepRecord | undefined {
     return this.getRecordOnDemand(id);
   }
 
   /**
-   * Itera sobre todas las entidades de un tipo IFC dado, emitiendo una a la vez vía callback.
-   * Manejo estricto de errores según Norma 13 / Desviación D4: registra advertencias
-   * detalladas sin suprimir fallos y contabiliza omisiones.
+   * Iterates over all entities of a given IFC type, emitting one at a time via callback.
+   * Strict error handling per Rule 13 / Deviation D4: logs detailed warnings
+   * without suppressing failures and counts omissions.
    */
   public getRecordsByTypeStreaming(
     type: string,
@@ -437,7 +437,7 @@ export class IfcStreamingParser implements IIfcStreamingParser {
           processed++;
         } else {
           errors++;
-          const warnMsg = `[IfcStreamingParser] No se pudo recuperar el registro para #${id} de tipo ${upper}`;
+          const warnMsg = `[IfcStreamingParser] Could not retrieve record for #${id} of type ${upper}`;
           console.warn(warnMsg);
           if (this.options.onWarning) {
             this.options.onWarning(warnMsg);
@@ -445,7 +445,7 @@ export class IfcStreamingParser implements IIfcStreamingParser {
         }
       } catch (err: any) {
         errors++;
-        const warnMsg = `[IfcStreamingParser] Error parseando entidad #${id} (${upper}): ${err?.message || err}`;
+        const warnMsg = `[IfcStreamingParser] Error parsing entity #${id} (${upper}): ${err?.message || err}`;
         console.warn(warnMsg);
         if (this.options.onError) {
           this.options.onError(err instanceof Error ? err : new Error(String(err)), id);
@@ -457,8 +457,8 @@ export class IfcStreamingParser implements IIfcStreamingParser {
   }
 
   /**
-   * Obtiene todos los registros de un tipo como array (conveniente para tipos de baja cardinalidad
-   * como IfcProject, IfcSite, IfcBuilding, IfcBuildingStorey, IfcSiUnit).
+   * Retrieves all records of a type as an array (convenient for low-cardinality types
+   * like IfcProject, IfcSite, IfcBuilding, IfcBuildingStorey, IfcSiUnit).
    */
   public getRecordsByType(type: string): StepRecord[] {
     const records: StepRecord[] = [];
@@ -469,7 +469,7 @@ export class IfcStreamingParser implements IIfcStreamingParser {
   }
 
   /**
-   * Parsea una única línea de entidad STEP aislada.
+   * Parses an isolated single STEP entity line.
    */
   private parseSingleRecord(stepId: number, typeName: string, rawLine: string): StepRecord | undefined {
     try {
@@ -490,7 +490,7 @@ export class IfcStreamingParser implements IIfcStreamingParser {
 
       const semi = lexer.nextToken();
       if (semi.type !== StepTokenType.SEMICOLON) {
-        throw new Error(`Sintaxis inválida: entidad STEP no finaliza en ';' (se encontró ${semi.type})`);
+        throw new Error(`Invalid syntax: STEP entity does not end in ';' (found ${semi.type})`);
       }
 
       return {
@@ -500,7 +500,7 @@ export class IfcStreamingParser implements IIfcStreamingParser {
         rawLine,
       };
     } catch (err: any) {
-      const warnMsg = `[IfcStreamingParser] Falló el parseo de entidad #${stepId} (${typeName}): ${err?.message || err}`;
+      const warnMsg = `[IfcStreamingParser] Failed to parse entity #${stepId} (${typeName}): ${err?.message || err}`;
       console.warn(warnMsg);
       if (this.options.onError) {
         this.options.onError(err instanceof Error ? err : new Error(String(err)), stepId, rawLine);
@@ -512,12 +512,12 @@ export class IfcStreamingParser implements IIfcStreamingParser {
   private static readonly MAX_PARAM_DEPTH = 128;
 
   /**
-   * Parsea una lista de parámetros de un registro STEP delimitada por comas hasta ')'.
+   * Parses a comma-separated STEP record parameter list until ')'.
    */
   private parseParamList(lexer: IfcStepLexer, depth: number = 0): StepParam[] {
     if (depth > IfcStreamingParser.MAX_PARAM_DEPTH) {
       console.warn(
-        `[IfcStreamingParser] Límite de anidamiento de parámetros excedido (> ${IfcStreamingParser.MAX_PARAM_DEPTH}). Truncando lista.`
+        `[IfcStreamingParser] Parameter nesting limit exceeded (> ${IfcStreamingParser.MAX_PARAM_DEPTH}). Truncating list.`
       );
       while (true) {
         const next = lexer.nextToken();
@@ -549,7 +549,7 @@ export class IfcStreamingParser implements IIfcStreamingParser {
         }
         params.push(this.parseParamValue(lexer, valToken, depth));
       } else {
-        throw new Error(`Sintaxis inválida en parámetros de entidad: token inesperado ${next.type}`);
+        throw new Error(`Invalid syntax in entity parameters: unexpected token ${next.type}`);
       }
     }
 
@@ -557,7 +557,7 @@ export class IfcStreamingParser implements IIfcStreamingParser {
   }
 
   /**
-   * Parsea un único valor de parámetro STEP.
+   * Parses a single STEP parameter value.
    */
   private parseParamValue(lexer: IfcStepLexer, token: StepToken, depth: number = 0): StepParam {
     switch (token.type) {
@@ -594,20 +594,58 @@ export class IfcStreamingParser implements IIfcStreamingParser {
 }
 
 /**
- * OnDemandRecordMap — Mapa virtual de compatibilidad para IfcStepImporter.
+ * OnDemandRecordMap — Virtual compatibility map for IfcStepImporter.
  *
- * Implementa la interfaz Map<number, StepRecord> resolviendo entidades sobre demanda
- * a través de IfcStreamingParser con una caché local acotada para evitar saturación de memoria.
+ * Implements the Map<number, StepRecord> interface by resolving entities on demand
+ * via IfcStreamingParser with a bounded local cache to avoid memory saturation.
  */
 export class OnDemandRecordMap extends Map<number, StepRecord> {
   private streamingParser: IIfcStreamingParser;
   private cache: Map<number, StepRecord> = new Map();
   private maxCacheSize: number;
 
-  constructor(streamingParser: IIfcStreamingParser, maxCacheSize: number = 10000) {
+  /**
+   * Ephemeral single-use entities that should NOT pollute the bounded cache (Issue 1.3).
+   * Geometry vertices, face loops and mesh tessellations are consumed once and never re-read,
+   * leaving cache space strictly for shared spatial structures, placements, styles and profiles.
+   */
+  public static readonly EPHEMERAL_TYPES = new Set<string>([
+    'IFCCARTESIANPOINT',
+    'IFCPOLYLOOP',
+    'IFCFACEOUTERBOUND',
+    'IFCFACEBOUND',
+    'IFCFACE',
+    'IFCCLOSEDSHELL',
+    'IFCOPENSHELL',
+    'IFCFACETEDBREP',
+    'IFCSHELLBASEDSURFACEMODEL',
+    'IFCFACEBASEDSURFACEMODEL',
+    'IFCCARTESIANPOINTLIST3D',
+    'IFCCARTESIANPOINTLIST2D',
+    'IFCTRIANGULATEDFACESET',
+    'IFCTRIANGULATEDIRREGULARNETWORK',
+    'IFCPOLYGONALFACESET',
+    'IFCINDEXEDPOLYGONALFACE',
+    'IFCINDEXEDPOLYGONALFACEWITHVOIDS',
+    'IFCVERTEXPOINT',
+    'IFCEDGECURVE',
+    'IFCORIENTEDEDGE',
+    'IFCEDGELOOP',
+  ]);
+
+  constructor(streamingParser: IIfcStreamingParser, maxCacheSize: number = 50000) {
     super();
     this.streamingParser = streamingParser;
     this.maxCacheSize = maxCacheSize;
+  }
+
+  private evictBatch(): void {
+    const evictCount = Math.max(1, Math.floor(this.maxCacheSize * 0.2));
+    let count = 0;
+    for (const k of this.cache.keys()) {
+      this.cache.delete(k);
+      if (++count >= evictCount) break;
+    }
   }
 
   public override get(key: number): StepRecord | undefined {
@@ -615,13 +653,12 @@ export class OnDemandRecordMap extends Map<number, StepRecord> {
     if (!rec) {
       rec = this.streamingParser.getRecordOnDemand(key);
       if (rec) {
-        if (this.cache.size >= this.maxCacheSize) {
-          const firstKey = this.cache.keys().next().value;
-          if (firstKey !== undefined) {
-            this.cache.delete(firstKey);
+        if (!OnDemandRecordMap.EPHEMERAL_TYPES.has(rec.type)) {
+          if (this.cache.size >= this.maxCacheSize) {
+            this.evictBatch();
           }
+          this.cache.set(key, rec);
         }
-        this.cache.set(key, rec);
       }
     }
     return rec;
@@ -632,13 +669,12 @@ export class OnDemandRecordMap extends Map<number, StepRecord> {
   }
 
   public override set(key: number, value: StepRecord): this {
-    if (this.cache.size >= this.maxCacheSize && !this.cache.has(key)) {
-      const firstKey = this.cache.keys().next().value;
-      if (firstKey !== undefined) {
-        this.cache.delete(firstKey);
+    if (!OnDemandRecordMap.EPHEMERAL_TYPES.has(value.type)) {
+      if (this.cache.size >= this.maxCacheSize && !this.cache.has(key)) {
+        this.evictBatch();
       }
+      this.cache.set(key, value);
     }
-    this.cache.set(key, value);
     return this;
   }
 

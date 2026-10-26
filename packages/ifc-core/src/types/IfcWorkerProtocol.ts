@@ -4,6 +4,10 @@
  * Enables 3-stage progressive streaming with zero-copy Transferable Objects (ArrayBuffers).
  */
 
+import type { GeometryIR } from './GeometryIR';
+import type { SharedScannerState, SharedSparsePage } from '../parser/ChunkedStreamScanner';
+export type { SharedScannerState, SharedSparsePage };
+
 export type EntityType = 'GEOMETRY_ENTITY' | 'GROUP' | 'SPATIAL_CONTAINER';
 
 export interface IfcValueType {
@@ -45,7 +49,7 @@ export interface GeorefData {
   trueNorthY?: number;
 }
 
-export interface IfcWorkerRequest {
+export interface IfcWorkerParseRequest {
   type: 'PARSE_IFC';
   stepContent?: string;
   stepBuffer?: ArrayBuffer;
@@ -54,6 +58,40 @@ export interface IfcWorkerRequest {
   phase1EntityIds?: string[];
   forcePhases?: boolean;
 }
+
+export interface IfcWorkerResolvePsetsRequest {
+  type: 'RESOLVE_PSETS';
+  requestId?: string;
+  stepId: number;
+}
+
+export interface IfcWorkerInitCoordinatorRequest {
+  type: 'INIT_COORDINATOR';
+  stepBuffer: SharedArrayBuffer | ArrayBuffer;
+  forcePhases?: boolean;
+}
+
+export interface IfcWorkerInitTessellatorRequest {
+  type: 'INIT_TESSELLATOR';
+  scannerState: SharedScannerState;
+  forcePhases?: boolean;
+}
+
+export interface IfcWorkerTessellateBatchRequest {
+  type: 'TESSELLATE_BATCH';
+  batchIndex: number;
+  totalBatches?: number;
+  productStepIds?: number[];
+  deferredTypes?: string[];
+  chunkSize?: number;
+}
+
+export type IfcWorkerRequest =
+  | IfcWorkerParseRequest
+  | IfcWorkerResolvePsetsRequest
+  | IfcWorkerInitCoordinatorRequest
+  | IfcWorkerInitTessellatorRequest
+  | IfcWorkerTessellateBatchRequest;
 
 export interface SpatialNodeDTO {
   id: string;
@@ -97,6 +135,9 @@ export interface TessellatedElementDTO {
   psets?: Record<string, Record<string, IfcValueType>>;
   materialId?: string;
 
+  // GPU Geometry Intermediate Representation (GeometryIR)
+  geometry?: GeometryIR;
+
   // GPU Transferable buffers
   positions: Float32Array;
   normals: Float32Array;
@@ -116,6 +157,7 @@ export interface TessellatedElementDTO {
 
 export interface InstanceElementDTO {
   id: string;
+  stepId?: number;
   name: string;
   ifcType: string;
   parentId: string | null;
@@ -135,7 +177,6 @@ export interface Stage1SpatialPayload {
   spatialNodes: SpatialNodeDTO[];
   materials: MaterialRecord[];
   parsedLevels: { id: string; name: string; elevation: number }[];
-  frameworkMetadata?: any;
   defaultBuildingId?: string | null;
   georef?: GeorefData | null;
 }
@@ -144,6 +185,7 @@ export interface Stage2BoundsPayload {
   type: 'STAGE_BOUNDS_AABB';
   elements: ElementBoundsDTO[];
   totalElements: number;
+  totalModelElements?: number;
   modelAABB: {
     min: [number, number, number];
     max: [number, number, number];
@@ -176,6 +218,31 @@ export interface StageErrorPayload {
   stack?: string;
 }
 
+export interface ResolvedPsetsPayload {
+  type: 'STAGE_RESOLVED_PSETS';
+  requestId?: string;
+  stepId: number;
+  psets: Record<string, Record<string, any>>;
+}
+
+export interface StageCoordinatorReadyPayload {
+  type: 'STAGE_COORDINATOR_READY';
+  scannerState: SharedScannerState;
+  productStepIds: number[];
+  deferredTypes: string[];
+  totalElements: number;
+}
+
+export interface StageTessellatorReadyPayload {
+  type: 'STAGE_TESSELLATOR_READY';
+}
+
+export interface StageBatchCompletePayload {
+  type: 'STAGE_BATCH_COMPLETE';
+  batchIndex: number;
+  elementsProcessed: number;
+}
+
 export type IfcWorkerResponse =
   | Stage1SpatialPayload
   | Stage2BoundsPayload
@@ -183,4 +250,8 @@ export type IfcWorkerResponse =
   | StagePhase1CompletePayload
   | InstanceBatchPayload
   | StageCompletePayload
-  | StageErrorPayload;
+  | StageErrorPayload
+  | ResolvedPsetsPayload
+  | StageCoordinatorReadyPayload
+  | StageTessellatorReadyPayload
+  | StageBatchCompletePayload;

@@ -93,7 +93,7 @@ export class PlanarGraph {
   }
 
   /**
-   * Inserción por lotes de múltiples segmentos 2D resolviendo el arreglo planar en una sola pasada O(n^2).
+   * Batch insertion of multiple 2D segments resolving the planar arrangement in a single O(n^2) pass.
    */
   public addSegments2D(newSegments: { a: Vec2D; b: Vec2D }[]): void {
     const validSegments: { a: Vec2D; b: Vec2D }[] = [];
@@ -120,7 +120,7 @@ export class PlanarGraph {
   }
 
   /**
-   * Inserción por lotes de múltiples segmentos 3D en una sola pasada.
+   * Batch insertion of multiple 3D segments in a single pass.
    */
   public addSegments3D(segments: { a: Vec3; b: Vec3 }[]): void {
     if (segments.length === 0) return;
@@ -175,7 +175,7 @@ export class PlanarGraph {
       ]);
     }
 
-    // Precomputar AABB 2D de cada segmento para descarte preliminar O(1)
+    // Precompute 2D AABB for each segment for preliminary O(1) broad-phase rejection
     const aabbs = segments.map((s) => ({
       minX: Math.min(s.a.x, s.b.x) - GeometryTolerance.COINCIDENT_POINT,
       maxX: Math.max(s.a.x, s.b.x) + GeometryTolerance.COINCIDENT_POINT,

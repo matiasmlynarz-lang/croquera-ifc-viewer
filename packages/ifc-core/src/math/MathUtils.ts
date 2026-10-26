@@ -251,26 +251,3 @@ export function rotatePointAroundAxis(point: Vec3, axisPoint: Vec3, axisDir: Vec
 
   return axisPoint.add(parallel).add(rotatedPerp);
 }
-
-export function mirrorPointAcrossPlane(point: Vec3, planePoint: Vec3, planeNormal: Vec3): Vec3 {
-  const norm = planeNormal.normalize();
-  const d = point.sub(planePoint).dot(norm);
-  return point.sub(norm.scale(2 * d));
-}
-
-export function createReflectionMatrix(planePoint: Vec3, planeNormal: Vec3): THREE.Matrix4 {
-  const n = planeNormal.normalize();
-  const d = planePoint.dot(n);
-  const nx = n.x;
-  const ny = n.y;
-  const nz = n.z;
-
-  const m = new THREE.Matrix4();
-  m.set(
-    1 - 2 * nx * nx,    -2 * nx * ny,    -2 * nx * nz, 2 * d * nx,
-       -2 * nx * ny, 1 - 2 * ny * ny,    -2 * ny * nz, 2 * d * ny,
-       -2 * nx * nz,    -2 * ny * nz, 1 - 2 * nz * nz, 2 * d * nz,
-                  0,               0,               0,          1
-  );
-  return m;
-}

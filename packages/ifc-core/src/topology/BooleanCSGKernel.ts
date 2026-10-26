@@ -1,22 +1,18 @@
 /**
- * BooleanCSGKernel — Motor Unificado de Operaciones Booleanas Exactas (B-Rep CSG).
+ * BooleanCSGKernel — Exact Boundary Representation Constructive Solid Geometry (B-Rep CSG) Engine.
  *
- * Misión:
- * Resuelve formalmente la diferencia, unión e intersección regularizada de sólidos
- * poliédricos 2-manifold (PolyMesh) en R^3:
- *   - Sustracción:    R = A \* B = clos(int(A) \ int(B))
- *   - Unión:          R = A U* B = clos(int(A) U int(B))
- *   - Intersección:   R = A (* B = clos(int(A) ( int(B))
+ * Formally evaluates regularized difference, union, and intersection of
+ * 2-manifold polyhedral solids (PolyMesh) in R^3:
+ *   - Subtraction:   R = A \* B = clos(int(A) \ int(B))
+ *   - Union:         R = A U* B = clos(int(A) U int(B))
+ *   - Intersection:  R = A (* B = clos(int(A) ( int(B))
  *
- * Principios y Cumplimiento:
- * - Reglas de frontera de Requicha-Voelcker con soporte On-Boundary (COPLANAR_SAME, COPLANAR_OPPOSITE).
- * - Partición conforme cara-cara mediante PlanarGraph en base ortonormal 2D (u, v).
- * - Clasificación topológica por punto interior de triángulo dominante y ray-casting 3D robusto.
- * - Fusión coplanar posterior con coalesceCoplanarFaces() para preservar N-gonos y bucles (Salvaguarda 6.2).
- * - Asignación determinista de openingId en caras de jamba procedentes del cortador (Salvaguarda 6.1).
- *
- * Verificado por tests en tests/topology/boolean_csg_kernel.test.ts (Norma 24).
- * Cumple estrictamente con NORMAS_DESARROLLO_CROQUERA.md y AGENTS.md.
+ * Core Principles:
+ * - Requicha-Voelcker boundary rules with On-Boundary support (COPLANAR_SAME, COPLANAR_OPPOSITE).
+ * - Conformal face-to-face partitioning via PlanarGraph in local 2D orthonormal basis (u, v).
+ * - Topological classification via dominant triangle interior point and robust 3D ray casting.
+ * - Coplanar face post-coalescing to preserve N-gons and boundary loops.
+ * - Deterministic openingId tagging on jamba faces originating from cutter geometries.
  */
 
 import * as THREE from 'three';
@@ -33,7 +29,7 @@ export type BooleanOperation = 'SUBTRACT' | 'UNION' | 'INTERSECT';
 export interface CSGOptions {
   openingGroupId?: string;
   matrixB?: THREE.Matrix4;
-  skipInstancePropagation?: boolean; // Norma 3
+  skipInstancePropagation?: boolean;
   tolerance?: number;
 }
 
@@ -57,7 +53,7 @@ interface SubFaceData {
 
 export class BooleanCSGKernel {
   /**
-   * Ejecuta la diferencia regularizada A \* B.
+   * Evaluates regularized subtraction A \* B.
    */
   public static subtract(
     solidA: PolyMesh,
@@ -68,7 +64,7 @@ export class BooleanCSGKernel {
   }
 
   /**
-   * Ejecuta la unión regularizada A U* B.
+   * Evaluates regularized union A U* B.
    */
   public static union(
     solidA: PolyMesh,
@@ -79,7 +75,7 @@ export class BooleanCSGKernel {
   }
 
   /**
-   * Ejecuta la intersección regularizada A (* B.
+   * Evaluates regularized intersection A (* B.
    */
   public static intersect(
     solidA: PolyMesh,
@@ -90,7 +86,7 @@ export class BooleanCSGKernel {
   }
 
   /**
-   * Núcleo de ejecución unificado para todas las operaciones booleanas CSG.
+   * Unified execution core for CSG boolean operations.
    */
   private static executeOperation(
     solidA: PolyMesh,
@@ -100,14 +96,14 @@ export class BooleanCSGKernel {
   ): PolyMesh {
     const tol = options.tolerance ?? GeometryTolerance.COINCIDENT_VERTEX;
 
-    // 0. Preparar sólido B (aplicar matrixB si existe y normalizar orientación de volumen)
+    // 0. Prepare solid B (apply matrixB if provided and normalize volume orientation)
     let bMesh = solidB;
     if (options.matrixB) {
       bMesh = solidB.clone(`${solidB.id}_transformed`);
       bMesh.applyMatrix4(options.matrixB);
     }
 
-    // Normalización de B: si su volumen con signo es negativo, invertir sus caras (Norma 2.4 del plan)
+    // Normalize solid B: if signed volume is negative, reverse its faces
     const volB = bMesh.computeSignedVolume();
     if (volB < -GeometryTolerance.COINCIDENT_POINT) {
       const invertedB = new PolyMesh(`${bMesh.id}_norm`);
@@ -119,19 +115,19 @@ export class BooleanCSGKernel {
       bMesh = invertedB;
     }
 
-    // 1. Fase Ancha (Broad-Phase): Colisión de cajas envolventes AABB
+    // 1. Broad-Phase: AABB bounding box collision test
     const boxA = this.computeMeshAABB(solidA);
     const boxB = this.computeMeshAABB(bMesh);
 
     const expandedBoxA = boxA.clone().expandByScalar(tol);
     if (!expandedBoxA.intersectsBox(boxB)) {
-      // Casos disjuntos sin intersección espacial:
+      // Disjoint cases without spatial intersection:
       if (operation === 'SUBTRACT') {
         return solidA.clone(`${solidA.id}_sub`);
       } else if (operation === 'INTERSECT') {
         return new PolyMesh(`${solidA.id}_empty`);
       } else {
-        // UNION disjunta: combinar caras de A y B directamente
+        // Disjoint UNION: directly combine faces of A and B
         const unionMesh = solidA.clone(`${solidA.id}_union`);
         for (const f of bMesh.faces.values()) {
           unionMesh.addFace(f.getPositions(), f.normal);
@@ -141,7 +137,7 @@ export class BooleanCSGKernel {
       }
     }
 
-    // 2. Extraer caras y construir AABBs por cara
+    // 2. Extract faces and construct per-face AABBs
     interface FaceEntry {
       face: Face;
       positions: Vec3[];
@@ -179,7 +175,7 @@ export class BooleanCSGKernel {
       });
     }
 
-    // 3. Fase Estrecha (Narrow-Phase): Descarte espacial preliminar con overlapBox (Norma 7)
+    // 3. Narrow-Phase: Spatial pruning via overlapBox
     const overlapBox = boxA.clone().intersect(boxB).expandByScalar(tol);
     const candidateFacesB = facesB.filter((fb) => fb.box.intersectsBox(overlapBox));
 
@@ -200,7 +196,7 @@ export class BooleanCSGKernel {
       }
     }
 
-    // 4. Subdivisión conforme de caras con sus segmentos de corte
+    // 4. Conformal face subdivision with cut segments
     const subFacesA: SubFaceData[] = [];
     for (const fa of facesA) {
       if (fa.cutSegments.length === 0) {
@@ -241,14 +237,14 @@ export class BooleanCSGKernel {
       }
     }
 
-    // 5. Triangulación de sólidos para clasificación robusta por punto interior
+    // 5. Solid triangulation for robust interior-point classification
     const trisA = this.triangulateMesh(solidA);
     const trisB = this.triangulateMesh(bMesh);
 
-    // 6. Clasificación de subcaras y selección según operador
+    // 6. Sub-face classification and selection per operation
     const resultMesh = new PolyMesh(solidA.id);
 
-    // Clasificar subcaras de A con respecto a B
+    // Classify sub-faces of A with respect to B
     for (const sfa of subFacesA) {
       const classification = this.classifySubFace(sfa, trisB, facesB, tol);
 
@@ -286,8 +282,8 @@ export class BooleanCSGKernel {
       let invertNormal = false;
 
       if (operation === 'SUBTRACT') {
-        // En A \* B: conservar subcaras de B INSIDE (con normal invertida para formar las paredes del hueco).
-        // Descartar OUTSIDE, COPLANAR_SAME y COPLANAR_OPP de B (las tapas de entrada/salida de B no aportan material).
+        // In A \ B: retain B subfaces INSIDE (with inverted normal to form void boundaries).
+        // Discard OUTSIDE, COPLANAR_SAME and COPLANAR_OPP from B (entry/exit caps of B contribute no material).
         if (classification === 'INSIDE') {
           keep = true;
           invertNormal = true;
@@ -309,7 +305,7 @@ export class BooleanCSGKernel {
         const newFace = resultMesh.addFace(finalPositions, finalNormal);
         newFace.materialId = sfb.materialId;
 
-        // Si se especificó openingGroupId, etiquetar las jambas con dicho ID (Salvaguarda 6.1)
+        // If openingGroupId is specified, tag jamba faces accordingly
         if (options.openingGroupId) {
           newFace.openingId = options.openingGroupId;
         } else {
@@ -325,22 +321,22 @@ export class BooleanCSGKernel {
       }
     }
 
-    // 7. Consolidación de caras coplanares adyacentes (Salvaguarda 6.2 - Preservación de N-gonos)
+    // 7. Consolidate adjacent coplanar faces (N-gon preservation)
     try {
       resultMesh.coalesceCoplanarFaces();
     } catch {
-      // Si la consolidación falla por configuraciones no-manifold aisladas, se conservan las subcaras
+      // If consolidation fails due to isolated non-manifold configurations, keep sub-faces intact
     }
 
-    // 8. Reconstrucción topológica determinista
+    // 8. Deterministic topological reconstruction
     resultMesh.rebuildTopology();
 
     return resultMesh;
   }
 
   /**
-   * Intersección transversal 3D exacta entre dos polígonos planares.
-   * Devuelve el segmento de intersección mutuo [P1, P2] si se cruzan transversalmente, o null si son disjuntos o coplanares.
+   * Exact 3D transversal intersection between two planar polygons.
+   * Returns mutual intersection segment [P1, P2] if intersecting, or null if disjoint/coplanar.
    */
   private static intersectPolygonPolygon(
     fa: { positions: Vec3[]; normal: Vec3; plane: Plane },
@@ -349,24 +345,24 @@ export class BooleanCSGKernel {
   ): [Vec3, Vec3] | null {
     const dotNorm = fa.normal.dot(fb.normal);
 
-    // Si los planos son cuasi-paralelos (|dot| > 1 - 1e-3), no hay intersección transversal de corte
+    // If planes are quasi-parallel (|dot| > 1 - 1e-3), no transversal cutting intersection occurs
     if (Math.abs(dotNorm) > 1 - 1e-3) {
       return null;
     }
 
-    // Vector de dirección de la recta de intersección de ambos planos
+    // Direction vector of the line of intersection of both planes
     const lineDir = fa.normal.cross(fb.normal).normalize();
     if (lineDir.lengthSq() < 1e-6) return null;
 
-    // Calcular el segmento de corte del polígono fa con el plano de fb
+    // Compute cutting segment of polygon fa against the plane of fb
     const segA = this.getPolygonPlaneIntersectionSegment(fa.positions, fb.plane, lineDir, tol);
     if (!segA) return null;
 
-    // Calcular el segmento de corte del polígono fb con el plano de fa
+    // Compute cutting segment of polygon fb against the plane of fa
     const segB = this.getPolygonPlaneIntersectionSegment(fb.positions, fa.plane, lineDir, tol);
     if (!segB) return null;
 
-    // Parametrizar ambos segmentos sobre lineDir usando un ÚNICO punto de origen común (segA.p1)
+    // Parameterize both segments along lineDir using a single shared origin (segA.p1)
     const origin = segA.p1;
     const tA1 = 0;
     const tA2 = segA.p2.sub(origin).dot(lineDir);
@@ -378,7 +374,7 @@ export class BooleanCSGKernel {
     const minB = Math.min(tB1, tB2);
     const maxB = Math.max(tB1, tB2);
 
-    // Intersección de intervalos 1D
+    // 1D interval overlap intersection
     const tStart = Math.max(minA, minB);
     const tEnd = Math.min(maxA, maxB);
 
@@ -393,7 +389,7 @@ export class BooleanCSGKernel {
   }
 
   /**
-   * Obtiene el segmento 3D [p1, p2] de intersección de un polígono planar con un plano infinito.
+   * Computes the 3D line segment [p1, p2] where a planar polygon intersects an infinite plane.
    */
   private static getPolygonPlaneIntersectionSegment(
     poly: Vec3[],
@@ -415,10 +411,10 @@ export class BooleanCSGKernel {
       else onPlaneCount++;
     }
 
-    // Si todo el polígono es coplanar o cae estrictamente en un semiespacio sin aristas en el plano, no hay corte transversal
-    if (!hasStrictPos && !hasStrictNeg) return null; // Todo coplanar
-    if (!hasStrictPos && onPlaneCount < 2) return null; // Todo negativo sin arista en el plano
-    if (!hasStrictNeg && onPlaneCount < 2) return null; // Todo positivo sin arista en el plano
+    // If entire polygon is coplanar or falls strictly on one half-space without plane edges, no transversal intersection
+    if (!hasStrictPos && !hasStrictNeg) return null; // Entirely coplanar
+    if (!hasStrictPos && onPlaneCount < 2) return null; // Entirely negative without edge on plane
+    if (!hasStrictNeg && onPlaneCount < 2) return null; // Entirely positive without edge on plane
 
     const cutPoints: Vec3[] = [];
     for (let i = 0; i < n; i++) {
@@ -441,7 +437,7 @@ export class BooleanCSGKernel {
 
     if (cutPoints.length < 2) return null;
 
-    // Buscar los dos puntos extremos a lo largo de lineDir
+    // Find two extreme points along lineDir
     let minT = Infinity;
     let maxT = -Infinity;
     let pMin = cutPoints[0];
@@ -466,7 +462,7 @@ export class BooleanCSGKernel {
   }
 
   /**
-   * Subdivide una cara poligonal con una lista de segmentos de corte usando PlanarGraph.
+   * Subdivides a polygonal face with a list of cutting segments using PlanarGraph.
    */
   private static splitFaceWithCutSegments(
     face: Face,
@@ -478,14 +474,14 @@ export class BooleanCSGKernel {
     const basis = PolygonClipping.getLocalBasis(face.plane.origin, face.normal);
     const pg = new PlanarGraph(face.plane.origin, face.normal);
 
-    // 1. Insertar el contorno exterior en el grafo
+    // 1. Insert outer loop into graph
     const outer2D = outerVerts.map((p) => PolygonClipping.projectTo2D(p, basis));
     for (let i = 0; i < outer2D.length; i++) {
       const next = (i + 1) % outer2D.length;
       pg.addSegment2D(outer2D[i], outer2D[next]);
     }
 
-    // 2. Insertar agujeros existentes si los tiene
+    // 2. Insert existing holes if any
     if (face.holes && face.holes.length > 0) {
       for (const hole of face.holes) {
         const hole2D = hole.map((p) => PolygonClipping.projectTo2D(p, basis));
@@ -496,17 +492,17 @@ export class BooleanCSGKernel {
       }
     }
 
-    // 3. Insertar los segmentos de corte proyectados a 2D
+    // 3. Insert cutting segments projected to 2D
     for (const [p1, p2] of cutSegments) {
       const s1 = PolygonClipping.projectTo2D(p1, basis);
       const s2 = PolygonClipping.projectTo2D(p2, basis);
       pg.addSegment2D(s1, s2);
     }
 
-    // 4. Extraer subcaras 2D
+    // 4. Extract 2D sub-faces
     const extractedFaces = pg.extractFaces2D();
     if (extractedFaces.length === 0) {
-      // Fallback seguro: conservar cara original
+      // Safe fallback: preserve original face
       return [
         {
           positions: outerVerts,
@@ -521,6 +517,11 @@ export class BooleanCSGKernel {
     }
 
     const resultPieces: SubFaceData[] = [];
+    const preHoles2D =
+      face.holes && face.holes.length > 0
+        ? face.holes.map((h) => h.map((p) => PolygonClipping.projectTo2D(p, basis)))
+        : null;
+
     for (const pf of extractedFaces) {
       if (pf.outerLoop.length < 3) continue;
 
@@ -529,6 +530,20 @@ export class BooleanCSGKernel {
 
       // Desproyectar agujeros a 3D si los tiene
       const holes3D = pf.holes ? pf.holes.map((h) => h.map((p2d) => PolygonClipping.unprojectTo3D(p2d, basis))) : undefined;
+
+      // Filter out sub-faces whose interior falls inside a pre-existing hole of the face
+      if (preHoles2D) {
+        const testPt = this.getDominantInteriorPoint(poly3D, face.normal, holes3D);
+        const testPt2D = PolygonClipping.projectTo2D(testPt, basis);
+        let insidePreHole = false;
+        for (const h2D of preHoles2D) {
+          if (PolygonClipping.pointInPolygon2D(testPt2D, h2D)) {
+            insidePreHole = true;
+            break;
+          }
+        }
+        if (insidePreHole) continue;
+      }
 
       resultPieces.push({
         positions: poly3D,
@@ -557,7 +572,7 @@ export class BooleanCSGKernel {
   }
 
   /**
-   * Clasifica una subcara como INSIDE, OUTSIDE, COPLANAR_SAME o COPLANAR_OPP con respecto a otro sólido.
+   * Classifies a sub-face as INSIDE, OUTSIDE, COPLANAR_SAME, or COPLANAR_OPP relative to another solid.
    */
   private static classifySubFace(
     subFace: SubFaceData,
@@ -565,44 +580,47 @@ export class BooleanCSGKernel {
     otherFaces: { positions: Vec3[]; normal: Vec3; plane: Plane; box: THREE.Box3 }[],
     tol: number
   ): 'INSIDE' | 'OUTSIDE' | 'COPLANAR_SAME' | 'COPLANAR_OPP' {
-    // 1. Evaluar si la subcara es coplanar con alguna cara de otherFaces
-    const sfCenter = this.computeCentroid(subFace.positions);
+    // 0. Extract guaranteed dominant interior point inside sub-face boundary and outside any holes
+    const testPoint = this.getDominantInteriorPoint(subFace.positions, subFace.normal, subFace.holes);
 
+    // 1. Evaluate whether testPoint lies on any coplanar face in otherFaces
     for (const of of otherFaces) {
       const dot = subFace.normal.dot(of.normal);
       if (Math.abs(Math.abs(dot) - 1.0) <= 1e-3) {
-        // Normales paralelas o antiparalelas
-        const dist = Math.abs(of.plane.distanceToPoint(sfCenter));
+        // Parallel or antiparallel face normals
+        const dist = Math.abs(of.plane.distanceToPoint(testPoint));
         if (dist <= tol) {
-          // Comprobar solape 2D proyectado
+          // Check 2D projected overlap
           const basis = PolygonClipping.getLocalBasis(of.plane.origin, of.normal);
           const of2D = of.positions.map((p) => PolygonClipping.projectTo2D(p, basis));
-          const sfCenter2D = PolygonClipping.projectTo2D(sfCenter, basis);
+          const testPoint2D = PolygonClipping.projectTo2D(testPoint, basis);
 
-          if (PolygonClipping.isPointInOrOnPolygon2D(sfCenter2D, of2D, tol * 5)) {
+          if (PolygonClipping.isPointInOrOnPolygon2D(testPoint2D, of2D, tol * 5)) {
             return dot > 0 ? 'COPLANAR_SAME' : 'COPLANAR_OPP';
           }
         }
       }
     }
 
-    // 2. Clasificación general por punto interior y ray-casting 3D
-    const testPoint = this.getDominantInteriorPoint(subFace.positions, subFace.normal);
+    // 2. General topological classification via 3D ray casting
     const isInside = this.isPointInsideMesh(testPoint, otherTriangles, tol);
 
     return isInside ? 'INSIDE' : 'OUTSIDE';
   }
 
   /**
-   * Determina un punto interior garantizado en un polígono (evita baricentros fuera de caras cóncavas).
-   * Calcula el incentro/baricentro del triángulo de mayor área resultante de la triangulación.
+   * Determines a guaranteed interior point inside a polygon (avoids centroids falling outside concave polygons or inside holes).
+   * Computes the incenter/centroid of the maximum-area triangle resulting from triangulation (with holes if present).
    */
-  private static getDominantInteriorPoint(positions: Vec3[], normal: Vec3): Vec3 {
-    if (positions.length === 3) {
+  private static getDominantInteriorPoint(positions: Vec3[], normal: Vec3, holes?: Vec3[][]): Vec3 {
+    if (positions.length === 3 && (!holes || holes.length === 0)) {
       return positions[0].add(positions[1]).add(positions[2]).scale(1 / 3);
     }
 
-    const tris = PolygonClipping.triangulate(positions, normal);
+    const tris = holes && holes.length > 0
+      ? PolygonClipping.triangulateWithHoles(positions, holes, normal)
+      : PolygonClipping.triangulate(positions, normal);
+
     if (tris.length < 3) {
       return this.computeCentroid(positions);
     }
@@ -628,7 +646,7 @@ export class BooleanCSGKernel {
   }
 
   /**
-   * Ray-casting 3D robusto con perturbación multiaxial para evitar degeneraciones en vértices/aristas.
+   * Robust 3D ray casting with multi-axial perturbation to prevent edge and vertex degeneracies.
    */
   private static isPointInsideMesh(
     point: Vec3,
@@ -637,7 +655,7 @@ export class BooleanCSGKernel {
   ): boolean {
     if (triangles.length === 0) return false;
 
-    // Direcciones de rayo candidatas no alineadas con ejes canónicos
+    // Candidate ray directions not aligned with standard canonical axes
     const rayDirections = [
       new Vec3(1, 0, 0),
       new Vec3(0.57735, 0.57735, 0.57735).normalize(),
@@ -655,7 +673,7 @@ export class BooleanCSGKernel {
 
         if (hit.isBorder) {
           ambiguous = true;
-          break; // Probar siguiente dirección de rayo
+          break; // Perturb and try next candidate ray direction
         }
 
         if (hit.t > tol) {
@@ -668,12 +686,12 @@ export class BooleanCSGKernel {
       }
     }
 
-    // Fallback: usar el resultado del primer rayo si todos tuvieron contacto tangencial mínimo
+    // Fallback: return false if all ray attempts suffered grazing ambiguities
     return false;
   }
 
   /**
-   * Intersección rayo-triángulo con algoritmo Möller-Trumbore y detección de borde/ambigüedad.
+   * Ray-triangle intersection via Möller-Trumbore algorithm with boundary grazing detection.
    */
   private static rayTriangleIntersect(
     orig: Vec3,
@@ -704,7 +722,7 @@ export class BooleanCSGKernel {
     const t = edge2.dot(qvec) * invDet;
     if (t < -tol) return null;
 
-    // Detección de borde si (u, v) cae excesivamente cerca de las fronteras
+    // Boundary detection if (u, v) falls excessively close to triangle borders
     const borderTol = 1e-3;
     const isBorder =
       Math.abs(u) < borderTol ||
@@ -715,7 +733,7 @@ export class BooleanCSGKernel {
   }
 
   /**
-   * Triangula una malla PolyMesh completa para acelerar consultas narrow-phase.
+   * Triangulates a complete PolyMesh to accelerate narrow-phase queries.
    */
   private static triangulateMesh(mesh: PolyMesh): Triangle3D[] {
     const triangles: Triangle3D[] = [];

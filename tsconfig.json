@@ -1,0 +1,8 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/ifc-core" },
+    { "path": "./packages/ifc-viewer" },
+    { "path": "./apps/web-viewer" }
+  ]
+}

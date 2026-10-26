@@ -14,6 +14,7 @@ export class CroqueraBridge {
   private readonly targetUrl: string;
 
   private currentBuffer: ArrayBuffer | null = null;
+  private currentFile: File | null = null;
   private currentFilename: string = 'model.ifc';
 
   constructor(options: CroqueraBridgeOptions = {}) {
@@ -21,25 +22,32 @@ export class CroqueraBridge {
   }
 
   /**
-   * Registers the loaded IFC file buffer and filename in memory.
+   * Registers the loaded IFC file (or buffer) and filename in memory without eager cloning.
    */
-  public setFile(buffer: ArrayBuffer, filename: string): void {
-    this.currentBuffer = buffer;
-    this.currentFilename = filename;
+  public setFile(fileOrBuffer: File | ArrayBuffer, filename?: string): void {
+    if (typeof File !== 'undefined' && fileOrBuffer instanceof File) {
+      this.currentFile = fileOrBuffer;
+      this.currentFilename = fileOrBuffer.name;
+      this.currentBuffer = null;
+    } else {
+      this.currentBuffer = fileOrBuffer as ArrayBuffer;
+      this.currentFilename = filename || 'model.ifc';
+      this.currentFile = null;
+    }
   }
 
   /**
-   * Returns true if an IFC file buffer is ready for transmission.
+   * Returns true if an IFC file is ready for transmission.
    */
   public hasFile(): boolean {
-    return this.currentBuffer !== null && this.currentBuffer.byteLength > 0;
+    return this.currentFile !== null || (this.currentBuffer !== null && this.currentBuffer.byteLength > 0);
   }
 
   /**
    * Launches croquera.com in a new tab and streams the IFC model buffer upon ready handshake.
    */
-  public editInCroquera(): void {
-    if (!this.currentBuffer) {
+  public async editInCroquera(): Promise<void> {
+    if (!this.hasFile()) {
       alert('No IFC model is currently loaded.');
       return;
     }
@@ -52,8 +60,12 @@ export class CroqueraBridge {
       return;
     }
 
-    // Clone the buffer slice so the viewer can still retain its own copy
-    const bufferToSend = this.currentBuffer.slice(0);
+    let bufferToSend: ArrayBuffer;
+    if (this.currentFile) {
+      bufferToSend = await this.currentFile.arrayBuffer();
+    } else {
+      bufferToSend = this.currentBuffer!.slice(0);
+    }
 
     const onMessage = (event: MessageEvent): void => {
       // Check for ready signal from Croquera

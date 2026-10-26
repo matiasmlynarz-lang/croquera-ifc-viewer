@@ -1,9 +1,9 @@
 /**
- * IfcStepParser — Generador de grafo de entidades STEP y mapa de líneas originales.
+ * IfcStepParser — STEP entity graph generator and original line indexer.
  *
- * Parsea archivos ISO-10303-21 en memoria y mantiene la referencia textual exacta
- * de cada entidad (rawLine), lo que permite la exportación diferencial (delta patching)
- * sin pérdida de precisión ni de datos de terceros.
+ * Parses ISO-10303-21 files in memory and retains exact textual references
+ * for each entity (rawLine), enabling differential export (delta patching)
+ * without loss of precision or third-party schema data.
  */
 
 import { IfcStepLexer, StepTokenType, type StepToken } from '../lexer/IfcStepLexer';
@@ -16,7 +16,7 @@ export type StepParam =
   | { ref: number }
   | { enum: string }
   | { asterisk: true }
-  | { type: string; params: StepParam[] } // Tipos anidados como IFCLABEL('foo')
+  | { type: string; params: StepParam[] } // Nested types such as IFCLABEL('foo')
   | StepParam[];
 
 export interface StepRecord {
@@ -49,27 +49,27 @@ export class IfcStepParser {
   }
 
   /**
-   * Parsea completamente el contenido STEP y construye las tablas de índices.
+   * Fully parses STEP content and constructs index lookup tables.
    */
   public parse(): void {
     let token = this.lexer.nextToken();
 
-    // 1. Escanear hasta la sección HEADER o DATA
+    // 1. Scan until HEADER or DATA section
     while (token.type !== StepTokenType.EOF) {
       if (token.type === StepTokenType.WORD) {
         const word = token.value.toUpperCase();
         if (word === 'HEADER') {
-          // Consumir ';'
+          // Consume ';'
           token = this.lexer.nextToken();
           this.parseHeader();
           const headerEnd = this.lexer.getPos();
           this.rawHeaderSection = this.buffer.slice(0, headerEnd).trim();
           break;
         } else if (word === 'DATA') {
-          // Archivo sin HEADER, entrar directamente a DATA
+          // File without HEADER, proceed directly to DATA
           const next = this.lexer.nextToken();
           if (next.type !== StepTokenType.SEMICOLON) {
-            // Continuar
+            // Continue
           }
           this.parseData();
           return;
@@ -78,13 +78,13 @@ export class IfcStepParser {
       token = this.lexer.nextToken();
     }
 
-    // 2. Escanear hasta la sección DATA si aún no se ha parseado
+    // 2. Scan until DATA section if not yet parsed
     token = this.lexer.nextToken();
     while (token.type !== StepTokenType.EOF) {
       if (token.type === StepTokenType.WORD && token.value.toUpperCase() === 'DATA') {
         const next = this.lexer.nextToken();
         if (next.type !== StepTokenType.SEMICOLON) {
-          // Continuar
+          // Continue
         }
         this.parseData();
         break;
@@ -94,7 +94,7 @@ export class IfcStepParser {
   }
 
   /**
-   * Parsea la sección HEADER.
+   * Parses the HEADER section.
    */
   private parseHeader(): void {
     while (true) {
@@ -103,18 +103,18 @@ export class IfcStepParser {
 
       if (token.type === StepTokenType.EOF) break;
       if (token.type === StepTokenType.WORD && token.value.toUpperCase() === 'ENDSEC') {
-        // Consumir ';'
+        // Consume ';'
         this.lexer.nextToken();
         break;
       }
 
       if (token.type === StepTokenType.WORD) {
         const typeName = token.value.toUpperCase();
-        // Esperar '('
+        // Expect '('
         const lp = this.lexer.nextToken();
         if (lp.type === StepTokenType.LPAREN) {
           const params = this.parseParamList();
-          // Esperar ';'
+          // Expect ';'
           const semi = this.lexer.nextToken();
           const lineEnd = semi.end;
           const rawLine = this.buffer.slice(lineStart, lineEnd).trim();
@@ -129,7 +129,7 @@ export class IfcStepParser {
   }
 
   /**
-   * Parsea la sección DATA (#id = TYPE(params);).
+   * Parses the DATA section (#id = TYPE(params);).
    */
   private parseData(): void {
     while (true) {
@@ -138,7 +138,7 @@ export class IfcStepParser {
 
       if (token.type === StepTokenType.EOF) break;
       if (token.type === StepTokenType.WORD && token.value.toUpperCase() === 'ENDSEC') {
-        // Consumir ';'
+        // Consume ';'
         this.lexer.nextToken();
         break;
       }
@@ -149,22 +149,22 @@ export class IfcStepParser {
           this.maxId = entityId;
         }
 
-        // Esperar '='
+        // Expect '='
         const eq = this.lexer.nextToken();
         if (eq.type !== StepTokenType.EQUALS) continue;
 
-        // Esperar nombre de tipo (ej. IFCWALL)
+        // Expect type name (e.g. IFCWALL)
         const typeToken = this.lexer.nextToken();
         if (typeToken.type !== StepTokenType.WORD) continue;
         const typeName = typeToken.value.toUpperCase();
 
-        // Esperar '('
+        // Expect '('
         const lp = this.lexer.nextToken();
         if (lp.type !== StepTokenType.LPAREN) continue;
 
         const params = this.parseParamList();
 
-        // Esperar ';'
+        // Expect ';'
         const semi = this.lexer.nextToken();
         const lineEnd = semi.type === StepTokenType.SEMICOLON ? semi.end : this.lexer.getPos();
 
@@ -193,12 +193,12 @@ export class IfcStepParser {
   private static readonly MAX_PARAM_DEPTH = 128;
 
   /**
-   * Parsea una lista de parámetros delimitada por comas hasta encontrar ')'.
+   * Parses a comma-separated parameter list until matching ')'.
    */
   private parseParamList(depth: number = 0): StepParam[] {
     if (depth > IfcStepParser.MAX_PARAM_DEPTH) {
-      console.warn(`[IfcStepParser] Límite de anidamiento de parámetros excedido (> ${IfcStepParser.MAX_PARAM_DEPTH}). Truncando lista.`);
-      // Consumir hasta el siguiente RPAREN o EOF para equilibrar
+      console.warn(`[IfcStepParser] Parameter nesting limit exceeded (> ${IfcStepParser.MAX_PARAM_DEPTH}). Truncating list.`);
+      // Consume until next RPAREN or EOF to balance
       while (true) {
         const next = this.lexer.nextToken();
         if (next.type === StepTokenType.RPAREN || next.type === StepTokenType.EOF) {
@@ -210,13 +210,13 @@ export class IfcStepParser {
 
     const params: StepParam[] = [];
 
-    // Comprobar si la lista está vacía inmediatamente
+    // Check if list is immediately empty
     const peekToken = this.lexer.nextToken();
     if (peekToken.type === StepTokenType.RPAREN) {
       return params;
     }
 
-    // Si no estaba vacía, parsear el primer parámetro
+    // If not empty, parse first parameter
     params.push(this.parseParamValue(peekToken, depth));
 
     while (true) {
@@ -227,7 +227,7 @@ export class IfcStepParser {
       if (next.type === StepTokenType.COMMA) {
         const valToken = this.lexer.nextToken();
         if (valToken.type === StepTokenType.RPAREN) {
-          // Tupla terminada con coma colgante
+          // Trailing comma tuple
           break;
         }
         params.push(this.parseParamValue(valToken, depth));
@@ -238,7 +238,7 @@ export class IfcStepParser {
   }
 
   /**
-   * Parsea un único valor de parámetro.
+   * Parses a single parameter value.
    */
   private parseParamValue(token: StepToken, depth: number = 0): StepParam {
     switch (token.type) {
@@ -259,14 +259,14 @@ export class IfcStepParser {
       case StepTokenType.LPAREN:
         return this.parseParamList(depth + 1);
       case StepTokenType.WORD: {
-        // Podría ser un tipo anidado como IFCLABEL('mi texto') o IFCBOOLEAN(.T.)
+        // Could be a nested type like IFCLABEL('my text') or IFCBOOLEAN(.T.)
         const savedPos = this.lexer.getPos();
         const next = this.lexer.nextToken();
         if (next.type === StepTokenType.LPAREN) {
           const nestedParams = this.parseParamList(depth + 1);
           return { type: token.value.toUpperCase(), params: nestedParams };
         }
-        // Si no va seguido de '(', es una palabra clave suelta
+        // If not followed by '(', it is a standalone keyword
         this.lexer.setPos(savedPos);
         return token.value;
       }
@@ -276,14 +276,14 @@ export class IfcStepParser {
   }
 
   /**
-   * Obtiene un registro por ID.
+   * Retrieves a record by STEP ID.
    */
   public getRecord(id: number): StepRecord | undefined {
     return this.records.get(id);
   }
 
   /**
-   * Obtiene todos los registros de un tipo IFC dado (case-insensitive).
+   * Retrieves all records of a given IFC type (case-insensitive).
    */
   public getRecordsByType(type: string): StepRecord[] {
     return this.recordsByType.get(type.toUpperCase()) || [];

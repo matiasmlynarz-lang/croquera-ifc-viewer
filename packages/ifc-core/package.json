@@ -15,6 +15,12 @@
     "build": "tsc",
     "test": "vitest run"
   },
+  "peerDependencies": {
+    "three": ">=0.170.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.174.0"
+  },
   "keywords": [
     "ifc",
     "bim",

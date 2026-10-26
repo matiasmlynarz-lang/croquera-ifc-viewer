@@ -1,16 +1,16 @@
 /**
- * GuidUtils — Generador y conversor de identificadores IfcGloballyUniqueId (22 caracteres).
+ * GuidUtils — Generator and converter for IfcGloballyUniqueId (22 characters).
  *
- * Implementa la codificación y decodificación oficial de buildingSMART para
- * convertir entre UUIDs RFC 4122 (128 bits / 36 caracteres) y cadenas IFC Base64 (22 caracteres).
- * Alfabeto IFC: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$"
+ * Implements the official buildingSMART encoding and decoding algorithms to
+ * convert between standard RFC 4122 UUIDs (128 bits / 36 characters) and IFC Base64 strings (22 characters).
+ * IFC Base64 Alphabet: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$"
  */
 
 const IFC_BASE64_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$';
 
 export class GuidUtils {
   /**
-   * Genera un nuevo IfcGloballyUniqueId de 22 caracteres válido para IFC 4.3.
+   * Generates a new valid 22-character IfcGloballyUniqueId for IFC 4.3.
    */
   static createIfcGuid(): string {
     const uuid = this.createUuidV4();
@@ -18,7 +18,7 @@ export class GuidUtils {
   }
 
   /**
-   * Genera un UUID estándar v4 (36 caracteres con guiones).
+   * Generates a standard RFC 4122 v4 UUID (36 characters with hyphens).
    */
   static createUuidV4(): string {
     if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -32,12 +32,12 @@ export class GuidUtils {
   }
 
   /**
-   * Convierte un UUID RFC 4122 (hexadecimal de 36 caracteres o sin guiones) a un IFC GUID (22 caracteres).
+   * Converts an RFC 4122 UUID (hexadecimal 36 characters or unhyphenated) to an IFC GUID (22 characters).
    */
   static uuidToIfcGuid(uuid: string): string {
     const cleanUuid = uuid.replace(/-/g, '');
     if (cleanUuid.length !== 32) {
-      throw new Error(`UUID inválido para conversión a IFC GUID: ${uuid}`);
+      throw new Error(`Invalid UUID for conversion to IFC GUID: ${uuid}`);
     }
 
     const bytes = new Uint8Array(16);
@@ -49,11 +49,11 @@ export class GuidUtils {
   }
 
   /**
-   * Convierte un IFC GUID (22 caracteres) a un UUID RFC 4122 (36 caracteres con guiones).
+   * Converts an IFC GUID (22 characters) to an RFC 4122 UUID (36 characters with hyphens).
    */
   static ifcGuidToUuid(ifcGuid: string): string {
     if (ifcGuid.length !== 22) {
-      throw new Error(`IFC GUID inválido (debe tener 22 caracteres): ${ifcGuid}`);
+      throw new Error(`Invalid IFC GUID (must have 22 characters): ${ifcGuid}`);
     }
 
     const bytes = this.decodeIfcGuidToBytes(ifcGuid);
@@ -67,9 +67,9 @@ export class GuidUtils {
 
   private static encodeBytesToIfcGuid(b: Uint8Array): string {
     // buildingSMART standard conversion:
-    // b[0] (1er byte / 8 bits) -> 2 caracteres base64 IFC
-    // 5 bloques de 3 bytes (24 bits c/u) -> 4 caracteres base64 IFC cada uno
-    // Total: 2 + (5 * 4) = 22 caracteres
+    // b[0] (1st byte / 8 bits) -> 2 IFC base64 characters
+    // 5 chunks of 3 bytes (24 bits each) -> 4 IFC base64 characters each
+    // Total: 2 + (5 * 4) = 22 characters
     let result = this.cv_to_64(b[0], 2);
 
     for (let i = 0; i < 5; i++) {
@@ -113,7 +113,7 @@ export class GuidUtils {
     for (let i = 0; i < str.length; i++) {
       const idx = IFC_BASE64_CHARS.indexOf(str.charAt(i));
       if (idx === -1) {
-        throw new Error(`Carácter inválido en IFC GUID: ${str.charAt(i)}`);
+        throw new Error(`Invalid character in IFC GUID: ${str.charAt(i)}`);
       }
       res = (res << 6) | idx;
     }
@@ -121,7 +121,7 @@ export class GuidUtils {
   }
 
   /**
-   * Valida si una cadena cumple con el formato oficial de IfcGloballyUniqueId (22 caracteres en alfabeto IFC).
+   * Validates if a string conforms to the official IfcGloballyUniqueId format (22 characters in IFC alphabet).
    */
   public static isValidIfcGuid(guid: string): boolean {
     if (!guid || typeof guid !== 'string' || guid.length !== 22) {
@@ -136,7 +136,7 @@ export class GuidUtils {
   }
 
   /**
-   * Alias de conveniencia para isValidIfcGuid.
+   * Convenience alias for isValidIfcGuid.
    */
   public static isIfcGuid(guid: string): boolean {
     return this.isValidIfcGuid(guid);

@@ -1,9 +1,9 @@
 /**
- * IfcStepImporter — Importador de IFC 4.3 ISO-10303-21 nativo para CROQUERA.
+ * IfcStepImporter — Native IFC 4.3 ISO-10303-21 importer for CROQUERA.
  *
- * Parsea el archivo STEP, extrae la geometría teselada / B-Rep y la jerarquía espacial,
- * reconstruye los PolyMesh con Half-Edge invariants, hidrata los Property Sets
- * y restaura el BuildingFramework (niveles y grids) con fidelidad del 100%.
+ * Parses the STEP file, extracts tessellated / B-Rep geometry and spatial hierarchy,
+ * reconstructs PolyMesh structures with Half-Edge invariants, hydrates Property Sets,
+ * and restores BuildingFramework (levels and grids) with 100% fidelity.
  */
 
 import { IfcStepParser, type StepRecord, type StepParam } from '../parser/IfcStepParser';
@@ -19,7 +19,8 @@ import { Plane } from '../math/Plane';
 import { GuidUtils } from '../types/GuidUtils';
 import { GeometryTolerance } from '../math/GeometryTolerance';
 import * as THREE from 'three';
-import { GeometryPrototypeDetector } from '../detector/GeometryPrototypeDetector';
+import { GeometryPrototypeDetector, M_CANONICAL, M_CANONICAL_INV } from '../detector/GeometryPrototypeDetector';
+import { ParametricSolidHasher, type ParametricSolidSignature } from '../detector/ParametricSolidHasher';
 import type {
   Stage1SpatialPayload,
   Stage2BoundsPayload,
@@ -43,6 +44,13 @@ export interface EvaluatedProductEntity {
   storeyId?: string | null;
   matrixId?: string | null;
   polyMesh?: PolyMesh;
+  rawGeometry?: {
+    positions: Float32Array;
+    normals: Float32Array;
+    indices: Uint32Array;
+    edgesBuffer?: Float32Array;
+  };
+  materialId?: string;
   hidden?: boolean;
   faces?: any[];
   vertices?: Vec3[];
@@ -53,10 +61,9 @@ export interface ImportResult {
   importedEntityIds: string[];
   buildingIds: string[];
   storeyIds: string[];
-  parser: IfcStepParser | IIfcStreamingParser; // Guardado para delta patching posterior
+  parser: IfcStepParser | IIfcStreamingParser; // Saved for subsequent delta patching
   defaultBuildingId?: string | null;
   parsedLevels?: { id: string; name: string; elevation: number }[];
-  frameworkMetadata?: any;
   georef?: GeorefData | null;
 }
 
@@ -66,6 +73,10 @@ export const IFC_PRIORITY_STRUCTURAL_TYPES = new Set<string>([
   'IFCSLAB',
   'IFCCOLUMN',
   'IFCBEAM',
+  'IFCMEMBER',
+  'IFCPLATE',
+  'IFCSIGN',
+  'IFCSIGNAL',
   'IFCDOOR',
   'IFCWINDOW',
   'IFCROOF',
@@ -76,11 +87,16 @@ export const IFC_PRIORITY_STRUCTURAL_TYPES = new Set<string>([
   'IFCFOOTING',
   'IFCCURTAINWALL',
   'IFCOPENINGELEMENT',
+  'IFCSPACE',
+  'IFCEARTHWORKSELEMENT',
+  'IFCEARTHWORKSCUT',
+  'IFCEARTHWORKSFILL',
+  'IFCSITE',
 ]);
 
 /**
- * Diccionario inmutable de índices de atributos STEP (0-based) conforme a ISO 16739-1 (IFC 4.3 ADD2).
- * Norma 21: Prohibido acceder a parámetros STEP mediante índices numéricos mágicos sueltos.
+ * Immutable dictionary of STEP attribute indices (0-based) conforming to ISO 16739-1 (IFC 4.3 ADD2).
+ * Rule 21: Prohibited to access STEP parameters via bare magic numeric indices.
  */
 export const IFC_GEOM_ATTRS = {
   // IfcFacetedBrep / IfcFacetedBrepWithVoids
@@ -211,6 +227,9 @@ export class IfcStepImporter {
     IFCCIVILELEMENT: 'IfcCivilElement',
     IFCGEOGRAPHICELEMENT: 'IfcGeographicElement',
     IFCEARTHWORKSELEMENT: 'IfcEarthworksElement',
+    IFCEARTHWORKSCUT: 'IfcEarthworksCut',
+    IFCEARTHWORKSFILL: 'IfcEarthworksFill',
+    IFCROADPART: 'IfcRoadPart',
     IFCTRACKELEMENT: 'IfcTrackElement',
     IFCTRANSPORTELEMENT: 'IfcTransportElement',
     IFCBEARING: 'IfcBearing',
@@ -332,9 +351,12 @@ export class IfcStepImporter {
     'IFCSURFACEFEATURE',
     'IFCVOIDINGFEATURE',
     // Infraestructura civil y terreno
+    'IFCSITE',
     'IFCCIVILELEMENT',
     'IFCGEOGRAPHICELEMENT',
     'IFCEARTHWORKSELEMENT',
+    'IFCEARTHWORKSCUT',
+    'IFCEARTHWORKSFILL',
     'IFCTRACKELEMENT',
     'IFCPAVEMENT',
     'IFCKERB',
@@ -399,6 +421,9 @@ export class IfcStepImporter {
     'IFCFILTER',
   ];
 
+  public static readonly DEFERRED_PRODUCT_TYPES: readonly string[] =
+    IfcStepImporter.ALL_PRODUCT_TYPES.filter((t) => !IFC_PRIORITY_STRUCTURAL_TYPES.has(t));
+
   public static canonicalizeIfcType(rawType: string): string {
     if (!rawType) return 'IfcBuildingElementProxy';
     const upper = rawType.toUpperCase().trim();
@@ -428,20 +453,20 @@ export class IfcStepImporter {
   private planeAngleUnitScale: number = Math.PI / 180;
   public importWarnings: string[] = [];
 
-  // Parámetros y estado de georreferenciación LoGeoRef 50 (Fase 2)
+  // LoGeoRef 50 georeferencing parameters and state (Phase 2)
   private extractedGeoref: GeorefData | null = null;
   private extractedTrueNorth: { x: number; y: number } | null = null;
   private siteGeoTranslationCaptured = false;
   private capturedSiteTranslation: { x: number; y: number; z: number } = { x: 0, y: 0, z: 0 };
   private capturedSiteRotation: THREE.Matrix4 = new THREE.Matrix4();
 
-  // Estados preparados para streaming progresivo (Fase 4)
+  // Prepared states for progressive streaming (Phase 4)
   private isPrepared = false;
+  private psetRelationsByElement: Map<number, number[]> = new Map();
   private elemPsetsMap: Map<number, Record<string, Record<string, any>>> = new Map();
   private elementMaterialMap: Map<number, string> = new Map();
   private itemToStyleMap: Map<number, string> = new Map();
   private faceToStyleMap: Map<number, string> = new Map();
-  private frameworkMetadata: any = null;
   private stepIdToEntityId: Map<number, string> = new Map();
   private defaultProjectId: string | null = null;
   private defaultSiteId: string | null = null;
@@ -450,6 +475,20 @@ export class IfcStepImporter {
   private storeyToBuildingGuidMap: Map<number, string> = new Map();
   private parsedLevels: { id: string; name: string; elevation: number }[] = [];
   private buildingPlacements: Map<string, THREE.Matrix4> = new Map();
+  private parametricPrototypes: Map<
+    bigint,
+    {
+      prototypeId: string;
+      stepId: number;
+      centroid_ifc: [number, number, number];
+      pcaRotation: THREE.Matrix4;
+      solidMatrixInv: THREE.Matrix4;
+    }
+  > = new Map();
+  private parametricMeshCache: Map<bigint, PolyMesh> = new Map();
+  private openingMeshCache: Map<number, { polyMesh: PolyMesh; id: string } | null> = new Map();
+  private placementMatrixCache: Map<number, THREE.Matrix4> = new Map();
+  private axis2PlacementCache: Map<number, THREE.Matrix4> = new Map();
 
   private getInheritedStoreyGuid(stepId: number): string | null {
     let currStepId: number | undefined = stepId;
@@ -499,7 +538,7 @@ export class IfcStepImporter {
     this.lengthUnitScale = 1.0;
     this.planeAngleUnitScale = Math.PI / 180;
 
-    // 1. Buscar unidades del SI (longitud y ángulo)
+    // 1. Search SI units (length and angle)
     const siUnits = this.parser.getRecordsByType('IFCSIUNIT');
     let lengthFound = false;
     for (const u of siUnits) {
@@ -532,7 +571,7 @@ export class IfcStepImporter {
       }
     }
 
-    // 2. Buscar unidades por conversión (longitud y ángulo)
+    // 2. Search conversion-based units (length and angle)
     const convUnits = this.parser.getRecordsByType('IFCCONVERSIONBASEDUNIT');
     for (const cu of convUnits) {
       const unitType = this.getParamEnumOrString(cu.params[1]);
@@ -591,26 +630,32 @@ export class IfcStepImporter {
       if (pParam && typeof pParam === 'object' && 'ref' in pParam) {
         const sitePlRef = (pParam as any).ref;
         this.sitePlacementRefs.add(sitePlRef);
-        // Resolver y capturar la traslación geodésica del Site en el paso preparatorio
+        // Resolve and capture geodetic translation of Site in the preparatory step
         this.resolveLocalPlacementMatrix(sitePlRef);
       }
     }
   }
 
   /**
-   * Prepara el grafo de relaciones, Psets y metadatos sin instanciar geometrías pesadas (Fase 4).
+   * Prepares the relationship graph, Psets, and metadata without instantiating heavy geometries (Phase 4).
    */
   public prepareImport(): void {
     if (this.isPrepared) return;
 
     this.parseUnitAssignment();
     this.materialCatalog.clear();
-    this.elemPsetsMap = this.extractElementPsets();
+    this.indexPsetRelations();
+    this.elemPsetsMap.clear();
+    this.parametricPrototypes.clear();
+    this.parametricMeshCache.clear();
+    this.openingMeshCache.clear();
+    this.placementMatrixCache.clear();
+    this.axis2PlacementCache.clear();
+    this.resolveSpatialContainerPsets();
     this.elementMaterialMap = this.importMaterials();
     const styled = this.parseStyledItems();
     this.itemToStyleMap = styled.itemToStyleMap;
     this.faceToStyleMap = styled.faceToStyleMap;
-    this.frameworkMetadata = this.extractFrameworkMetadata();
 
     this.stepParentToChildrenMap.clear();
     this.stepChildToParentMap.clear();
@@ -706,10 +751,10 @@ export class IfcStepImporter {
     this.defaultSiteId = null;
     this.defaultBuildingId = null;
 
-    // 1. Proyectos
+    // 1. Projects
     const projectRecords = this.parser.getRecordsByType('IFCPROJECT');
     if (projectRecords.length === 0) {
-      const msg = 'Advertencia STEP: El archivo no contiene la entidad raíz IfcProject. Se creará una estructura espacial por defecto.';
+      const msg = 'STEP Warning: File does not contain root entity IfcProject. Default spatial structure will be created.';
       console.warn(`[IfcStepImporter] ${msg}`);
       this.importWarnings.push(msg);
       const defaultGuid = GuidUtils.createIfcGuid();
@@ -717,7 +762,7 @@ export class IfcStepImporter {
       this.spatialNodes.push({
         id: defaultGuid,
         stepId: 0,
-        name: 'Proyecto por defecto',
+        name: 'Default Project',
         ifcType: 'IfcProject',
         parentId: null,
         psets: {},
@@ -739,7 +784,7 @@ export class IfcStepImporter {
       }
     }
 
-    // 2. Sitios (Raíz física en SceneGraph: parentId = null si existen)
+    // 2. Sites (Physical root in SceneGraph: parentId = null if present)
     const siteRecords = this.parser.getRecordsByType('IFCSITE');
     for (const site of siteRecords) {
       const guid = this.getParamString(site.params[0]) || GuidUtils.createIfcGuid();
@@ -756,7 +801,7 @@ export class IfcStepImporter {
       });
     }
 
-    // 3. Edificios
+    // 3. Buildings
     const facilityTypes = [
       'IFCBUILDING',
       'IFCFACILITY',
@@ -777,7 +822,7 @@ export class IfcStepImporter {
         parentGuid = this.defaultSiteId || null;
       }
 
-      // Resolver ObjectPlacement (param 5) del edificio y convertir a coordenadas Croquera Y-Up (Norma 21, Norma 22)
+      // Resolve ObjectPlacement (param 5) of the building and convert to Croquera Y-Up coordinates (Rule 21, Rule 22)
       const placementParam = bldg.params[5];
       let bldgPlacementMatrix = new THREE.Matrix4();
       if (placementParam && typeof placementParam === 'object' && 'ref' in placementParam) {
@@ -797,8 +842,8 @@ export class IfcStepImporter {
       });
     }
 
-    // 4. Pisos / Niveles
-    const storeyTypes = ['IFCBUILDINGSTOREY', 'IFCFACILITYPART', 'IFCBUILDINGPART'];
+    // 4. Storeys / Levels
+    const storeyTypes = ['IFCBUILDINGSTOREY', 'IFCFACILITYPART', 'IFCBUILDINGPART', 'IFCROADPART'];
     const storeyRecords = storeyTypes.flatMap((t) => this.parser.getRecordsByType(t));
     this.storeyMap.clear();
     this.storeyToBuildingGuidMap.clear();
@@ -832,12 +877,12 @@ export class IfcStepImporter {
         psets: this.elemPsetsMap.get(storey.id) || {},
       });
 
-      // Ajuste 2: Los IfcBuildingStorey no se crean como nodos GROUP en SceneGraph
-      // (evita carpetas vacías de nivel en el árbol). Su información se traslada
-      // a BuildingFramework.levels y los elementos se vinculan a su IfcBuilding contenedor con storeyId.
+      // Adjustment 2: IfcBuildingStorey nodes are not created as GROUP nodes in SceneGraph
+      // (avoids empty storey folders in the tree). Their information is transferred
+      // to BuildingFramework.levels and elements are linked to their host IfcBuilding with storeyId.
     }
 
-    // 5. Lista de Productos
+    // 5. Product List
     const productTypes = IfcStepImporter.ALL_PRODUCT_TYPES;
 
     const productMap = new Map<number, StepRecord>();
@@ -854,6 +899,9 @@ export class IfcStepImporter {
 
     if (!(this.records instanceof OnDemandRecordMap)) {
       for (const rec of this.records.values()) {
+        if (this.productTypesFilter && !this.productTypesFilter.has(rec.type.toUpperCase())) {
+          continue;
+        }
         if (!this.stepIdToEntityId.has(rec.id) && !productMap.has(rec.id)) {
           const p6 = rec.params[6];
           if (p6 && typeof p6 === 'object' && 'ref' in p6) {
@@ -863,6 +911,17 @@ export class IfcStepImporter {
             }
           }
         }
+      }
+    }
+
+    // Physical geometry on spatial elements (e.g. IfcSite with terrain representation)
+    for (const site of siteRecords) {
+      if (this.productTypesFilter && !this.productTypesFilter.has('IFCSITE')) {
+        continue;
+      }
+      const shapeParam = site.params[6];
+      if (shapeParam && typeof shapeParam === 'object' && 'ref' in shapeParam) {
+        productMap.set(site.id, site);
       }
     }
 
@@ -879,8 +938,8 @@ export class IfcStepImporter {
   }
 
   /**
-   * Extrae la jerarquía espacial (Etapa 1 - Fase 4).
-   * Despliega Proyecto, Sitio, Edificio y Pisos en tiempo sub-200ms sin calcular geometrías.
+   * Extracts the spatial hierarchy (Stage 1 - Phase 4).
+   * Deploys Project, Site, Building, and Storeys in sub-200ms without computing geometries.
    */
   public extractSpatialHierarchy(): Stage1SpatialPayload {
     this.prepareImport();
@@ -890,15 +949,131 @@ export class IfcStepImporter {
       spatialNodes: this.spatialNodes,
       materials: this.materialsList,
       parsedLevels: this.parsedLevels,
-      frameworkMetadata: this.frameworkMetadata,
       defaultBuildingId: this.defaultBuildingId,
       georef: this.finalizeGeoref(),
     };
   }
 
   /**
-   * Extrae las cajas envolventes AABB y la envolvente global del modelo (Etapa 2 - Fase 4).
-   * Permite encuadrar la cámara inmediatamente en el viewport mientras se transmiten las mallas.
+   * Fast O(1) computation of element bounds from placement matrix and optional IfcBoundingBox.
+   * Avoids tessellation, CSG booleans, extrusions, and heavy memory allocation in Stage 2.
+   */
+  private resolveProductFastBounds(
+    shapeRef: number | null,
+    mProduct: THREE.Matrix4,
+    elemMin: THREE.Vector3,
+    elemMax: THREE.Vector3
+  ): boolean {
+    if (shapeRef === null) return false;
+    const shapeRec = this.records.get(shapeRef);
+    if (!shapeRec || shapeRec.type !== 'IFCPRODUCTDEFINITIONSHAPE') return false;
+
+    const repsList = shapeRec.params[2];
+    if (!Array.isArray(repsList)) return false;
+
+    for (const item of repsList) {
+      if (!item || typeof item !== 'object' || !('ref' in item)) continue;
+      const repRec = this.records.get(item.ref);
+      if (!repRec) continue;
+
+      const geomItems = repRec.params[3];
+      if (!Array.isArray(geomItems)) continue;
+
+      for (const geomItem of geomItems) {
+        if (!geomItem || typeof geomItem !== 'object' || !('ref' in geomItem)) continue;
+        const gRec = this.records.get(geomItem.ref);
+        if (!gRec) continue;
+
+        if (gRec.type === 'IFCBOUNDINGBOX') {
+          // #ID = IFCBOUNDINGBOX(Corner, XDim, YDim, ZDim);
+          const corner = new THREE.Vector3(0, 0, 0);
+          const cornerParam = gRec.params[0];
+          if (cornerParam && typeof cornerParam === 'object' && 'ref' in cornerParam) {
+            const ptRec = this.records.get(cornerParam.ref);
+            if (ptRec && Array.isArray(ptRec.params[0])) {
+              const coords = ptRec.params[0].map((v: any) =>
+                (typeof v === 'number' ? v : parseFloat(String(v)) || 0) * this.lengthUnitScale
+              );
+              corner.set(coords[0] || 0, coords[1] || 0, coords[2] || 0);
+            }
+          }
+
+          const xDim = (typeof gRec.params[1] === 'number' ? gRec.params[1] : parseFloat(String(gRec.params[1])) || 0) * this.lengthUnitScale;
+          const yDim = (typeof gRec.params[2] === 'number' ? gRec.params[2] : parseFloat(String(gRec.params[2])) || 0) * this.lengthUnitScale;
+          const zDim = (typeof gRec.params[3] === 'number' ? gRec.params[3] : parseFloat(String(gRec.params[3])) || 0) * this.lengthUnitScale;
+
+          for (let ix = 0; ix <= 1; ix++) {
+            for (let iy = 0; iy <= 1; iy++) {
+              for (let iz = 0; iz <= 1; iz++) {
+                const pt = new THREE.Vector3(
+                  corner.x + ix * xDim,
+                  corner.y + iy * yDim,
+                  corner.z + iz * zDim
+                ).applyMatrix4(mProduct);
+                // Canonical change of basis: X_croq = X_ifc, Y_croq = Z_ifc, Z_croq = -Y_ifc (det = +1)
+                const x = pt.x;
+                const y = pt.z;
+                const z = -pt.y;
+
+                if (x < elemMin.x) elemMin.x = x;
+                if (y < elemMin.y) elemMin.y = y;
+                if (z < elemMin.z) elemMin.z = z;
+                if (x > elemMax.x) elemMax.x = x;
+                if (y > elemMax.y) elemMax.y = y;
+                if (z > elemMax.z) elemMax.z = z;
+              }
+            }
+          }
+          return true;
+        }
+
+        if (
+          gRec.type === 'IFCTRIANGULATEDFACESET' ||
+          gRec.type === 'IFCTRIANGULATEDIRREGULARNETWORK' ||
+          gRec.type === 'IFCPOLYGONALFACESET'
+        ) {
+          const ptRef = gRec.params[0];
+          if (ptRef && typeof ptRef === 'object' && 'ref' in ptRef) {
+            const ptListRec = this.records.get(ptRef.ref);
+            if (ptListRec && Array.isArray(ptListRec.params[0])) {
+              const rawCoords = ptListRec.params[0];
+              const el = mProduct.elements;
+              const scale = this.lengthUnitScale;
+              for (let i = 0; i < rawCoords.length; i++) {
+                const pt = rawCoords[i];
+                if (!Array.isArray(pt) || pt.length < 3) continue;
+                const x = (typeof pt[0] === 'number' ? pt[0] : parseFloat(String(pt[0])) || 0) * scale;
+                const y = (typeof pt[1] === 'number' ? pt[1] : parseFloat(String(pt[1])) || 0) * scale;
+                const z = (typeof pt[2] === 'number' ? pt[2] : parseFloat(String(pt[2])) || 0) * scale;
+
+                const px = el[0] * x + el[4] * y + el[8] * z + el[12];
+                const py = el[1] * x + el[5] * y + el[9] * z + el[13];
+                const pz = el[2] * x + el[6] * y + el[10] * z + el[14];
+
+                const cx = px;
+                const cy = pz;
+                const cz = -py;
+
+                if (cx < elemMin.x) elemMin.x = cx;
+                if (cy < elemMin.y) elemMin.y = cy;
+                if (cz < elemMin.z) elemMin.z = cz;
+                if (cx > elemMax.x) elemMax.x = cx;
+                if (cy > elemMax.y) elemMax.y = cy;
+                if (cz > elemMax.z) elemMax.z = cz;
+              }
+              return true;
+            }
+          }
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Extracts AABB bounding boxes and global model bounding envelope (Stage 2 - Phase 4).
+   * Enables framing camera immediately in the viewport while meshes are streamed.
    */
   public extractProductBounds(): Stage2BoundsPayload {
     if (this.cachedBoundsPayload) return this.cachedBoundsPayload;
@@ -919,7 +1094,10 @@ export class IfcStepImporter {
         let parentGuid: string | null = null;
         let storeyGuid: string | null = null;
 
-        if (parentStepId && this.storeyMap.has(parentStepId)) {
+        if (rec.type === 'IFCSITE') {
+          parentGuid = (parentStepId ? this.stepIdToEntityId.get(parentStepId) : null) || null;
+          storeyGuid = null;
+        } else if (parentStepId && this.storeyMap.has(parentStepId)) {
           storeyGuid = this.storeyMap.get(parentStepId)!.guid;
           parentGuid = this.storeyToBuildingGuidMap.get(parentStepId) || this.defaultBuildingId || null;
         } else if (parentStepId) {
@@ -941,7 +1119,7 @@ export class IfcStepImporter {
           }
         }
 
-        // Norma 15.1: Ventanas/puertas no son hijas del vano invisible sino que conservan contenedor espacial y se vinculan vía Pset_OpeningFiller
+        // Rule 15.1: Windows/doors are not children of invisible openings but keep spatial containers and link via Pset_OpeningFiller
         if (this.fillToOpeningStepMap.has(rec.id)) {
           const openingStepId = this.fillToOpeningStepMap.get(rec.id)!;
           const openingGuid = this.stepIdToEntityId.get(openingStepId);
@@ -956,69 +1134,48 @@ export class IfcStepImporter {
           }
         }
 
-        // 1. Resolver colocación espacial local
+        // 1. Resolve local spatial placement
         const placementParam = rec.params[5];
         let mProduct = new THREE.Matrix4();
         if (placementParam && typeof placementParam === 'object' && 'ref' in placementParam) {
           mProduct = this.resolveLocalPlacementMatrix((placementParam as any).ref);
         }
 
-        // 2. Extraer caja envolvente aproximada
+        // 2. Extract approximate bounding box in O(1) without tessellation
         const shapeParam = rec.params[6];
-        let subMeshes: { mesh: PolyMesh; itemId: number; materialId?: string }[] = [];
-        if (shapeParam && typeof shapeParam === 'object' && 'ref' in shapeParam) {
-          try {
-            subMeshes = this.rebuildSubMeshesFromShape((shapeParam as any).ref, id, this.itemToStyleMap, this.faceToStyleMap);
-          } catch (meshErr: any) {
-            console.warn(`[IfcStepImporter] Fallo al extraer envolvente de producto #${rec.id}: ${meshErr?.message || meshErr}`);
-          }
-        }
+        const shapeRef = (shapeParam && typeof shapeParam === 'object' && 'ref' in shapeParam)
+          ? (shapeParam as any).ref
+          : null;
 
         const elemMin = new THREE.Vector3(Infinity, Infinity, Infinity);
         const elemMax = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
-        let hasPoints = false;
 
-        for (const sm of subMeshes) {
-          for (const v of sm.mesh.vertices.values()) {
-            const p = new THREE.Vector3(v.position.x, v.position.y, v.position.z).applyMatrix4(mProduct);
-            // Cambio canónico: X_croq = X_ifc, Y_croq = Z_ifc, Z_croq = -Y_ifc (det = +1)
-            const x = p.x;
-            const y = p.z;
-            const z = -p.y;
-
-            if (x < elemMin.x) elemMin.x = x;
-            if (y < elemMin.y) elemMin.y = y;
-            if (z < elemMin.z) elemMin.z = z;
-            if (x > elemMax.x) elemMax.x = x;
-            if (y > elemMax.y) elemMax.y = y;
-            if (z > elemMax.z) elemMax.z = z;
-
-            if (x < modelMin.x) modelMin.x = x;
-            if (y < modelMin.y) modelMin.y = y;
-            if (z < modelMin.z) modelMin.z = z;
-            if (x > modelMax.x) modelMax.x = x;
-            if (y > modelMax.y) modelMax.y = y;
-            if (z > modelMax.z) modelMax.z = z;
-
-            hasPoints = true;
-          }
-        }
-
-        // Si no hubo puntos geométricos, usar la posición de mProduct
-        if (!hasPoints) {
+        const hasBox = this.resolveProductFastBounds(shapeRef, mProduct, elemMin, elemMax);
+        if (!hasBox) {
           const origin = new THREE.Vector3(0, 0, 0).applyMatrix4(mProduct);
           const ox = origin.x;
           const oy = origin.z;
           const oz = -origin.y;
-          elemMin.set(ox - 0.1, oy - 0.1, oz - 0.1);
-          elemMax.set(ox + 0.1, oy + 0.1, oz + 0.1);
+          elemMin.set(ox - 0.5, oy - 0.5, oz - 0.5);
+          elemMax.set(ox + 0.5, oy + 0.5, oz + 0.5);
+        }
+
+        const isVirtual = rec.type === 'IFCOPENINGELEMENT' || rec.type === 'IFCSPACE';
+        if (!isVirtual) {
+          if (elemMin.x < modelMin.x) modelMin.x = elemMin.x;
+          if (elemMin.y < modelMin.y) modelMin.y = elemMin.y;
+          if (elemMin.z < modelMin.z) modelMin.z = elemMin.z;
+          if (elemMax.x > modelMax.x) modelMax.x = elemMax.x;
+          if (elemMax.y > modelMax.y) modelMax.y = elemMax.y;
+          if (elemMax.z > modelMax.z) modelMax.z = elemMax.z;
         }
 
         const isExplicitAssembly =
           rec.type === 'IFCELEMENTASSEMBLY' ||
           rec.type === 'IFCGROUP';
         const hasChildren = this.stepParentToChildrenMap.has(rec.id) && (this.stepParentToChildrenMap.get(rec.id)!.size > 0);
-        const isGroup = isExplicitAssembly || hasChildren || subMeshes.length > 0;
+        const hasShape = Boolean(shapeRef !== null);
+        const isGroup = isExplicitAssembly || hasChildren || hasShape;
 
         elements.push({
           id,
@@ -1061,15 +1218,29 @@ export class IfcStepImporter {
   }
 
   /**
-   * Genera y transmite en lotes la geometría teselada usando Transferable Objects (Etapa 3 - Fase 4).
+   * Returns the list of STEP IDs for all priority product records gathered during prepareImport.
+   */
+  public getProductStepIds(): number[] {
+    if (!this.isPrepared) this.prepareImport();
+    return this.productRecordsList.map((r) => r.id);
+  }
+
+  /**
+   * Generates and streams tessellated geometry in batches using Transferable Objects (Stage 3 - Phase 4).
+   * Supports an optional subset of STEP IDs for distributed multi-worker tessellation.
    */
   public extractGeometryChunks(
     chunkSize: number = 150,
-    onChunk?: (chunk: Stage3GeometryChunkPayload, transferables: Transferable[]) => void
+    onChunk?: (chunk: Stage3GeometryChunkPayload, transferables: Transferable[]) => void,
+    subsetStepIds?: number[]
   ): Stage3GeometryChunkPayload[] {
     if (!this.isPrepared) this.prepareImport();
 
-    const totalProducts = this.productRecordsList.length;
+    const recordsToProcess: StepRecord[] = subsetStepIds
+      ? subsetStepIds.map((id) => this.records.get(id)).filter((r): r is StepRecord => Boolean(r))
+      : this.productRecordsList;
+
+    const totalProducts = recordsToProcess.length;
     const totalChunks = Math.max(1, Math.ceil(totalProducts / chunkSize));
     const allChunks: Stage3GeometryChunkPayload[] = [];
 
@@ -1078,13 +1249,16 @@ export class IfcStepImporter {
     let chunkIndex = 0;
 
     for (let i = 0; i < totalProducts; i++) {
-      const rec = this.productRecordsList[i];
+      const rec = recordsToProcess[i];
       try {
         const parentStepId = this.stepChildToParentMap.get(rec.id);
         let parentGuid: string | null = null;
         let storeyGuid: string | null = null;
 
-        if (parentStepId && this.storeyMap.has(parentStepId)) {
+        if (rec.type === 'IFCSITE') {
+          parentGuid = (parentStepId ? this.stepIdToEntityId.get(parentStepId) : null) || null;
+          storeyGuid = null;
+        } else if (parentStepId && this.storeyMap.has(parentStepId)) {
           storeyGuid = this.storeyMap.get(parentStepId)!.guid;
           parentGuid = this.storeyToBuildingGuidMap.get(parentStepId) || this.defaultBuildingId || null;
         } else if (parentStepId) {
@@ -1128,90 +1302,69 @@ export class IfcStepImporter {
           }
 
           const effectiveParent = parentGuid || this.defaultBuildingId || '';
-          const openingGroupEntity = this.rebuildProductEntity(rec, effectiveParent, this.elemPsetsMap.get(rec.id));
-          if (openingGroupEntity) {
-            const openingPolyMesh = openingGroupEntity.polyMesh;
-            if (openingPolyMesh && openingPolyMesh.faces.size > 0) {
-              const childGeoId = GuidUtils.createIfcGuid();
-              const clonedMesh = openingPolyMesh.clone(childGeoId);
-              for (const f of clonedMesh.faces.values()) f.hidden = false;
-              clonedMesh.rebuildTopology();
-              for (const e of clonedMesh.edges.values()) e.hidden = false;
+          const rawGuid = this.getParamString(rec.params[0]);
+          const openingId =
+            this.stepIdToEntityId.get(rec.id) ||
+            (rawGuid && GuidUtils.isIfcGuid(rawGuid) ? rawGuid : GuidUtils.createIfcGuid());
+          this.stepIdToEntityId.set(rec.id, openingId);
 
-              const geo = clonedMesh.toThreeGeometry();
-              const edgeGeo = clonedMesh.toEdgeGeometry();
-              const posAttr = geo.attributes.position;
-              const normAttr = geo.attributes.normal;
-              const edgePosAttr = edgeGeo.attributes.position;
+          const rawName = this.getParamString(rec.params[2]);
+          const openingName = rawName || 'Opening (IfcOpeningElement)';
 
-              const positions = new Float32Array(posAttr.array);
-              const normals = normAttr
-                ? new Float32Array(normAttr.array)
-                : new Float32Array(posAttr.array.length);
-              const indices = geo.index
-                ? new Uint32Array(geo.index.array)
-                : new Uint32Array(positions.length / 3).map((_, idx) => idx);
-              const edgesBuffer = edgePosAttr ? new Float32Array(edgePosAttr.array) : new Float32Array(0);
-
-              const brepData = null;
-
-              currentTransferables.push(positions.buffer, normals.buffer, indices.buffer);
-              if (edgesBuffer.buffer.byteLength > 0) {
-                currentTransferables.push(edgesBuffer.buffer);
-              }
-
-              const psets = this.elemPsetsMap.get(rec.id) || {};
-              if (!psets.Pset_Opening) psets.Pset_Opening = {};
-              if (hostGuid) {
-                psets.Pset_Opening.VoidsElements = {
-                  type: 'IfcLabel',
-                  value: JSON.stringify([hostGuid]),
-                };
-              }
-              this.stepIdToEntityId.set(rec.id, openingGroupEntity.id);
-
-              currentChunkElements.push({
-                id: openingGroupEntity.id,
-                stepId: rec.id,
-                name: openingGroupEntity.name || 'Vano (IfcOpeningElement)',
-                type: 'GROUP',
-                ifcType: 'IfcOpeningElement',
-                predefinedType: 'OPENING',
-                parentId: effectiveParent,
-                storeyId: storeyGuid,
-                psets,
-                positions: new Float32Array(0),
-                normals: new Float32Array(0),
-                indices: new Uint32Array(0),
-                edgesBuffer: new Float32Array(0),
-                brepData: null,
-                hidden: false,
-              });
-
-              currentChunkElements.push({
-                id: childGeoId,
-                stepId: rec.id,
-                name: 'Geometría Vano',
-                type: 'GEOMETRY_ENTITY',
-                ifcType: 'IfcOpeningElement',
-                predefinedType: 'OPENING',
-                parentId: openingGroupEntity.id,
-                storeyId: storeyGuid,
-                psets,
-                positions,
-                normals,
-                indices,
-                edgesBuffer,
-                brepData,
-                hidden: false,
-                isOpeningGeometry: true,
-                openingGroupId: openingGroupEntity.id,
-                hostIds: hostGuid ? [hostGuid] : [],
-              });
-            }
+          const psets = this.elemPsetsMap.get(rec.id) || {};
+          if (!psets.Pset_Opening) psets.Pset_Opening = {};
+          if (hostGuid) {
+            psets.Pset_Opening.VoidsElements = {
+              type: 'IfcLabel',
+              value: JSON.stringify([hostGuid]),
+            };
           }
-        } else {
+
+          currentChunkElements.push({
+            id: openingId,
+            stepId: rec.id,
+            name: openingName,
+            type: 'GROUP',
+            ifcType: 'IfcOpeningElement',
+            predefinedType: 'OPENING',
+            parentId: effectiveParent,
+            storeyId: storeyGuid,
+            psets,
+            positions: new Float32Array(0),
+            normals: new Float32Array(0),
+            indices: new Uint32Array(0),
+            edgesBuffer: new Float32Array(0),
+            brepData: null,
+            hidden: true,
+          });
+        } else if (rec.type === 'IFCSPACE') {
+          // Spatial functional volumes (Rule 15): retain spatial metadata and hierarchy,
+          // but hide 3D geometry from physical architectural viewport rendering
+          const rawGuid = this.getParamString(rec.params[0]);
+          const spaceId = this.stepIdToEntityId.get(rec.id) || (rawGuid && GuidUtils.isIfcGuid(rawGuid) ? rawGuid : GuidUtils.createIfcGuid());
+          const spaceName = this.getParamString(rec.params[2]) || 'Espacio';
+          const psets = this.elemPsetsMap.get(rec.id) || {};
           const effectiveParent = parentGuid || this.defaultBuildingId || '';
+
+          currentChunkElements.push({
+            id: spaceId,
+            stepId: rec.id,
+            name: spaceName,
+            type: 'GROUP',
+            ifcType: 'IfcSpace',
+            predefinedType: this.getPredefinedType(rec) || undefined,
+            parentId: effectiveParent,
+            storeyId: storeyGuid,
+            psets,
+            positions: new Float32Array(0),
+            normals: new Float32Array(0),
+            indices: new Uint32Array(0),
+            edgesBuffer: new Float32Array(0),
+            brepData: null,
+            hidden: true,
+          });
+        } else {
+          const effectiveParent = rec.type === 'IFCSITE' ? (parentGuid || null) : (parentGuid || this.defaultBuildingId || '');
           const parsed = this.rebuildProductEntities(
             rec,
             effectiveParent,
@@ -1232,7 +1385,7 @@ export class IfcStepImporter {
                 type: 'GROUP',
                 ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
                 predefinedType: this.getPredefinedType(rec) || undefined,
-                parentId: rootEntity.parentId || this.defaultBuildingId,
+                parentId: rootEntity.parentId !== undefined ? rootEntity.parentId : (rec.type === 'IFCSITE' ? (parentGuid || null) : this.defaultBuildingId),
                 storeyId: storeyGuid,
                 matrixId: rootEntity.matrixId || null,
                 psets: this.elemPsetsMap.get(rec.id) || {},
@@ -1242,13 +1395,50 @@ export class IfcStepImporter {
                 indices: new Uint32Array(0),
                 edgesBuffer: new Float32Array(0),
                 brepData: null,
+                hidden: rootEntity.hidden,
               });
 
               for (const child of children) {
+                if (child.rawGeometry) {
+                  const { positions, normals, indices } = child.rawGeometry;
+                  const edgesBuffer = child.rawGeometry.edgesBuffer || new Float32Array(0);
+
+                  currentTransferables.push(positions.buffer, normals.buffer, indices.buffer);
+                  if (edgesBuffer.buffer.byteLength > 0) {
+                    currentTransferables.push(edgesBuffer.buffer);
+                  }
+
+                  currentChunkElements.push({
+                    id: child.id,
+                    stepId: rec.id,
+                    name: child.name || rootEntity.name || 'Malla Triangulada',
+                    type: 'GEOMETRY_ENTITY',
+                    ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
+                    predefinedType: undefined,
+                    parentId: child.parentId || rootEntity.id,
+                    storeyId: storeyGuid,
+                    psets: {},
+                    materialId: child.materialId || this.elementMaterialMap.get(rec.id) || this.itemToStyleMap.get(rec.id),
+                    positions,
+                    normals,
+                    indices,
+                    edgesBuffer,
+                    geometry: {
+                      triPositions: positions,
+                      triNormals: normals,
+                      triIndices: indices,
+                      featureEdges: edgesBuffer,
+                    },
+                    brepData: null,
+                    hidden: child.hidden || rootEntity.hidden,
+                  });
+                  continue;
+                }
+
                 if (child.polyMesh && child.polyMesh.faces.size > 0) {
                   const mesh = child.polyMesh;
                   this.carveOpeningsIntoMesh(rec.id, mesh);
-                  const geo = mesh.toThreeGeometry();
+                  const geo = mesh.toThreeGeometry(undefined, true);
                   const edgeGeo = mesh.toEdgeGeometry();
                   const posAttr = geo.attributes.position;
                   const normAttr = geo.attributes.normal;
@@ -1273,26 +1463,68 @@ export class IfcStepImporter {
                   currentChunkElements.push({
                     id: child.id,
                     stepId: rec.id,
-                    name: child.name || 'Malla',
+                    name: child.name || rootEntity.name || 'Malla',
                     type: 'GEOMETRY_ENTITY',
                     ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
                     predefinedType: undefined,
                     parentId: child.parentId || rootEntity.id,
                     storeyId: storeyGuid,
                     psets: {},
-                    materialId: (child.name !== 'Malla' ? child.name : undefined) || this.elementMaterialMap.get(rec.id) || this.itemToStyleMap.get(rec.id),
+                    materialId: child.materialId || this.elementMaterialMap.get(rec.id) || this.itemToStyleMap.get(rec.id),
                     positions,
                     normals,
                     indices,
                     edgesBuffer,
+                    geometry: {
+                      triPositions: positions,
+                      triNormals: normals,
+                      triIndices: indices,
+                      featureEdges: edgesBuffer,
+                    },
                     brepData,
+                    hidden: child.hidden || rootEntity.hidden,
                   });
                 }
               }
+            } else if (rootEntity.rawGeometry) {
+              const { positions, normals, indices } = rootEntity.rawGeometry;
+              const edgesBuffer = rootEntity.rawGeometry.edgesBuffer || new Float32Array(0);
+
+              currentTransferables.push(positions.buffer, normals.buffer, indices.buffer);
+              if (edgesBuffer.buffer.byteLength > 0) {
+                currentTransferables.push(edgesBuffer.buffer);
+              }
+
+              const assignedMatId = rootEntity.materialId || this.elementMaterialMap.get(rec.id) || this.itemToStyleMap.get(rec.id);
+
+              currentChunkElements.push({
+                id: rootEntity.id,
+                stepId: rec.id,
+                name: rootEntity.name || IfcStepImporter.canonicalizeIfcType(rec.type),
+                type: 'GEOMETRY_ENTITY',
+                ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
+                predefinedType: this.getPredefinedType(rec) || undefined,
+                parentId: rootEntity.parentId !== undefined ? rootEntity.parentId : (rec.type === 'IFCSITE' ? (parentGuid || null) : this.defaultBuildingId),
+                storeyId: storeyGuid,
+                psets: this.elemPsetsMap.get(rec.id) || {},
+                materialId: assignedMatId,
+                positions,
+                normals,
+                indices,
+                edgesBuffer,
+                geometry: {
+                  triPositions: positions,
+                  triNormals: normals,
+                  triIndices: indices,
+                  featureEdges: edgesBuffer,
+                },
+                brepData: null,
+                hidden: rootEntity.hidden,
+              });
             } else if (rootEntity.polyMesh && rootEntity.polyMesh.faces.size > 0) {
               const mesh = rootEntity.polyMesh;
               this.carveOpeningsIntoMesh(rec.id, mesh);
-              const geo = mesh.toThreeGeometry();
+              const geo = mesh.toThreeGeometry(undefined, true);
               const edgeGeo = mesh.toEdgeGeometry();
               const posAttr = geo.attributes.position;
               const normAttr = geo.attributes.normal;
@@ -1314,7 +1546,7 @@ export class IfcStepImporter {
                 currentTransferables.push(edgesBuffer.buffer);
               }
 
-              const assignedMatId = this.elementMaterialMap.get(rec.id) || this.itemToStyleMap.get(rec.id);
+              const assignedMatId = rootEntity.materialId || this.elementMaterialMap.get(rec.id) || this.itemToStyleMap.get(rec.id);
 
               currentChunkElements.push({
                 id: rootEntity.id,
@@ -1331,18 +1563,25 @@ export class IfcStepImporter {
                 normals,
                 indices,
                 edgesBuffer,
+                geometry: {
+                  triPositions: positions,
+                  triNormals: normals,
+                  triIndices: indices,
+                  featureEdges: edgesBuffer,
+                },
                 brepData,
+                hidden: rootEntity.hidden,
               });
             }
           }
         }
       } catch (err: any) {
-        const msg = `Error al procesar producto STEP #${rec.id} (${rec.type}): ${err?.message || err}`;
+        const msg = `Error processing STEP product #${rec.id} (${rec.type}): ${err?.message || err}`;
         console.warn(`[IfcStepImporter] ${msg}`);
         this.importWarnings.push(msg);
       }
 
-      // Emitir chunk cuando se alcanza chunkSize o el final
+      // Emit chunk when chunkSize is reached or at the end
       if (currentChunkElements.length >= chunkSize || (i === totalProducts - 1 && currentChunkElements.length > 0)) {
         const payload: Stage3GeometryChunkPayload = {
           type: 'STAGE_GEOMETRY_CHUNK',
@@ -1367,21 +1606,45 @@ export class IfcStepImporter {
   }
 
   /**
-   * Talla los vanos asociados (IfcOpeningElement) sobre la malla B-Rep del elemento anfitrión.
+   * Carves associated openings (IfcOpeningElement) into the host element's B-Rep mesh.
    */
   private carveOpeningsIntoMesh(hostStepId: number, hostMesh: PolyMesh): void {
     const openingStepIds = this.hostToOpeningsStepMap.get(hostStepId);
     if (!openingStepIds || openingStepIds.size === 0) return;
 
     for (const opStepId of openingStepIds) {
-      const opRec = this.records.get(opStepId);
-      if (!opRec) continue;
-      const opEntity = this.rebuildProductEntity(opRec, null, this.elemPsetsMap.get(opStepId));
-      if (opEntity && opEntity.polyMesh && opEntity.polyMesh.faces.size > 0) {
+      let cached = this.openingMeshCache.get(opStepId);
+      if (cached === undefined) {
+        const opRec = this.records.get(opStepId);
+        if (!opRec) {
+          this.openingMeshCache.set(opStepId, null);
+          continue;
+        }
+        const opEntity = this.rebuildProductEntity(opRec, null, this.elemPsetsMap.get(opStepId));
+        if (opEntity && opEntity.polyMesh && opEntity.polyMesh.faces.size > 0) {
+          cached = { polyMesh: opEntity.polyMesh, id: opEntity.id };
+          this.openingMeshCache.set(opStepId, cached);
+        } else {
+          this.openingMeshCache.set(opStepId, null);
+          continue;
+        }
+      }
+
+      if (cached && cached.polyMesh && cached.polyMesh.faces.size > 0) {
+        const tagged = OpeningVoidSolver.tagExistingJambas(
+          hostMesh,
+          cached.polyMesh,
+          cached.id,
+          new THREE.Matrix4(),
+          true
+        );
+        if (tagged >= 2) {
+          continue;
+        }
         OpeningVoidSolver.carveVoidIntoHost(
           hostMesh,
-          opEntity.polyMesh,
-          opEntity.id,
+          cached.polyMesh,
+          cached.id,
           new THREE.Matrix4(),
           true
         );
@@ -1390,13 +1653,8 @@ export class IfcStepImporter {
   }
 
   /**
-   * Extrae y procesa los elementos masivos diferidos (Fase 2 - Etapa B).
-   * Identifica geometrías congruentes con GeometryPrototypeDetector y las emite
-   * como InstanceBatchPayload, colapsando instancias en GPU (Norma 4: matrixId).
-   */
-  /**
-   * Extrae directamente coordenadas crudas (Float32Array) de un ítem B-Rep sin instanciar PolyMesh en el heap.
-   * Optimización crítica de memoria O(1) para inspección previa de congruencia geométrica (Norma 7).
+   * Directly extracts raw coordinates (Float32Array) from a B-Rep item without instantiating PolyMesh on the heap.
+   * Critical O(1) memory optimization for preliminary geometric congruence inspection (Rule 7).
    */
   private extractRawPositionsFromItem(itemId: number): Float32Array | null {
     const rec = this.records.get(itemId);
@@ -1464,66 +1722,33 @@ export class IfcStepImporter {
         }
       }
     }
-    if (coords.length > 0) {
-      return new Float32Array(coords);
-    }
-
-    const fallbackMesh = this.rebuildMeshFromItem(itemId, `temp_${itemId}`, this.itemToStyleMap, this.faceToStyleMap);
-    if (!fallbackMesh || fallbackMesh.vertices.size === 0) return null;
-    const vList = Array.from(fallbackMesh.vertices.values());
-    const arr = new Float32Array(vList.length * 3);
-    for (let i = 0; i < vList.length; i++) {
-      arr[i * 3] = vList[i].position.x;
-      arr[i * 3 + 1] = vList[i].position.y;
-      arr[i * 3 + 2] = vList[i].position.z;
-    }
-    return arr;
+    return coords.length > 0 ? new Float32Array(coords) : null;
   }
 
   /**
-   * Extrae y procesa los elementos masivos diferidos (Fase 2 - Etapa B).
-   * Identifica geometrías congruentes con GeometryPrototypeDetector y las emite
-   * como InstanceBatchPayload, colapsando instancias en GPU (Norma 4: matrixId).
+   * Extracts and processes deferred massive elements (Phase 2 - Stage B).
+   * Identifies congruent geometries with GeometryPrototypeDetector and emits them
+   * as InstanceBatchPayload, collapsing instances on the GPU (Rule 4: matrixId).
    */
   public extractDeferredInstances(
     detector: GeometryPrototypeDetector,
     onInstanceBatch: (batch: InstanceBatchPayload) => void,
-    onPrototypeChunk?: (chunk: Stage3GeometryChunkPayload, transferables: Transferable[]) => void
+    onPrototypeChunk?: (chunk: Stage3GeometryChunkPayload, transferables: Transferable[]) => void,
+    subsetDeferredTypes?: string[]
   ): { totalPrototypes: number; totalInstances: number } {
     if (!this.isPrepared) this.prepareImport();
 
-    const deferredTypes = [
-      'IFCRAILING',
-      'IFCCOVERING',
-      'IFCPLATE',
-      'IFCMEMBER',
-      'IFCBUILDINGELEMENTPART',
-      'IFCFURNISHINGELEMENT',
-      'IFCFURNITURE',
-      'IFCBUILDINGELEMENTPROXY',
-      'IFCELEMENTASSEMBLY',
-      'IFCFLOWSEGMENT',
-      'IFCDUCTSEGMENT',
-      'IFCDUCTFITTING',
-      'IFCPIPESEGMENT',
-      'IFCPIPEFITTING',
-      'IFCAIRTERMINAL',
-      'IFCDISTRIBUTIONPORT',
-      'IFCFLOWTERMINAL',
-      'IFCFLOWCONTROLLER',
-      'IFCFLOWFITTING',
-      'IFCFLOWMOVINGDEVICE',
-      'IFCFLOWSTORAGEDEVICE',
-      'IFCFLOWTREATMENTDEVICE',
-      'IFCSENSOR',
-      'IFCACTUATOR',
-    ];
+    const deferredTypes = subsetDeferredTypes && subsetDeferredTypes.length > 0
+      ? subsetDeferredTypes
+      : IfcStepImporter.DEFERRED_PRODUCT_TYPES;
 
     const pendingBatches: Map<string, InstanceElementDTO[]> = new Map();
 
     for (const dType of deferredTypes) {
+      if (dType === 'IFCOPENINGELEMENT' || dType === 'IFCSPACE') continue;
       const records = this.parser.getRecordsByType(dType);
       for (const rec of records) {
+        if (rec.type === 'IFCOPENINGELEMENT' || rec.type === 'IFCSPACE') continue;
         try {
           const rawGuid = this.getParamString(rec.params[0]);
           const productGuid =
@@ -1549,14 +1774,14 @@ export class IfcStepImporter {
 
           if (parentGuid === this.defaultProjectId) parentGuid = null;
 
-          // Resolver colocación espacial local
+          // Resolve local spatial placement
           const placementParam = rec.params[5];
           let mProduct = new THREE.Matrix4();
           if (placementParam && typeof placementParam === 'object' && 'ref' in placementParam) {
             mProduct = this.resolveLocalPlacementMatrix((placementParam as any).ref);
           }
 
-          // Extraer representaciones de forma
+          // Extract shape representations
           const shapeParam = rec.params[6];
           if (!shapeParam || typeof shapeParam !== 'object' || !('ref' in shapeParam)) {
             continue;
@@ -1582,7 +1807,57 @@ export class IfcStepImporter {
           }
 
           if (allGeomRefs.length <= 1) {
-            // Caso 1: Producto monocomponente o perfil continuo (e.g. baranda individual estándar)
+            // Case 1: Single-component product or continuous profile (e.g. standard individual railing)
+            let paramSig: ParametricSolidSignature | null = null;
+            if (allGeomRefs.length === 1) {
+              const geomRec = this.records.get(allGeomRefs[0]);
+              if (geomRec) {
+                paramSig = ParametricSolidHasher.computeSolidHash(this.records, geomRec, this.lengthUnitScale);
+              }
+            }
+
+            if (paramSig) {
+              const existingProto = this.parametricPrototypes.get(paramSig.hash);
+              if (existingProto) {
+                const M_rel = new THREE.Matrix4().multiplyMatrices(paramSig.solidMatrix, existingProto.solidMatrixInv);
+                const M_eff = new THREE.Matrix4().multiplyMatrices(mProduct, M_rel);
+                const [cx, cy, cz] = existingProto.centroid_ifc;
+                const M_ifc = M_eff
+                  .multiply(new THREE.Matrix4().makeTranslation(cx, cy, cz))
+                  .multiply(existingProto.pcaRotation);
+                const M_croq = M_CANONICAL.clone().multiply(M_ifc).multiply(M_CANONICAL_INV);
+
+                let batch = pendingBatches.get(existingProto.prototypeId);
+                if (!batch) {
+                  batch = [];
+                  pendingBatches.set(existingProto.prototypeId, batch);
+                }
+
+                batch.push({
+                  id: productGuid,
+                  stepId: rec.id,
+                  name,
+                  ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
+                  parentId: parentGuid || this.defaultBuildingId || null,
+                  storeyId: storeyGuid,
+                  transform: new Float32Array(M_croq.elements),
+                  psets: this.elemPsetsMap.get(rec.id),
+                });
+
+                detector.totalInstancesDetected++;
+
+                if (batch.length >= 100) {
+                  onInstanceBatch({
+                    type: 'STAGE_INSTANCE_BATCH',
+                    prototypeId: existingProto.prototypeId,
+                    instances: batch,
+                  });
+                  pendingBatches.set(existingProto.prototypeId, []);
+                }
+                continue;
+              }
+            }
+
             const subMeshes = this.rebuildSubMeshesFromShape(
               (shapeParam as any).ref,
               productGuid,
@@ -1592,148 +1867,316 @@ export class IfcStepImporter {
 
             if (subMeshes.length === 0) continue;
 
-            const primarySubMesh = subMeshes[0];
-            const mesh = primarySubMesh.mesh;
-            if (mesh.vertices.size === 0 || mesh.faces.size === 0) continue;
+            if (subMeshes.length === 1) {
+              const primarySubMesh = subMeshes[0];
+              const mesh = primarySubMesh.mesh;
+              if (mesh.vertices.size === 0 || mesh.faces.size === 0) continue;
 
-            // Consultar / registrar en el detector de prototipos
-            const match = detector.checkOrRegister(productGuid, rec.id, mesh, mProduct);
+              // Query / register in prototype detector
+              const match = detector.checkOrRegister(productGuid, rec.id, mesh, mProduct);
 
-            if (match.isInstance) {
-              let batch = pendingBatches.get(match.prototypeId);
-              if (!batch) {
-                batch = [];
-                pendingBatches.set(match.prototypeId, batch);
-              }
-
-              batch.push({
-                id: productGuid,
-                name,
-                ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
-                parentId: parentGuid || this.defaultBuildingId || null,
-                storeyId: storeyGuid,
-                transform: match.transform,
-                psets: this.elemPsetsMap.get(rec.id),
-              });
-
-              if (batch.length >= 100) {
-                onInstanceBatch({
-                  type: 'STAGE_INSTANCE_BATCH',
-                  prototypeId: match.prototypeId,
-                  instances: batch,
-                });
-                pendingBatches.set(match.prototypeId, []);
-              }
-            } else {
-              // Prototipo nuevo: centrar en Croquera Y-up space in-place en el PolyMesh
-              // y emitir como template oculto para InstancedMesh.
-              //
-              // CRITICO: InstancedMeshPool.allocate llama a protoPolyMesh.toThreeGeometry()
-              // directamente, ignorando cualquier búfer pre-computado en el DTO. Por tanto
-              // la transformación debe aplicarse IN-PLACE en los vértices del PolyMesh
-              // (igual que rebuildProductEntities hace en Fase 1: applyMatrix4 + canonical swap).
-              //
-              // centroid_ifc = AABB midpoint (el mismo que usó el detector para M_croq)
-              // v_proto_croq = (v_ifc.x - cx, v_ifc.z - cz, -(v_ifc.y - cy))
-              if (onPrototypeChunk) {
-                const [icx, icy, icz] = match.centroid_ifc;
-
-                // Transformar vértices del PolyMesh in-place: centrar + canonical swap IFC->Croquera
-                for (const v of mesh.vertices.values()) {
-                  const vx = v.position.x - icx;
-                  const vy = v.position.y - icy;
-                  const vz = v.position.z - icz;
-                  v.position = new Vec3(vx, vz, -vy); // X_croq=X_ifc-cx, Y_croq=Z_ifc-cz, Z_croq=-(Y_ifc-cy)
-                }
-                // toThreeGeometry() recalculará las normales desde los vértices ya transformados.
-                // Solo transformamos los holes si existen.
-                for (const f of mesh.faces.values()) {
-                  if (f.holes && f.holes.length > 0) {
-                    f.holes = f.holes.map((loop) =>
-                      loop.map((pt) => new Vec3(pt.x - icx, pt.z - icz, -(pt.y - icy)))
-                    );
-                  }
+              if (match.isInstance) {
+                let batch = pendingBatches.get(match.prototypeId);
+                if (!batch) {
+                  batch = [];
+                  pendingBatches.set(match.prototypeId, batch);
                 }
 
-                // Generar búferes desde el PolyMesh ya transformado
-                const geo = mesh.toThreeGeometry();
-                const edgeGeo = mesh.toEdgeGeometry();
-                const posAttr = geo.attributes.position;
-                const normAttr = geo.attributes.normal;
-                const edgePosAttr = edgeGeo.attributes.position;
-
-                const positions = new Float32Array(posAttr.array);
-                const normals = normAttr
-                  ? new Float32Array(normAttr.array)
-                  : new Float32Array(posAttr.array.length);
-                const indices = geo.index
-                  ? new Uint32Array(geo.index.array)
-                  : new Uint32Array(positions.length / 3).map((_, idx) => idx);
-                const edgesBuffer = (edgePosAttr && edgePosAttr.array.length > 0)
-                  ? new Float32Array(edgePosAttr.array)
-                  : new Float32Array(0);
-
-                const brepData = null;
-                const transferables: Transferable[] = [positions.buffer, normals.buffer, indices.buffer];
-                if (edgesBuffer.buffer.byteLength > 0) {
-                  transferables.push(edgesBuffer.buffer);
-                }
-
-                const assignedMatId =
-                  this.elementMaterialMap.get(rec.id) || this.itemToStyleMap.get(rec.id);
-
-                const protoElement: TessellatedElementDTO = {
+                batch.push({
                   id: productGuid,
                   stepId: rec.id,
-                  name: `[Prototipo] ${name}`,
-                  type: 'GEOMETRY_ENTITY',
-                  ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
-                  predefinedType: this.getPredefinedType(rec) || undefined,
-                  parentId: parentGuid || this.defaultBuildingId,
-                  storeyId: storeyGuid,
-                  matrixId: productGuid,
-                  hidden: true,
-                  psets: this.elemPsetsMap.get(rec.id) || {},
-                  materialId: assignedMatId,
-                  positions,
-                  normals,
-                  indices,
-                  edgesBuffer,
-                  brepData,
-                };
-
-                onPrototypeChunk(
-                  { type: 'STAGE_GEOMETRY_CHUNK', chunkIndex: 0, totalChunks: 1, progress: 1.0, elements: [protoElement] },
-                  transferables
-                );
-
-                // Emitir la primera ocurrencia como instancia
-                let protoBatch = pendingBatches.get(productGuid);
-                if (!protoBatch) {
-                  protoBatch = [];
-                  pendingBatches.set(productGuid, protoBatch);
-                }
-                protoBatch.push({
-                  id: GuidUtils.createIfcGuid(),
                   name,
                   ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
                   parentId: parentGuid || this.defaultBuildingId || null,
                   storeyId: storeyGuid,
                   transform: match.transform,
-                  psets: {},
+                  psets: this.elemPsetsMap.get(rec.id),
                 });
+
+                if (paramSig) {
+                  const protoRec = detector.getPrototype(match.prototypeId);
+                  this.parametricPrototypes.set(paramSig.hash, {
+                    prototypeId: match.prototypeId,
+                    stepId: rec.id,
+                    centroid_ifc: match.centroid_ifc,
+                    pcaRotation: protoRec?.pcaRotation || new THREE.Matrix4().identity(),
+                    solidMatrixInv: paramSig.solidMatrix.clone().invert(),
+                  });
+                }
+
+                if (batch.length >= 100) {
+                  onInstanceBatch({
+                    type: 'STAGE_INSTANCE_BATCH',
+                    prototypeId: match.prototypeId,
+                    instances: batch,
+                  });
+                  pendingBatches.set(match.prototypeId, []);
+                }
+              } else {
+                // New prototype: center in Croquera Y-up space in-place on PolyMesh
+                // and emit as hidden template for InstancedMesh.
+                if (onPrototypeChunk) {
+                  const M_proto = match.toCanonicalCroqueraMatrix;
+
+                  // Transform PolyMesh vertices in-place to canonical Croquera space via PCA
+                  for (const v of mesh.vertices.values()) {
+                    v.position = v.position.applyMatrix4(M_proto);
+                  }
+                  // toThreeGeometry() will recalculate normals from already transformed vertices.
+                  // Only transform holes if they exist.
+                  for (const f of mesh.faces.values()) {
+                    if (f.holes && f.holes.length > 0) {
+                      f.holes = f.holes.map((loop) =>
+                        loop.map((pt) => pt.applyMatrix4(M_proto))
+                      );
+                    }
+                  }
+
+                  // Generate buffers from already transformed PolyMesh
+                  const geo = mesh.toThreeGeometry(undefined, true);
+                  const edgeGeo = mesh.toEdgeGeometry();
+                  const posAttr = geo.attributes.position;
+                  const normAttr = geo.attributes.normal;
+                  const edgePosAttr = edgeGeo.attributes.position;
+
+                  const positions = new Float32Array(posAttr.array);
+                  const normals = normAttr
+                    ? new Float32Array(normAttr.array)
+                    : new Float32Array(posAttr.array.length);
+                  const indices = geo.index
+                    ? new Uint32Array(geo.index.array)
+                    : new Uint32Array(positions.length / 3).map((_, idx) => idx);
+                  const edgesBuffer = (edgePosAttr && edgePosAttr.array.length > 0)
+                    ? new Float32Array(edgePosAttr.array)
+                    : new Float32Array(0);
+
+                  const brepData = null;
+                  const transferables: Transferable[] = [positions.buffer, normals.buffer, indices.buffer];
+                  if (edgesBuffer.buffer.byteLength > 0) {
+                    transferables.push(edgesBuffer.buffer);
+                  }
+
+                  const assignedMatId =
+                    primarySubMesh.materialId ||
+                    this.elementMaterialMap.get(rec.id) ||
+                    this.itemToStyleMap.get(rec.id);
+
+                  const protoElement: TessellatedElementDTO = {
+                    id: productGuid,
+                    stepId: rec.id,
+                    name: `[Prototype] ${name}`,
+                    type: 'GEOMETRY_ENTITY',
+                    ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
+                    predefinedType: this.getPredefinedType(rec) || undefined,
+                    parentId: parentGuid || this.defaultBuildingId,
+                    storeyId: storeyGuid,
+                    matrixId: productGuid,
+                    hidden: true,
+                    psets: this.elemPsetsMap.get(rec.id) || {},
+                    materialId: assignedMatId,
+                    positions,
+                    normals,
+                    indices,
+                    edgesBuffer,
+                    brepData,
+                  };
+
+                  onPrototypeChunk(
+                    { type: 'STAGE_GEOMETRY_CHUNK', chunkIndex: 0, totalChunks: 1, progress: 0.0, elements: [protoElement] },
+                    transferables
+                  );
+
+                  // Emit first occurrence as an instance
+                  let protoBatch = pendingBatches.get(productGuid);
+                  if (!protoBatch) {
+                    protoBatch = [];
+                    pendingBatches.set(productGuid, protoBatch);
+                  }
+                  protoBatch.push({
+                    id: GuidUtils.createIfcGuid(),
+                    stepId: rec.id,
+                    name,
+                    ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
+                    parentId: parentGuid || this.defaultBuildingId || null,
+                    storeyId: storeyGuid,
+                    transform: match.transform,
+                    psets: {},
+                  });
+
+                  if (paramSig) {
+                    const protoRec = detector.getPrototype(productGuid);
+                    this.parametricPrototypes.set(paramSig.hash, {
+                      prototypeId: productGuid,
+                      stepId: rec.id,
+                      centroid_ifc: match.centroid_ifc,
+                      pcaRotation: protoRec?.pcaRotation || new THREE.Matrix4().identity(),
+                      solidMatrixInv: paramSig.solidMatrix.clone().invert(),
+                    });
+                  }
+                }
+              }
+            } else {
+              // Multi-component assembly (e.g. MappedItem or multi-material element)
+              // Emit container GROUP for assembly to preserve product GUID, metadata and IFC classification (Rule 15)
+              if (onPrototypeChunk) {
+                onPrototypeChunk(
+                  {
+                    type: 'STAGE_GEOMETRY_CHUNK',
+                    chunkIndex: 0,
+                    totalChunks: 1,
+                    progress: 0.0,
+                    elements: [
+                      {
+                        id: productGuid,
+                        stepId: rec.id,
+                        name,
+                        type: 'GROUP',
+                        ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
+                        predefinedType: this.getPredefinedType(rec) || undefined,
+                        parentId: parentGuid || this.defaultBuildingId,
+                        storeyId: storeyGuid,
+                        psets: this.elemPsetsMap.get(rec.id) || {},
+                        positions: new Float32Array(0),
+                        normals: new Float32Array(0),
+                        indices: new Uint32Array(0),
+                        edgesBuffer: new Float32Array(0),
+                        brepData: null,
+                      },
+                    ],
+                  },
+                  []
+                );
+              }
+
+              for (let k = 0; k < subMeshes.length; k++) {
+                const sm = subMeshes[k];
+                const mesh = sm.mesh;
+                if (mesh.vertices.size === 0 || mesh.faces.size === 0) continue;
+
+                const subKey = `proto_${rec.id}_sub_${k}`;
+                const match = detector.checkOrRegister(subKey, rec.id, mesh, mProduct);
+                const pieceGuid = GuidUtils.createIfcGuid();
+
+                if (match.isInstance) {
+                  let batch = pendingBatches.get(match.prototypeId);
+                  if (!batch) {
+                    batch = [];
+                    pendingBatches.set(match.prototypeId, batch);
+                  }
+
+                  batch.push({
+                    id: pieceGuid,
+                    stepId: rec.id,
+                    name: `${name} (Part ${k + 1})`,
+                    ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
+                    parentId: productGuid,
+                    storeyId: storeyGuid,
+                    transform: match.transform,
+                    psets: {},
+                  });
+
+                  if (batch.length >= 100) {
+                    onInstanceBatch({
+                      type: 'STAGE_INSTANCE_BATCH',
+                      prototypeId: match.prototypeId,
+                      instances: batch,
+                    });
+                    pendingBatches.set(match.prototypeId, []);
+                  }
+                } else {
+                  if (onPrototypeChunk) {
+                    const M_proto = match.toCanonicalCroqueraMatrix;
+
+                    for (const v of mesh.vertices.values()) {
+                      v.position = v.position.applyMatrix4(M_proto);
+                    }
+                    for (const f of mesh.faces.values()) {
+                      if (f.holes && f.holes.length > 0) {
+                        f.holes = f.holes.map((loop) =>
+                          loop.map((pt) => pt.applyMatrix4(M_proto))
+                        );
+                      }
+                    }
+
+                    const geo = mesh.toThreeGeometry(undefined, true);
+                    const edgeGeo = mesh.toEdgeGeometry();
+                    const posAttr = geo.attributes.position;
+                    const normAttr = geo.attributes.normal;
+                    const edgePosAttr = edgeGeo.attributes.position;
+
+                    const positions = new Float32Array(posAttr.array);
+                    const normals = normAttr
+                      ? new Float32Array(normAttr.array)
+                      : new Float32Array(posAttr.array.length);
+                    const indices = geo.index
+                      ? new Uint32Array(geo.index.array)
+                      : new Uint32Array(positions.length / 3).map((_, idx) => idx);
+                    const edgesBuffer = (edgePosAttr && edgePosAttr.array.length > 0)
+                      ? new Float32Array(edgePosAttr.array)
+                      : new Float32Array(0);
+
+                    const transferables: Transferable[] = [positions.buffer, normals.buffer, indices.buffer];
+                    if (edgesBuffer.buffer.byteLength > 0) {
+                      transferables.push(edgesBuffer.buffer);
+                    }
+
+                    const assignedMatId =
+                      sm.materialId || this.elementMaterialMap.get(rec.id) || this.itemToStyleMap.get(rec.id);
+
+                    const protoElement: TessellatedElementDTO = {
+                      id: match.prototypeId,
+                      stepId: rec.id,
+                      name: `[Prototype] ${name} (Part ${k + 1})`,
+                      type: 'GEOMETRY_ENTITY',
+                      ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
+                      predefinedType: this.getPredefinedType(rec) || undefined,
+                      parentId: productGuid,
+                      storeyId: storeyGuid,
+                      matrixId: match.prototypeId,
+                      hidden: true,
+                      psets: {},
+                      materialId: assignedMatId,
+                      positions,
+                      normals,
+                      indices,
+                      edgesBuffer,
+                      brepData: null,
+                    };
+
+                    onPrototypeChunk(
+                      { type: 'STAGE_GEOMETRY_CHUNK', chunkIndex: 0, totalChunks: 1, progress: 0.0, elements: [protoElement] },
+                      transferables
+                    );
+
+                    let protoBatch = pendingBatches.get(match.prototypeId);
+                    if (!protoBatch) {
+                      protoBatch = [];
+                      pendingBatches.set(match.prototypeId, protoBatch);
+                    }
+                    protoBatch.push({
+                      id: pieceGuid,
+                      stepId: rec.id,
+                      name: `${name} (Part ${k + 1})`,
+                      ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
+                      parentId: productGuid,
+                      storeyId: storeyGuid,
+                      transform: match.transform,
+                      psets: {},
+                    });
+                  }
+                }
               }
             }
           } else {
-            // Caso 2: Ensamblaje masivo con cientos/miles de ítems discretos repetitivos (e.g. balaustres en ElManzano)
-            // Emitir GROUP contenedor del ensamblaje (Norma 15)
+            // Case 2: Massive assembly with hundreds/thousands of discrete repetitive items (e.g. balusters in ElManzano)
+            // Emit container GROUP for assembly (Rule 15)
             if (onPrototypeChunk) {
               onPrototypeChunk(
                 {
                   type: 'STAGE_GEOMETRY_CHUNK',
                   chunkIndex: 0,
                   totalChunks: 1,
-                  progress: 1.0,
+                  progress: 0.0,
                   elements: [
                     {
                       id: productGuid,
@@ -1758,10 +2201,70 @@ export class IfcStepImporter {
             }
 
             for (const itemRef of allGeomRefs) {
-              const rawPos = this.extractRawPositionsFromItem(itemRef);
-              if (!rawPos || rawPos.length < 9) continue;
+              const itemRec = this.records.get(itemRef);
+              const paramSig = itemRec ? ParametricSolidHasher.computeSolidHash(this.records, itemRec, this.lengthUnitScale) : null;
 
-              const match = detector.checkOrRegister(`proto_item_${itemRef}`, itemRef, rawPos, mProduct);
+              if (paramSig) {
+                const existingProto = this.parametricPrototypes.get(paramSig.hash);
+                if (existingProto) {
+                  const M_rel = new THREE.Matrix4().multiplyMatrices(paramSig.solidMatrix, existingProto.solidMatrixInv);
+                  const M_eff = new THREE.Matrix4().multiplyMatrices(mProduct, M_rel);
+                  const [cx, cy, cz] = existingProto.centroid_ifc;
+                  const M_ifc = M_eff
+                    .multiply(new THREE.Matrix4().makeTranslation(cx, cy, cz))
+                    .multiply(existingProto.pcaRotation);
+                  const M_croq = M_CANONICAL.clone().multiply(M_ifc).multiply(M_CANONICAL_INV);
+
+                  const pieceGuid = GuidUtils.createIfcGuid();
+                  let batch = pendingBatches.get(existingProto.prototypeId);
+                  if (!batch) {
+                    batch = [];
+                    pendingBatches.set(existingProto.prototypeId, batch);
+                  }
+
+                  batch.push({
+                    id: pieceGuid,
+                    stepId: rec.id,
+                    name: `${name} (Part)`,
+                    ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
+                    parentId: productGuid,
+                    storeyId: storeyGuid,
+                    transform: new Float32Array(M_croq.elements),
+                    psets: {},
+                  });
+
+                  detector.totalInstancesDetected++;
+
+                  if (batch.length >= 250) {
+                    onInstanceBatch({
+                      type: 'STAGE_INSTANCE_BATCH',
+                      prototypeId: existingProto.prototypeId,
+                      instances: batch,
+                    });
+                    pendingBatches.set(existingProto.prototypeId, []);
+                  }
+                  continue;
+                }
+              }
+
+              const rawPos = this.extractRawPositionsFromItem(itemRef);
+              let candidateMesh: PolyMesh | null = null;
+
+              if (!rawPos || rawPos.length < 9) {
+                // If raw coordinates cannot be extracted directly (e.g. extrusion, revolve, boolean, swept solid),
+                // reconstruct PolyMesh ONCE.
+                candidateMesh = this.rebuildMeshFromItem(itemRef, `proto_item_${itemRef}`, this.itemToStyleMap, this.faceToStyleMap);
+                if (!candidateMesh || candidateMesh.faces.size === 0 || candidateMesh.vertices.size === 0) {
+                  continue;
+                }
+              }
+
+              const match = detector.checkOrRegister(
+                `proto_item_${itemRef}`,
+                itemRef,
+                candidateMesh || rawPos!,
+                mProduct
+              );
               const pieceGuid = GuidUtils.createIfcGuid();
 
               if (match.isInstance) {
@@ -1773,13 +2276,24 @@ export class IfcStepImporter {
 
                 batch.push({
                   id: pieceGuid,
-                  name: `${name} (Pieza)`,
+                  name: `${name} (Part)`,
                   ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
                   parentId: productGuid,
                   storeyId: storeyGuid,
                   transform: match.transform,
                   psets: {},
                 });
+
+                if (paramSig) {
+                  const protoRec = detector.getPrototype(match.prototypeId);
+                  this.parametricPrototypes.set(paramSig.hash, {
+                    prototypeId: match.prototypeId,
+                    stepId: itemRef,
+                    centroid_ifc: match.centroid_ifc,
+                    pcaRotation: protoRec?.pcaRotation || new THREE.Matrix4().identity(),
+                    solidMatrixInv: paramSig.solidMatrix.clone().invert(),
+                  });
+                }
 
                 if (batch.length >= 250) {
                   onInstanceBatch({
@@ -1790,28 +2304,27 @@ export class IfcStepImporter {
                   pendingBatches.set(match.prototypeId, []);
                 }
               } else {
-                // Nuevo prototipo de pieza: transformar PolyMesh in-place
-                const itemMesh = this.rebuildMeshFromItem(itemRef, match.prototypeId, this.itemToStyleMap, this.faceToStyleMap);
+                // New part prototype:
+                // If candidateMesh was already reconstructed, REUSE IT directly (cero double reconstruction)!
+                // If rawPos was used, candidateMesh is null, so build itemMesh ONCE for the prototype.
+                const itemMesh = candidateMesh || this.rebuildMeshFromItem(itemRef, match.prototypeId, this.itemToStyleMap, this.faceToStyleMap);
                 if (itemMesh && itemMesh.faces.size > 0 && onPrototypeChunk) {
-                  const [picx, picy, picz] = match.centroid_ifc;
+                  const M_proto = match.toCanonicalCroqueraMatrix;
 
-                  // Transformar vértices in-place: centrar + canonical swap IFC->Croquera
+                  // Transform vertices in-place to canonical Croquera space via PCA
                   for (const v of itemMesh.vertices.values()) {
-                    const vx = v.position.x - picx;
-                    const vy = v.position.y - picy;
-                    const vz = v.position.z - picz;
-                    v.position = new Vec3(vx, vz, -vy); // X_croq=X_ifc-cx, Y_croq=Z_ifc-cz, Z_croq=-(Y_ifc-cy)
+                    v.position = v.position.applyMatrix4(M_proto);
                   }
-                  // toThreeGeometry() recalculará las normales. Solo transformamos holes.
+                  // toThreeGeometry() will recalculate normals. Only transform holes.
                   for (const f of itemMesh.faces.values()) {
                     if (f.holes && f.holes.length > 0) {
                       f.holes = f.holes.map((loop) =>
-                        loop.map((pt) => new Vec3(pt.x - picx, pt.z - picz, -(pt.y - picy)))
+                        loop.map((pt) => pt.applyMatrix4(M_proto))
                       );
                     }
                   }
 
-                  const geo = itemMesh.toThreeGeometry();
+                  const geo = itemMesh.toThreeGeometry(undefined, true);
                   const edgeGeo = itemMesh.toEdgeGeometry();
                   const posAttr = geo.attributes.position;
                   const normAttr = geo.attributes.normal;
@@ -1835,12 +2348,14 @@ export class IfcStepImporter {
                   }
 
                   const assignedMatId =
-                    this.elementMaterialMap.get(rec.id) || this.itemToStyleMap.get(rec.id);
+                    this.itemToStyleMap.get(itemRef) ||
+                    this.elementMaterialMap.get(rec.id) ||
+                    this.itemToStyleMap.get(rec.id);
 
                   const protoElement: TessellatedElementDTO = {
                     id: match.prototypeId,
                     stepId: itemRef,
-                    name: `[Prototipo] ${name} (Pieza)`,
+                    name: `[Prototype] ${name} (Part)`,
                     type: 'GEOMETRY_ENTITY',
                     ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
                     predefinedType: this.getPredefinedType(rec) || undefined,
@@ -1858,7 +2373,7 @@ export class IfcStepImporter {
                   };
 
                   onPrototypeChunk(
-                    { type: 'STAGE_GEOMETRY_CHUNK', chunkIndex: 0, totalChunks: 1, progress: 1.0, elements: [protoElement] },
+                    { type: 'STAGE_GEOMETRY_CHUNK', chunkIndex: 0, totalChunks: 1, progress: 0.0, elements: [protoElement] },
                     transferables
                   );
 
@@ -1869,24 +2384,36 @@ export class IfcStepImporter {
                   }
                   pieceBatch.push({
                     id: GuidUtils.createIfcGuid(),
-                    name: `${name} (Pieza)`,
+                    stepId: rec.id,
+                    name: `${name} (Part)`,
                     ifcType: IfcStepImporter.canonicalizeIfcType(rec.type),
                     parentId: productGuid,
                     storeyId: storeyGuid,
                     transform: match.transform,
                     psets: {},
                   });
+
+                  if (paramSig) {
+                    const protoRec = detector.getPrototype(match.prototypeId);
+                    this.parametricPrototypes.set(paramSig.hash, {
+                      prototypeId: match.prototypeId,
+                      stepId: itemRef,
+                      centroid_ifc: match.centroid_ifc,
+                      pcaRotation: protoRec?.pcaRotation || new THREE.Matrix4().identity(),
+                      solidMatrixInv: paramSig.solidMatrix.clone().invert(),
+                    });
+                  }
                 }
               }
             }
           }
         } catch (err: any) {
-          console.warn(`[IfcStepImporter] Falló la evaluación de instancia diferida #${rec.id}: ${err?.message || err}`);
+          console.warn(`[IfcStepImporter] Deferred instance evaluation failed for #${rec.id}: ${err?.message || err}`);
         }
       }
     }
 
-    // Flush de lotes pendientes restantes
+    // Flush remaining pending batches
     for (const [prototypeId, instances] of pendingBatches.entries()) {
       if (instances.length > 0) {
         onInstanceBatch({
@@ -1905,9 +2432,367 @@ export class IfcStepImporter {
 
 
   /**
-   * Reconstruye una entidad de producto y sus posibles componentes hijos (GEOMETRY_ENTITY)
-   * a partir de representaciones múltiples o sub-ítems MappedItem.
-   * Cumple con Norma 15 (ontología binaria GROUP / GEOMETRY_ENTITY).
+   * Fast O(1) memory extraction of an IFCTRIANGULATEDFACESET / IFCTRIANGULATEDIRREGULARNETWORK
+   * directly into Float32Array and Uint32Array without instantiating PolyMesh, Vec3, or Faces.
+   */
+  private extractFastTriangulatedItem(
+    itemRec: StepRecord,
+    mProduct: THREE.Matrix4
+  ): { positions: Float32Array; normals: Float32Array; indices: Uint32Array; edgesBuffer: Float32Array } | null {
+    const pointListRef = itemRec.params[0];
+    if (!pointListRef || typeof pointListRef !== 'object' || !('ref' in pointListRef)) {
+      return null;
+    }
+
+    const pointListRec = this.records.get(pointListRef.ref);
+    if (!pointListRec || !Array.isArray(pointListRec.params[0])) return null;
+
+    const rawCoords = pointListRec.params[0];
+    const numPts = rawCoords.length;
+    if (numPts === 0) return null;
+
+    // Resolve coordIndex and pnIndex
+    let coordIndex: any = null;
+    let pnIndexRaw: any = null;
+
+    const candidate3 = itemRec.params[3];
+    const candidate4 = itemRec.params[4];
+    if (Array.isArray(candidate3) && candidate3.length > 0 && Array.isArray(candidate3[0])) {
+      coordIndex = candidate3;
+      if (Array.isArray(candidate4) && candidate4.length > 0 && !Array.isArray(candidate4[0])) {
+        pnIndexRaw = candidate4;
+      }
+    } else if (Array.isArray(candidate4) && candidate4.length > 0 && Array.isArray(candidate4[0])) {
+      coordIndex = candidate4;
+      const candidate5 = itemRec.params[5];
+      if (Array.isArray(candidate5) && candidate5.length > 0 && !Array.isArray(candidate5[0])) {
+        pnIndexRaw = candidate5;
+      } else if (Array.isArray(candidate3) && candidate3.length > 0 && !Array.isArray(candidate3[0])) {
+        pnIndexRaw = candidate3;
+      }
+    }
+
+    if (!coordIndex || !Array.isArray(coordIndex)) return null;
+
+    // 1. Vectorized points extraction with matrix transform & canonical change of basis
+    const positions = new Float32Array(numPts * 3);
+    const el = mProduct.elements;
+    const scale = this.lengthUnitScale;
+
+    for (let i = 0; i < numPts; i++) {
+      const pt = rawCoords[i];
+      if (!Array.isArray(pt) || pt.length < 3) continue;
+
+      const x = (typeof pt[0] === 'number' ? pt[0] : parseFloat(String(pt[0])) || 0) * scale;
+      const y = (typeof pt[1] === 'number' ? pt[1] : parseFloat(String(pt[1])) || 0) * scale;
+      const z = (typeof pt[2] === 'number' ? pt[2] : parseFloat(String(pt[2])) || 0) * scale;
+
+      const px = el[0] * x + el[4] * y + el[8] * z + el[12];
+      const py = el[1] * x + el[5] * y + el[9] * z + el[13];
+      const pz = el[2] * x + el[6] * y + el[10] * z + el[14];
+
+      // Canonical Croquera swap: X_croq = px, Y_croq = pz, Z_croq = -py
+      positions[i * 3] = px;
+      positions[i * 3 + 1] = pz;
+      positions[i * 3 + 2] = -py;
+    }
+
+    // 2. Build triangle indices
+    let maxCoordIndex = 0;
+    for (const tri of coordIndex) {
+      if (Array.isArray(tri)) {
+        for (const idx of tri) {
+          const num = typeof idx === 'number' ? idx : parseInt(String(idx), 10);
+          if (num > maxCoordIndex) maxCoordIndex = num;
+        }
+      }
+    }
+    const isPointPnIndex = Array.isArray(pnIndexRaw) && pnIndexRaw.length >= maxCoordIndex;
+
+    const numTris = coordIndex.length;
+    const indices = new Uint32Array(numTris * 3);
+    let writeIdx = 0;
+    const det = mProduct.determinant();
+    const isFlipped = det < 0;
+
+    for (let t = 0; t < numTris; t++) {
+      const tri = coordIndex[t];
+      if (!Array.isArray(tri) || tri.length < 3) continue;
+
+      let idx0 = typeof tri[0] === 'number' ? tri[0] : parseInt(String(tri[0]), 10);
+      let idx1 = typeof tri[1] === 'number' ? tri[1] : parseInt(String(tri[1]), 10);
+      let idx2 = typeof tri[2] === 'number' ? tri[2] : parseInt(String(tri[2]), 10);
+
+      if (isNaN(idx0) || isNaN(idx1) || isNaN(idx2) || idx0 < 1 || idx1 < 1 || idx2 < 1) continue;
+      if (idx0 === idx1 || idx1 === idx2 || idx2 === idx0) continue;
+
+      if (isPointPnIndex) {
+        idx0 = typeof pnIndexRaw[idx0 - 1] === 'number' ? pnIndexRaw[idx0 - 1] : parseInt(String(pnIndexRaw[idx0 - 1]), 10);
+        idx1 = typeof pnIndexRaw[idx1 - 1] === 'number' ? pnIndexRaw[idx1 - 1] : parseInt(String(pnIndexRaw[idx1 - 1]), 10);
+        idx2 = typeof pnIndexRaw[idx2 - 1] === 'number' ? pnIndexRaw[idx2 - 1] : parseInt(String(pnIndexRaw[idx2 - 1]), 10);
+      }
+
+      const u0 = idx0 - 1;
+      const u1 = idx1 - 1;
+      const u2 = idx2 - 1;
+
+      if (u0 >= numPts || u1 >= numPts || u2 >= numPts) continue;
+
+      if (isFlipped) {
+        indices[writeIdx++] = u0;
+        indices[writeIdx++] = u2;
+        indices[writeIdx++] = u1;
+      } else {
+        indices[writeIdx++] = u0;
+        indices[writeIdx++] = u1;
+        indices[writeIdx++] = u2;
+      }
+    }
+
+    if (writeIdx === 0) return null;
+    const finalIndices = writeIdx === indices.length ? indices : indices.subarray(0, writeIdx);
+
+    // 3. Fast vertex normal accumulation and per-triangle normal tracking
+    const normals = new Float32Array(numPts * 3);
+    const triCount = finalIndices.length / 3;
+    const triNormals = new Float32Array(triCount * 3);
+
+    for (let t = 0; t < triCount; t++) {
+      const i0 = finalIndices[t * 3];
+      const i1 = finalIndices[t * 3 + 1];
+      const i2 = finalIndices[t * 3 + 2];
+
+      const p0x = positions[i0 * 3], p0y = positions[i0 * 3 + 1], p0z = positions[i0 * 3 + 2];
+      const p1x = positions[i1 * 3], p1y = positions[i1 * 3 + 1], p1z = positions[i1 * 3 + 2];
+      const p2x = positions[i2 * 3], p2y = positions[i2 * 3 + 1], p2z = positions[i2 * 3 + 2];
+
+      const v01x = p1x - p0x, v01y = p1y - p0y, v01z = p1z - p0z;
+      const v02x = p2x - p0x, v02y = p2y - p0y, v02z = p2z - p0z;
+
+      const nx = v01y * v02z - v01z * v02y;
+      const ny = v01z * v02x - v01x * v02z;
+      const nz = v01x * v02y - v01y * v02x;
+
+      const tLen = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      if (tLen > 1e-8) {
+        triNormals[t * 3] = nx / tLen;
+        triNormals[t * 3 + 1] = ny / tLen;
+        triNormals[t * 3 + 2] = nz / tLen;
+      }
+
+      normals[i0 * 3] += nx; normals[i0 * 3 + 1] += ny; normals[i0 * 3 + 2] += nz;
+      normals[i1 * 3] += nx; normals[i1 * 3 + 1] += ny; normals[i1 * 3 + 2] += nz;
+      normals[i2 * 3] += nx; normals[i2 * 3 + 1] += ny; normals[i2 * 3 + 2] += nz;
+    }
+
+    for (let i = 0; i < numPts; i++) {
+      const nx = normals[i * 3];
+      const ny = normals[i * 3 + 1];
+      const nz = normals[i * 3 + 2];
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      if (len > 1e-6) {
+        normals[i * 3] = nx / len;
+        normals[i * 3 + 1] = ny / len;
+        normals[i * 3 + 2] = nz / len;
+      } else {
+        normals[i * 3] = 0;
+        normals[i * 3 + 1] = 1;
+        normals[i * 3 + 2] = 0;
+      }
+    }
+
+    // 4. Feature edge extraction for architectural outlines & creases (suppress coplanar diagonals)
+    const edgeMap = new Map<bigint, { v0: number; v1: number; t0: number; t1?: number; count: number }>();
+
+    for (let t = 0; t < triCount; t++) {
+      const i0 = finalIndices[t * 3];
+      const i1 = finalIndices[t * 3 + 1];
+      const i2 = finalIndices[t * 3 + 2];
+
+      const triEdges = [
+        [i0, i1],
+        [i1, i2],
+        [i2, i0],
+      ];
+
+      for (let e = 0; e < 3; e++) {
+        const a = triEdges[e][0];
+        const b = triEdges[e][1];
+        const minV = a < b ? a : b;
+        const maxV = a < b ? b : a;
+        const key = (BigInt(minV) << 32n) | BigInt(maxV);
+
+        let entry = edgeMap.get(key);
+        if (!entry) {
+          edgeMap.set(key, { v0: minV, v1: maxV, t0: t, count: 1 });
+        } else {
+          entry.t1 = t;
+          entry.count++;
+        }
+      }
+    }
+
+    const COS_CREASE_THRESHOLD = 0.99619; // cos(5 deg)
+    const edgeFloats: number[] = [];
+
+    for (const edge of edgeMap.values()) {
+      let isFeature = false;
+      if (edge.count === 1 || edge.count > 2) {
+        isFeature = true;
+      } else if (edge.count === 2 && edge.t1 !== undefined) {
+        const idx0 = edge.t0 * 3;
+        const idx1 = edge.t1 * 3;
+        const dot = Math.abs(
+          triNormals[idx0] * triNormals[idx1] +
+          triNormals[idx0 + 1] * triNormals[idx1 + 1] +
+          triNormals[idx0 + 2] * triNormals[idx1 + 2]
+        );
+        if (dot < COS_CREASE_THRESHOLD) {
+          isFeature = true;
+        }
+      }
+
+      if (isFeature) {
+        const u0 = edge.v0 * 3;
+        const u1 = edge.v1 * 3;
+        edgeFloats.push(
+          positions[u0], positions[u0 + 1], positions[u0 + 2],
+          positions[u1], positions[u1 + 1], positions[u1 + 2]
+        );
+      }
+    }
+
+    return {
+      positions,
+      normals,
+      indices: finalIndices,
+      edgesBuffer: new Float32Array(edgeFloats),
+    };
+  }
+
+  /**
+   * Fast-path generator for pure IFCTRIANGULATEDFACESET products without openings.
+   * Directly produces raw TypedArrays (Float32Array / Uint32Array) for zero-copy GPU transmission.
+   */
+  private tryBuildFastTriangulatedEntities(
+    rec: StepRecord,
+    defaultParentId: string | null,
+    _psets?: Record<string, Record<string, any>>,
+    itemToStyleMap?: Map<number, string>,
+    _faceToStyleMap?: Map<number, string>,
+    elementMaterialMap?: Map<number, string>
+  ): { rootEntity: EvaluatedProductEntity; children: EvaluatedProductEntity[] } | null {
+    if (this.hostToOpeningsStepMap.has(rec.id)) {
+      return null;
+    }
+
+    const shapeParam = rec.params[6];
+    if (!shapeParam || typeof shapeParam !== 'object' || !('ref' in shapeParam)) {
+      return null;
+    }
+
+    const shapeRec = this.records.get(shapeParam.ref);
+    if (!shapeRec || shapeRec.type !== 'IFCPRODUCTDEFINITIONSHAPE') {
+      return null;
+    }
+
+    const repsList = shapeRec.params[2];
+    if (!Array.isArray(repsList) || repsList.length === 0) {
+      return null;
+    }
+
+    const fastItems: { itemRec: StepRecord; repStyleId?: string }[] = [];
+    let hasOtherGeometry = false;
+
+    for (const item of repsList) {
+      if (!item || typeof item !== 'object' || !('ref' in item)) continue;
+      const repRec = this.records.get(item.ref);
+      if (!repRec) continue;
+
+      const repStyleId = itemToStyleMap?.get(repRec.id);
+      const geomItems = repRec.params[3];
+      if (!Array.isArray(geomItems)) continue;
+
+      for (const geomItem of geomItems) {
+        if (!geomItem || typeof geomItem !== 'object' || !('ref' in geomItem)) continue;
+        const gRec = this.records.get(geomItem.ref);
+        if (!gRec) continue;
+
+        if (gRec.type === 'IFCTRIANGULATEDFACESET' || gRec.type === 'IFCTRIANGULATEDIRREGULARNETWORK') {
+          fastItems.push({ itemRec: gRec, repStyleId: itemToStyleMap?.get(gRec.id) || repStyleId });
+        } else {
+          hasOtherGeometry = true;
+          break;
+        }
+      }
+      if (hasOtherGeometry) break;
+    }
+
+    if (hasOtherGeometry || fastItems.length === 0) {
+      return null;
+    }
+
+    // Resolve ObjectPlacement
+    const placementParam = rec.params[5];
+    let mProduct = new THREE.Matrix4();
+    if (placementParam && typeof placementParam === 'object' && 'ref' in placementParam) {
+      mProduct = this.resolveLocalPlacementMatrix(placementParam.ref);
+    }
+
+    const rawGuid = this.getParamString(rec.params[0]);
+    const id = this.stepIdToEntityId.get(rec.id) || (rawGuid && GuidUtils.isIfcGuid(rawGuid) ? rawGuid : GuidUtils.createIfcGuid());
+    this.stepIdToEntityId.set(rec.id, id);
+    const name = this.getParamString(rec.params[2]) || rec.type;
+    const productLevelMatId = elementMaterialMap?.get(rec.id) || itemToStyleMap?.get(rec.id);
+
+    const isSpace = rec.type === 'IFCSPACE';
+    const children: EvaluatedProductEntity[] = [];
+
+    for (let idx = 0; idx < fastItems.length; idx++) {
+      const fi = fastItems[idx];
+      const rawGeo = this.extractFastTriangulatedItem(fi.itemRec, mProduct);
+      if (!rawGeo || rawGeo.indices.length === 0) continue;
+
+      const childId = GuidUtils.createIfcGuid();
+      const matId = fi.repStyleId || productLevelMatId;
+      const childName = fastItems.length === 1
+        ? name
+        : `${name} [${matId || 'Parte ' + (idx + 1)}]`;
+
+      children.push({
+        id: childId,
+        type: 'GEOMETRY_ENTITY',
+        name: childName,
+        parentId: id,
+        rawGeometry: rawGeo,
+        materialId: matId,
+        hidden: isSpace ? true : undefined,
+        faces: [],
+        vertices: [],
+        edges: [],
+      });
+    }
+
+    if (children.length === 0) return null;
+
+    const rootGroup: EvaluatedProductEntity = {
+      id,
+      type: 'GROUP',
+      name,
+      parentId: defaultParentId,
+      hidden: isSpace ? true : undefined,
+      faces: [],
+      vertices: [],
+      edges: [],
+    };
+
+    return { rootEntity: rootGroup, children };
+  }
+
+  /**
+   * Reconstructs a product entity and its potential child components (GEOMETRY_ENTITY)
+   * from multiple representations or MappedItem sub-items.
+   * Complies with Rule 15 (binary ontology GROUP / GEOMETRY_ENTITY).
    */
   private rebuildProductEntities(
     rec: StepRecord,
@@ -1917,12 +2802,27 @@ export class IfcStepImporter {
     faceToStyleMap?: Map<number, string>,
     elementMaterialMap?: Map<number, string>
   ): { rootEntity: EvaluatedProductEntity; children: EvaluatedProductEntity[] } | null {
+    // Fast-path: If the product definition shape consists solely of IFCTRIANGULATEDFACESET
+    // and has no openings, extract directly to TypedArrays (Float32Array, Uint32Array)
+    // without creating PolyMesh, Vec3, seenTriangles, or coalesceCoplanarFaces.
+    const fastTriangulated = this.tryBuildFastTriangulatedEntities(
+      rec,
+      defaultParentId,
+      _psets,
+      itemToStyleMap,
+      faceToStyleMap,
+      elementMaterialMap
+    );
+    if (fastTriangulated) {
+      return fastTriangulated;
+    }
+
     const rawGuid = this.getParamString(rec.params[0]);
     const id = this.stepIdToEntityId.get(rec.id) || (rawGuid && GuidUtils.isIfcGuid(rawGuid) ? rawGuid : GuidUtils.createIfcGuid());
     this.stepIdToEntityId.set(rec.id, id);
     const name = this.getParamString(rec.params[2]) || rec.type;
 
-    // Param 6 suele ser la representación geométrica (IfcProductDefinitionShape)
+    // Param 6 is usually geometric representation (IfcProductDefinitionShape)
     const shapeParam = rec.params[6];
     let subMeshes: { mesh: PolyMesh; itemId: number; materialId?: string }[] = [];
 
@@ -1942,22 +2842,22 @@ export class IfcStepImporter {
       return null;
     }
 
-    // 1. Resolver ObjectPlacement (rec.params[5]) del producto
+    // 1. Resolve ObjectPlacement (rec.params[5]) of product
     const placementParam = rec.params[5];
     let mProduct = new THREE.Matrix4();
     if (placementParam && typeof placementParam === 'object' && 'ref' in placementParam) {
       mProduct = this.resolveLocalPlacementMatrix(placementParam.ref);
     }
 
-    // Material por defecto a nivel de producto
+    // Default material at product level
     const productLevelMatId = elementMaterialMap?.get(rec.id) || itemToStyleMap?.get(rec.id);
 
-    // 2. Aplicar mProduct y cambio de base canónico (Z-Up -> Y-Up) a cada sub-malla
+    // 2. Apply mProduct and canonical change of basis (Z-Up -> Y-Up) to each sub-mesh
     for (const sm of subMeshes) {
       const mesh = sm.mesh;
       for (const v of mesh.vertices.values()) {
         const p = new THREE.Vector3(v.position.x, v.position.y, v.position.z).applyMatrix4(mProduct);
-        // Cambio canónico: X_croq = X_ifc, Y_croq = Z_ifc, Z_croq = -Y_ifc (det = +1)
+        // Canonical change: X_croq = X_ifc, Y_croq = Z_ifc, Z_croq = -Y_ifc (det = +1)
         v.position = new Vec3(p.x, p.z, -p.y);
       }
       for (const f of mesh.faces.values()) {
@@ -1969,21 +2869,18 @@ export class IfcStepImporter {
             })
           );
         }
-        const isAnonymousIfcMat = f.materialId && f.materialId.startsWith('mat_ifc_');
-        if ((!f.materialId || isAnonymousIfcMat) && productLevelMatId) {
-          f.materialId = productLevelMatId;
-        } else if (!f.materialId && sm.materialId) {
-          f.materialId = sm.materialId;
+        if (!f.materialId) {
+          f.materialId = sm.materialId || productLevelMatId;
         }
       }
-      if (productLevelMatId && (!sm.materialId || sm.materialId.startsWith('mat_ifc_'))) {
+      if (!sm.materialId && productLevelMatId) {
         sm.materialId = productLevelMatId;
       }
     }
 
-    // En la lógica de Croquera, todo producto IFC con geometría se estructura formalmente
-    // como un GROUP contenedor (con su clasificación IFC y metadatos) que alberga sus piezas/mallas
-    // como GEOMETRY_ENTITY hijas (Norma 15).
+    // In Croquera logic, every IFC product with geometry is formally structured
+    // as a container GROUP (with its IFC classification and metadata) hosting its parts/meshes
+    // as child GEOMETRY_ENTITY elements (Rule 15).
     const matrixSourceVal = _psets?.Pset_InstanceCommon?.MatrixSourceId;
     const matrixSourceId = (typeof matrixSourceVal === 'object' && matrixSourceVal !== null && 'value' in matrixSourceVal)
       ? matrixSourceVal.value
@@ -1999,7 +2896,7 @@ export class IfcStepImporter {
     if (subMeshes.length > 0) {
       const rootGroup: EvaluatedProductEntity = {
         id,
-        type: isSpace ? 'GEOMETRY_ENTITY' : 'GROUP',
+        type: 'GROUP',
         name,
         parentId: defaultParentId,
         matrixId: resolvedMatrixId || undefined,
@@ -2010,17 +2907,22 @@ export class IfcStepImporter {
       };
 
       const children: EvaluatedProductEntity[] = [];
-      for (const sm of subMeshes) {
+      for (let idx = 0; idx < subMeshes.length; idx++) {
+        const sm = subMeshes[idx];
         const childId = GuidUtils.createIfcGuid();
         const childMesh = sm.mesh;
-        const childName = sm.materialId || 'Malla';
+        const childName = subMeshes.length === 1
+          ? name
+          : `${name} [${sm.materialId || 'Parte ' + (idx + 1)}]`;
 
         const childEntity: EvaluatedProductEntity = {
           id: childId,
           type: 'GEOMETRY_ENTITY',
           name: childName,
           parentId: id,
+          materialId: sm.materialId,
           polyMesh: childMesh,
+          hidden: isSpace ? true : undefined,
           faces: [],
           vertices: [],
           edges: [],
@@ -2055,11 +2957,11 @@ export class IfcStepImporter {
       return { rootEntity: rootGroup, children };
     }
 
-    // Contenedores puramente lógicos o ensamblajes sin geometría propia directa (Grupos Rama - Norma 15)
+    // Purely logical containers or assemblies without direct geometry (Branch Groups - Rule 15)
     if (isExplicitAssembly || hasChildren || hasPsets || isSpace || isDoor) {
       const groupEntity: EvaluatedProductEntity = {
         id,
-        type: isSpace ? 'GEOMETRY_ENTITY' : 'GROUP',
+        type: 'GROUP',
         name,
         parentId: defaultParentId,
         matrixId: resolvedMatrixId || undefined,
@@ -2081,14 +2983,31 @@ export class IfcStepImporter {
   ): EvaluatedProductEntity | null {
     const res = this.rebuildProductEntities(rec, defaultParentId, psets);
     if (!res) return null;
-    if (res.rootEntity.type === 'GROUP' && res.children.length > 0 && res.children[0].polyMesh) {
-      res.rootEntity.polyMesh = res.children[0].polyMesh;
+    if (res.rootEntity.type === 'GROUP' && res.children.length > 0) {
+      if (res.children.length === 1 && res.children[0].polyMesh) {
+        res.rootEntity.polyMesh = res.children[0].polyMesh;
+      } else {
+        const combinedMesh = new PolyMesh(res.rootEntity.id);
+        for (const ch of res.children) {
+          if (ch.polyMesh) {
+            for (const f of ch.polyMesh.faces.values()) {
+              combinedMesh.addFace(f.getPositions(), f.normal);
+            }
+          }
+        }
+        if (combinedMesh.faces.size > 0) {
+          combinedMesh.rebuildTopology();
+          res.rootEntity.polyMesh = combinedMesh;
+        } else if (res.children[0].polyMesh) {
+          res.rootEntity.polyMesh = res.children[0].polyMesh;
+        }
+      }
     }
     return res.rootEntity;
   }
 
   /**
-   * Reconstruye todos los sub-PolyMesh navegando desde IfcProductDefinitionShape -> IfcShapeRepresentation -> Mallas.
+   * Reconstructs all sub-PolyMeshes navigating from IfcProductDefinitionShape -> IfcShapeRepresentation -> Meshes.
    */
   private rebuildSubMeshesFromShape(
     shapeRef: number,
@@ -2152,17 +3071,17 @@ export class IfcStepImporter {
   }
 
   /**
-   * Consolida submallas múltiples pertenecientes al mismo producto agrupándolas por materialId.
-   * Evita la explosión combinatoria de entidades hijas y draw calls en elementos masivos
-   * compuestos por miles de ítems BRep discretos (e.g. balaustres, perfiles repetitivos).
+   * Consolidates multiple sub-meshes belonging to the same product by grouping them by materialId.
+   * Prevents combinatorial explosion of child entities and draw calls in massive elements
+   * composed of thousands of discrete BRep items (e.g. balusters, repetitive profiles).
    */
   private consolidateSubMeshes(
     subMeshes: { mesh: PolyMesh; itemId: number; materialId?: string }[],
     baseEntityId: string
   ): { mesh: PolyMesh; itemId: number; materialId?: string }[] {
-    // Conforme a Norma 15 y buildingSMART, los elementos con componentes discretos
-    // (sillas, muros multicapa, puertas, etc.) deben preservar sus piezas como GEOMETRY_ENTITY hijas.
-    // Solo se consolidan elementos masivos (e.g. teselados o conjuntos > 16 fragmentos).
+    // In compliance with Rule 15 and buildingSMART, elements with discrete components
+    // (chairs, multilayer walls, doors, etc.) must preserve their parts as child GEOMETRY_ENTITY elements.
+    // Only massive elements (e.g. tessellations or sets > 16 fragments) are consolidated.
     if (subMeshes.length <= 16) return subMeshes;
 
     const byMaterial = new Map<string, { mesh: PolyMesh; itemId: number; materialId?: string }[]>();
@@ -2218,7 +3137,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Reconstruye un PolyMesh desde representaciones STEP estándar (Malla, Extrusión o Mapeo).
+   * Reconstructs a PolyMesh from standard STEP representations (Mesh, Extrusion, or Mapping).
    */
   private rebuildMeshFromItem(
     itemId: number,
@@ -2228,7 +3147,7 @@ export class IfcStepImporter {
     visited: Set<number> = new Set<number>()
   ): PolyMesh | null {
     if (visited.has(itemId) || visited.size >= 64) {
-      console.warn(`[IfcStepImporter] Ciclo o exceso de recursión detectado en ítem geom #${itemId}. Omitiendo.`);
+      console.warn(`[IfcStepImporter] Cycle or recursion depth exceeded in geom item #${itemId}. Skipping.`);
       return null;
     }
     visited.add(itemId);
@@ -2318,12 +3237,16 @@ export class IfcStepImporter {
       return this.rebuildFromBooleanResult(itemRec, entityId, itemToStyleMap, faceToStyleMap, visited);
     }
 
+    if (itemRec.type === 'IFCPOLYGONALBOUNDEDHALFSPACE') {
+      return this.rebuildFromPolygonalBoundedHalfSpace(itemRec, entityId);
+    }
+
     return null;
   }
 
   /**
-   * Reconstruye un PolyMesh desde un IfcBooleanResult / IfcBooleanClippingResult navegando recursivamente
-   * por el primer operando (FirstOperand) hasta el sólido base.
+   * Reconstructs a PolyMesh from an IfcBooleanResult / IfcBooleanClippingResult by navigating recursively
+   * through the first operand (FirstOperand) to the base solid.
    */
   private rebuildFromBooleanResult(
     rec: StepRecord,
@@ -2352,8 +3275,11 @@ export class IfcStepImporter {
     if (secondOperandParam && typeof secondOperandParam === 'object' && 'ref' in secondOperandParam) {
       try {
         const secondRec = this.records.get(secondOperandParam.ref);
-        if (operator.includes('DIFFERENCE') && secondRec && (secondRec.type === 'IFCHALFSPACESOLID' || secondRec.type === 'IFCPOLYGONALBOUNDEDHALFSPACE')) {
-          // Caso 1: Semiespacio analítico (IFCHALFSPACESOLID / IFCPOLYGONALBOUNDEDHALFSPACE) -> clipByPlane analítico
+        const isHalfSpace =
+          secondRec &&
+          secondRec.type === 'IFCHALFSPACESOLID';
+        if (operator.includes('DIFFERENCE') && isHalfSpace) {
+          // Case 1: Analytical infinite half-space solid -> analytical clipByPlane
           const planeParam = secondRec.params[0];
           if (planeParam && typeof planeParam === 'object' && 'ref' in planeParam) {
             const planeRec = this.records.get(planeParam.ref);
@@ -2362,14 +3288,20 @@ export class IfcStepImporter {
               if (posRec && posRec.type === 'IFCAXIS2PLACEMENT3D') {
                 const mPlane = this.resolveAxis2Placement3D(posRec);
                 const pos = new Vec3(mPlane.elements[12], mPlane.elements[13], mPlane.elements[14]);
-                const normal = new Vec3(mPlane.elements[8], mPlane.elements[9], mPlane.elements[10]).normalize();
+                let normal = new Vec3(mPlane.elements[8], mPlane.elements[9], mPlane.elements[10]).normalize();
+                const agreementFlag = secondRec.params[1] !== false && secondRec.params[1] !== '.F.';
+                // In ISO 10303-42 / IFC: AgreementFlag == false means surface normal points INTO the removed half-space.
+                // AgreementFlag == true means surface normal points AWAY from the removed half-space.
+                if (agreementFlag) {
+                  normal = normal.negate();
+                }
                 const plane = Plane.fromPointAndNormal(pos, normal);
                 firstMesh.clipByPlane(plane, true);
               }
             }
           }
         } else {
-          // Caso 2: Sólido poliédrico general -> Despacho a BooleanCSGKernel
+          // Case 2: General polyhedral solid -> Dispatch to BooleanCSGKernel
           const secondMesh = this.rebuildMeshFromItem(
             secondOperandParam.ref,
             GuidUtils.createIfcGuid(),
@@ -2399,18 +3331,123 @@ export class IfcStepImporter {
           }
         }
       } catch (err: any) {
-        console.warn(`[IfcStepImporter] Fallo al aplicar operación booleana #${rec.id}: ${err?.message || err}`);
+        console.warn(`[IfcStepImporter] Failed to apply boolean operation #${rec.id}: ${err?.message || err}`);
       }
     }
     return firstMesh;
   }
 
   /**
-   * Reconstruye un PolyMesh desde un IfcExtrudedAreaSolid (Revit/ArchiCAD estándar).
+   * Reconstructs a PolyMesh from an IfcPolygonalBoundedHalfSpace (ISO 16739-1 / IFC 4.3).
+   * Generates a 2-manifold closed polygonal prism extruded along the halfspace normal direction
+   * for exact CSG boolean clipping, preserving the unclipped body of the element.
    */
+  private rebuildFromPolygonalBoundedHalfSpace(rec: StepRecord, entityId: string): PolyMesh | null {
+    // rec.params: [BaseSurface, AgreementFlag, Position, PolygonalBoundary]
+    const positionParam = rec.params[2];
+    if (!positionParam || typeof positionParam !== 'object' || !('ref' in positionParam)) {
+      return null;
+    }
+    const posRec = this.records.get(positionParam.ref);
+    if (!posRec || posRec.type !== 'IFCAXIS2PLACEMENT3D') {
+      return null;
+    }
+    const mPos = this.resolveAxis2Placement3D(posRec);
+
+    const boundaryParam = rec.params[3];
+    if (!boundaryParam || typeof boundaryParam !== 'object' || !('ref' in boundaryParam)) {
+      return null;
+    }
+    const rawBoundaryPoints = this.extract2DCurvePoints(boundaryParam.ref);
+    if (rawBoundaryPoints.length < 3) return null;
+
+    const pts = [...rawBoundaryPoints];
+    if (pts.length >= 4) {
+      const first = pts[0];
+      const last = pts[pts.length - 1];
+      if (Math.hypot(first.x - last.x, first.y - last.y) < GeometryTolerance.COINCIDENT_POINT) {
+        pts.pop();
+      }
+    }
+    if (pts.length < 3) return null;
+
+    // Ensure CCW orientation in the (u, v) plane
+    if (PolygonClipping.signedArea2D(pts) < 0) {
+      pts.reverse();
+    }
+
+    // Resolve BaseSurface plane in object space
+    let basePlane: Plane | null = null;
+    let nBase = new Vec3(0, 0, 1);
+    const planeParam = rec.params[0];
+    if (planeParam && typeof planeParam === 'object' && 'ref' in planeParam) {
+      const planeRec = this.records.get(planeParam.ref);
+      if (planeRec && planeRec.params[0] && typeof planeRec.params[0] === 'object' && 'ref' in planeRec.params[0]) {
+        const planePosRec = this.records.get(planeRec.params[0].ref);
+        if (planePosRec && planePosRec.type === 'IFCAXIS2PLACEMENT3D') {
+          const mPlane = this.resolveAxis2Placement3D(planePosRec);
+          const p0 = new Vec3(mPlane.elements[12], mPlane.elements[13], mPlane.elements[14]);
+          nBase = new Vec3(mPlane.elements[8], mPlane.elements[9], mPlane.elements[10]).normalize();
+          basePlane = Plane.fromPointAndNormal(p0, nBase);
+        }
+      }
+    }
+
+    const agreementFlagParam = rec.params[1];
+    const agreementFlag = agreementFlagParam !== false && agreementFlagParam !== '.F.';
+
+    // In ISO 10303-42 / IFC 4.3 standard:
+    // AgreementFlag == false: surface normal points INTO the removed halfspace volume.
+    // AgreementFlag == true: surface normal points AWAY from the removed halfspace volume.
+    const vIntoHalfspace = agreementFlag ? nBase.negate() : nBase;
+
+    // Build bounding prism spanning from -H to +H along local Z of Position
+    const H = 50.0;
+    const bottomPts = pts.map((p) => new Vec3(p.x, p.y, -H));
+    const topPts = pts.map((p) => new Vec3(p.x, p.y, H));
+
+    const polyMesh = new PolyMesh(entityId);
+    // Bottom cap (Z = -H, normal points into -Z => reversed)
+    polyMesh.addFace([...bottomPts].reverse());
+    // Top cap (Z = +H, normal points into +Z => unreversed)
+    polyMesh.addFace(topPts);
+
+    // Side faces
+    const N = pts.length;
+    for (let i = 0; i < N; i++) {
+      const next = (i + 1) % N;
+      polyMesh.addFace([bottomPts[i], bottomPts[next], topPts[next], topPts[i]]);
+    }
+
+    // Transform prism into object space
+    this.applyMatrixToPolyMesh(polyMesh, mPos);
+    polyMesh.rebuildTopology();
+
+    // Symmetrically slice the bounding prism with BaseSurface:
+    // clipByPlane(plane, true) keeps points where (p - p0) . cutNormal <= 0.
+    // Since vIntoHalfspace points into the solid volume to RETAIN, we want (p - p0) . vIntoHalfspace >= 0,
+    // which corresponds to cutNormal = -vIntoHalfspace.
+    if (basePlane) {
+      const cutNormal = vIntoHalfspace.negate();
+      const clipPlane = Plane.fromPointAndNormal(basePlane.origin, cutNormal);
+      polyMesh.clipByPlane(clipPlane, true);
+    } else {
+      const zPos = new Vec3(mPos.elements[8], mPos.elements[9], mPos.elements[10]).normalize();
+      const originPos = new Vec3(mPos.elements[12], mPos.elements[13], mPos.elements[14]);
+      const dot = vIntoHalfspace.dot(zPos);
+      const cutNormal = dot >= 0 ? zPos.negate() : zPos;
+      const clipPlane = Plane.fromPointAndNormal(originPos, cutNormal);
+      polyMesh.clipByPlane(clipPlane, true);
+    }
+
+    polyMesh.rebuildTopology();
+    polyMesh.resetVersion();
+    return polyMesh;
+  }
+
   /**
-   * Reconstruye un PolyMesh desde un IfcExtrudedAreaSolid (Revit/ArchiCAD estándar).
-   * Alimenta múltiples lazos y perfiles compuestos según Norma 16 (Ruta Única).
+   * Reconstructs a PolyMesh from an IfcExtrudedAreaSolid (Revit/ArchiCAD standard).
+   * Supplies multiple loops and composite profiles according to Rule 16 (Single Path).
    */
   private rebuildFromExtrudedAreaSolid(
     rec: StepRecord,
@@ -2431,11 +3468,37 @@ export class IfcStepImporter {
       return null;
     }
 
-    // Ruta Única (Norma 16): extracción canónica de perfiles 2D
+    let mSolid: THREE.Matrix4 | null = null;
+    if (positionParam && typeof positionParam === 'object' && 'ref' in positionParam) {
+      const posRec = this.records.get(positionParam.ref);
+      if (posRec && posRec.type === 'IFCAXIS2PLACEMENT3D') {
+        mSolid = this.resolveAxis2Placement3D(posRec);
+      }
+    }
+
+    // 2nd-tier parametric mesh cache check
+    const paramSig = ParametricSolidHasher.computeExtrudedAreaSolidHash(this.records, rec, this.lengthUnitScale);
+    if (paramSig && this.parametricMeshCache.has(paramSig.hash)) {
+      const cached = this.parametricMeshCache.get(paramSig.hash)!;
+      const polyMesh = cached.clone(entityId);
+      if (mSolid) {
+        this.applyMatrixToPolyMesh(polyMesh, mSolid);
+      }
+      const styleMatId = itemToStyleMap?.get(rec.id);
+      if (styleMatId) {
+        for (const face of polyMesh.faces.values()) {
+          face.materialId = styleMatId;
+        }
+      }
+      polyMesh.resetVersion();
+      return polyMesh;
+    }
+
+    // Single Path (Rule 16): canonical 2D profile extraction
     const profileLoops = this.extractProfileLoops2D((sweptAreaParam as any).ref);
     if (profileLoops.length === 0) return null;
 
-    // Vector de extrusión (IFCDIRECTION) en sistema local del sólido (default Z: (0, 0, 1))
+    // Extrusion vector (IFCDIRECTION) in solid local system (default Z: (0, 0, 1))
     let extrudeDir = new THREE.Vector3(0, 0, 1);
     if (dirParam && typeof dirParam === 'object' && 'ref' in dirParam) {
       const dirRec = this.records.get(dirParam.ref);
@@ -2447,14 +3510,6 @@ export class IfcStepImporter {
       }
     }
     extrudeDir.normalize().multiplyScalar(depth);
-
-    let mSolid: THREE.Matrix4 | null = null;
-    if (positionParam && typeof positionParam === 'object' && 'ref' in positionParam) {
-      const posRec = this.records.get(positionParam.ref);
-      if (posRec && posRec.type === 'IFCAXIS2PLACEMENT3D') {
-        mSolid = this.resolveAxis2Placement3D(posRec);
-      }
-    }
 
     const polyMesh = new PolyMesh(entityId);
 
@@ -2471,13 +3526,6 @@ export class IfcStepImporter {
         loop.map((v) => new THREE.Vector3().addVectors(v, extrudeDir))
       );
 
-      if (mSolid) {
-        baseVerts.forEach((v) => v.applyMatrix4(mSolid!));
-        topVerts.forEach((v) => v.applyMatrix4(mSolid!));
-        innerBaseLoops.forEach((loop) => loop.forEach((v) => v.applyMatrix4(mSolid!)));
-        innerTopLoops.forEach((loop) => loop.forEach((v) => v.applyMatrix4(mSolid!)));
-      }
-
       const basePts = baseVerts.map((v) => new Vec3(v.x, v.y, v.z));
       const topPts = topVerts.map((v) => new Vec3(v.x, v.y, v.z));
 
@@ -2488,36 +3536,57 @@ export class IfcStepImporter {
         loop.map((v) => new Vec3(v.x, v.y, v.z))
       );
 
-      // Cara inferior (orientada hacia afuera en dirección opuesta a la extrusión)
-      const bottomFace = [...basePts].reverse();
-      const bottomHoles = innerBasePts.map((loop) => [...loop].reverse());
-      polyMesh.addFace(bottomFace, undefined, bottomHoles.length > 0 ? bottomHoles : undefined);
+      const isNegativeExtrusion = extrudeDir.z < 0;
 
-      // Cara superior (orientada hacia afuera en dirección de extrusión)
-      polyMesh.addFace(topPts, undefined, innerTopPts.length > 0 ? innerTopPts : undefined);
+      // Bottom / starting face (Z = 0):
+      // When extruding in +Z direction, Z = 0 is bottom cap and must point in -Z (reversed).
+      // When extruding in -Z direction, Z = 0 is top cap and must point in +Z (unreversed).
+      const startFace = isNegativeExtrusion ? basePts : [...basePts].reverse();
+      const startHoles = innerBasePts.map((loop) => (isNegativeExtrusion ? loop : [...loop].reverse()));
+      polyMesh.addFace(startFace, undefined, startHoles.length > 0 ? startHoles : undefined);
 
-      // Caras laterales exteriores cuadriláteras
+      // Top / ending face (Z = extrudeDir.z):
+      // When extruding in +Z direction, Z = extrudeDir.z is top cap and must point in +Z (unreversed).
+      // When extruding in -Z direction, Z = extrudeDir.z is bottom cap and must point in -Z (reversed).
+      const endFace = isNegativeExtrusion ? [...topPts].reverse() : topPts;
+      const endHoles = innerTopPts.map((loop) => (isNegativeExtrusion ? [...loop].reverse() : loop));
+      polyMesh.addFace(endFace, undefined, endHoles.length > 0 ? endHoles : undefined);
+
+      // Outer quadrilateral side faces (oriented outwards)
       const N = basePts.length;
       for (let i = 0; i < N; i++) {
         const next = (i + 1) % N;
-        const sideFace = [basePts[i], basePts[next], topPts[next], topPts[i]];
+        const sideFace = isNegativeExtrusion
+          ? [basePts[next], basePts[i], topPts[i], topPts[next]]
+          : [basePts[i], basePts[next], topPts[next], topPts[i]];
         polyMesh.addFace(sideFace);
       }
 
-      // Caras laterales interiores (túneles de huecos)
+      // Inner side faces (opening tunnels)
       for (let k = 0; k < innerBasePts.length; k++) {
         const hBase = innerBasePts[k];
         const hTop = innerTopPts[k];
         const M = hBase.length;
         for (let j = 0; j < M; j++) {
           const next = (j + 1) % M;
-          const tunnelFace = [hBase[next], hBase[j], hTop[j], hTop[next]];
+          const tunnelFace = isNegativeExtrusion
+            ? [hBase[j], hBase[next], hTop[next], hTop[j]]
+            : [hBase[next], hBase[j], hTop[j], hTop[next]];
           polyMesh.addFace(tunnelFace);
         }
       }
     }
 
     if (polyMesh.faces.size === 0) return null;
+
+    // Cache un-transformed PolyMesh for 2nd-tier mesh deduplication
+    if (paramSig && !this.parametricMeshCache.has(paramSig.hash)) {
+      this.parametricMeshCache.set(paramSig.hash, polyMesh.clone());
+    }
+
+    if (mSolid) {
+      this.applyMatrixToPolyMesh(polyMesh, mSolid);
+    }
 
     const styleMatId = itemToStyleMap?.get(rec.id);
     if (styleMatId) {
@@ -2531,7 +3600,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Aplica una transformación afín THREE.Matrix4 a los vértices y huecos de un PolyMesh.
+   * Applies an affine THREE.Matrix4 transformation to the vertices and holes of a PolyMesh.
    */
   private applyMatrixToPolyMesh(mesh: PolyMesh, mat: THREE.Matrix4): void {
     for (const v of mesh.vertices.values()) {
@@ -2551,8 +3620,8 @@ export class IfcStepImporter {
   }
 
   /**
-   * Reconstruye un PolyMesh desde un IfcSweptDiskSolid o IfcSweptDiskSolidPolygonal (ISO 16739-1 / IFC 4.3).
-   * Genera un sólido tubular barriendo un disco plano circular ortogonal a la directriz 3D.
+   * Reconstructs a PolyMesh from an IfcSweptDiskSolid or IfcSweptDiskSolidPolygonal (ISO 16739-1 / IFC 4.3).
+   * Generates a tubular solid sweeping an orthogonal flat circular disk along the 3D directrix.
    */
   private rebuildFromSweptDiskSolid(
     rec: StepRecord,
@@ -2564,7 +3633,7 @@ export class IfcStepImporter {
     const innerRadiusParam = rec.params[IFC_GEOM_ATTRS.SWEPT_DISK_INNER_RADIUS];
 
     if (!directrixParam || typeof directrixParam !== 'object' || !('ref' in directrixParam)) {
-      const msg = `IfcSweptDiskSolid #${rec.id} sin directriz válida`;
+      const msg = `IfcSweptDiskSolid #${rec.id} without valid directrix`;
       console.warn(`[IfcStepImporter] ${msg}`);
       this.importWarnings.push(msg);
       return null;
@@ -2572,7 +3641,7 @@ export class IfcStepImporter {
 
     const directrix = this.extract3DCurvePoints((directrixParam as any).ref);
     if (!directrix || directrix.points.length < 2) {
-      const msg = `Directriz 3D no resuelta o degenerada (< 2 puntos) en IfcSweptDiskSolid #${rec.id}`;
+      const msg = `3D Directrix unresolved or degenerate (< 2 points) in IfcSweptDiskSolid #${rec.id}`;
       console.warn(`[IfcStepImporter] ${msg}`);
       this.importWarnings.push(msg);
       return null;
@@ -2581,7 +3650,7 @@ export class IfcStepImporter {
     const rawRadius = typeof radiusParam === 'number' ? radiusParam : parseFloat(String(radiusParam || 0)) || 0;
     const radius = rawRadius * this.lengthUnitScale;
     if (radius <= GeometryTolerance.COINCIDENT_POINT) {
-      const msg = `Radio nulo o degenerado (${radius}) en IfcSweptDiskSolid #${rec.id}`;
+      const msg = `Zero or degenerate radius (${radius}) in IfcSweptDiskSolid #${rec.id}`;
       console.warn(`[IfcStepImporter] ${msg}`);
       this.importWarnings.push(msg);
       return null;
@@ -2597,12 +3666,12 @@ export class IfcStepImporter {
     }
     T0 = T0.scale(1 / t0Len);
 
-    // Up-vector canónico invariante
+    // Canonical invariant up-vector
     const up = Math.abs(T0.dot(Vec3.Y)) < 0.9 ? Vec3.Y : Vec3.X;
     const u = T0.cross(up).normalize();
     const v = T0.cross(u).normalize();
 
-    // Discretización del perfil exterior en 16 segmentos en el plano ortogonal a T0
+    // Discretization of outer profile into 16 segments in the plane orthogonal to T0
     const SEGMENTS = 16;
     const outerProfileVerts: Vec3[] = [];
     for (let i = 0; i < SEGMENTS; i++) {
@@ -2630,7 +3699,7 @@ export class IfcStepImporter {
 
     let finalMesh = outerMesh;
 
-    // Sustracción de cavidad interior si innerRadius está especificado (ISO 16739-1)
+    // Subtraction of inner cavity if innerRadius is specified (ISO 16739-1)
     if (innerRadiusParam !== null && innerRadiusParam !== undefined && innerRadiusParam !== '$') {
       const rawInnerRadius =
         typeof innerRadiusParam === 'number' ? innerRadiusParam : parseFloat(String(innerRadiusParam)) || 0;
@@ -2664,7 +3733,7 @@ export class IfcStepImporter {
               finalMesh = hollow;
             }
           } catch (err: any) {
-            console.warn(`[IfcStepImporter] Sustracción de innerRadius en IfcSweptDiskSolid #${rec.id} falló: ${err?.message || err}`);
+            console.warn(`[IfcStepImporter] Subtraction of innerRadius in IfcSweptDiskSolid #${rec.id} failed: ${err?.message || err}`);
           }
         }
       }
@@ -2682,8 +3751,8 @@ export class IfcStepImporter {
   }
 
   /**
-   * Reconstruye un PolyMesh desde IfcSurfaceCurveSweptAreaSolid o IfcFixedReferenceSweptAreaSolid.
-   * Barre cualquier perfil 2D (catálogo completo) a lo largo de una directriz 3D.
+   * Reconstructs a PolyMesh from IfcSurfaceCurveSweptAreaSolid or IfcFixedReferenceSweptAreaSolid.
+   * Sweeps any 2D profile (complete catalog) along a 3D directrix.
    */
   private rebuildFromSurfaceCurveSweptAreaSolid(
     rec: StepRecord,
@@ -2749,7 +3818,7 @@ export class IfcStepImporter {
       );
       if (!swept || swept.faces.size === 0) continue;
 
-      // Si el perfil contiene cavidades interiores (inners), sustraerlas
+      // If the profile contains inner cavities (inners), subtract them
       if (loop.inners && loop.inners.length > 0) {
         for (const inner of loop.inners) {
           if (inner.length < 3) continue;
@@ -2782,7 +3851,7 @@ export class IfcStepImporter {
                 }
               }
             } catch (err: any) {
-              console.warn(`[IfcStepImporter] Falló hueco interior de barrido en #${rec.id}: ${err?.message || err}`);
+              console.warn(`[IfcStepImporter] Inner sweep void failed in #${rec.id}: ${err?.message || err}`);
             }
           }
         }
@@ -2816,8 +3885,8 @@ export class IfcStepImporter {
   }
 
   /**
-   * Reconstruye un PolyMesh desde un IfcRevolvedAreaSolid (ISO 16739-1 / IFC 4.3).
-   * Rota cualquier perfil 2D alrededor de un eje lineal IFCAXIS1PLACEMENT.
+   * Reconstructs a PolyMesh from an IfcRevolvedAreaSolid (ISO 16739-1 / IFC 4.3).
+   * Revolves any 2D profile around a linear IFCAXIS1PLACEMENT axis.
    */
   private rebuildFromRevolvedAreaSolid(
     rec: StepRecord,
@@ -2839,13 +3908,13 @@ export class IfcStepImporter {
     const rawAngle = typeof angleParam === 'number' ? angleParam : parseFloat(String(angleParam || 0)) || 0;
     const angleRadians = this.toAngleRadians(rawAngle);
     if (Math.abs(angleRadians) < GeometryTolerance.MATH_EPSILON) {
-      const msg = `Ángulo nulo o degenerado en IfcRevolvedAreaSolid #${rec.id}`;
+      const msg = `Zero or degenerate angle in IfcRevolvedAreaSolid #${rec.id}`;
       console.warn(`[IfcStepImporter] ${msg}`);
       this.importWarnings.push(msg);
       return null;
     }
 
-    // Resolver IFCAXIS1PLACEMENT: Location (param[0]), Axis (param[1])
+    // Resolve IFCAXIS1PLACEMENT: Location (param[0]), Axis (param[1])
     const axisRec = this.records.get(axisParam.ref);
     if (!axisRec) return null;
 
@@ -2862,7 +3931,7 @@ export class IfcStepImporter {
     }
 
     const dirParam = axisRec.params[1];
-    let axisDirection = new Vec3(0, 0, 1); // Por defecto Z en ISO 10303-42 / IFC 4.3
+    let axisDirection = new Vec3(0, 0, 1); // Default Z in ISO 10303-42 / IFC 4.3
     if (dirParam && typeof dirParam === 'object' && 'ref' in dirParam) {
       const dirRec = this.records.get(dirParam.ref);
       if (dirRec && Array.isArray(dirRec.params[0])) {
@@ -2874,7 +3943,7 @@ export class IfcStepImporter {
       }
     }
 
-    // Ruta Única (Norma 16): extracción de perfiles 2D
+    // Single Path (Rule 16): 2D profile extraction
     const profileLoops = this.extractProfileLoops2D((sweptAreaParam as any).ref);
     if (profileLoops.length === 0) return null;
 
@@ -2891,7 +3960,7 @@ export class IfcStepImporter {
     for (const loop of profileLoops) {
       if (loop.outer.length < 3) continue;
 
-      // El perfil 2D en IFC se define en el plano local XY: (x, y, 0)
+      // The 2D profile in IFC is defined in the local XY plane: (x, y, 0)
       const profileVertices = loop.outer.map((p) => new Vec3(p.x, p.y, 0));
 
       const revolved = RevolveKernel.revolveProfile({
@@ -2904,7 +3973,7 @@ export class IfcStepImporter {
 
       if (!revolved || revolved.faces.size === 0) continue;
 
-      // Si el perfil tiene huecos (e.g. IFCCIRCLEHOLLOWPROFILEDEF o WITHVOIDS), sustraer cavidad
+      // If the profile has holes (e.g. IFCCIRCLEHOLLOWPROFILEDEF or WITHVOIDS), subtract cavity
       if (loop.inners && loop.inners.length > 0) {
         for (const inner of loop.inners) {
           if (inner.length < 3) continue;
@@ -2931,7 +4000,7 @@ export class IfcStepImporter {
                 }
               }
             } catch (err: any) {
-              console.warn(`[IfcStepImporter] Falló hueco interior de revolución en #${rec.id}: ${err?.message || err}`);
+              console.warn(`[IfcStepImporter] Inner revolution void failed in #${rec.id}: ${err?.message || err}`);
             }
           }
         }
@@ -2965,17 +4034,17 @@ export class IfcStepImporter {
   }
 
   /**
-   * Extrae contornos 2D ({ outer: { x, y }[], inners: { x, y }[][] }) desde cualquier definición IfcProfileDef.
-   * Ruta Única (Norma 16): Gobierna extrusiones, barridos y revoluciones sin duplicación.
-   * Soporta perfiles estándar, huecos, paramétricos (L, T, U, C, Z, Trapezium, Ellipse, AsymmetricI),
-   * derivados (IfcDerivedProfileDef con operadores y reflexiones) y compuestos (IfcCompositeProfileDef).
+   * Extracts 2D contours ({ outer: { x, y }[], inners: { x, y }[][] }) from any IfcProfileDef definition.
+   * Single Path (Rule 16): Governs extrusions, sweeps, and revolutions without duplication.
+   * Supports standard, hollow, parameterized (L, T, U, C, Z, Trapezium, Ellipse, AsymmetricI),
+   * derived (IfcDerivedProfileDef with operators and reflections), and composite profiles (IfcCompositeProfileDef).
    */
   private extractProfileLoops2D(
     profileRef: number,
     visited = new Set<number>()
   ): Array<{ outer: { x: number; y: number }[]; inners: { x: number; y: number }[][] }> {
     if (visited.has(profileRef) || visited.size >= 32) {
-      console.warn(`[IfcStepImporter] Ciclo detectado en IfcProfileDef #${profileRef}`);
+      console.warn(`[IfcStepImporter] Cycle detected in IfcProfileDef #${profileRef}`);
       return [];
     }
     visited.add(profileRef);
@@ -2983,7 +4052,7 @@ export class IfcStepImporter {
     const sweptAreaRec = this.records.get(profileRef);
     if (!sweptAreaRec) return [];
 
-    // Manejo de IfcCompositeProfileDef (concatena múltiples sub-perfiles)
+    // Handling of IfcCompositeProfileDef (concatenates multiple sub-profiles)
     if (sweptAreaRec.type === 'IFCCOMPOSITEPROFILEDEF') {
       const profilesParam = sweptAreaRec.params[2];
       const pList = Array.isArray(profilesParam)
@@ -3001,7 +4070,7 @@ export class IfcStepImporter {
       return results;
     }
 
-    // Manejo de IfcDerivedProfileDef (transformación 2D sobre perfil base)
+    // Handling of IfcDerivedProfileDef (2D transformation over base profile)
     if (sweptAreaRec.type === 'IFCDERIVEDPROFILEDEF') {
       const parentRef = sweptAreaRec.params[2];
       const opRef = sweptAreaRec.params[3];
@@ -3018,7 +4087,7 @@ export class IfcStepImporter {
         if (opRec) {
           mat2D = this.resolveCartesianTransformationOperator(opRec);
           const e = mat2D.elements;
-          // Determinante 2D en plano XY: e[0]*e[5] - e[1]*e[4]
+          // 2D determinant in XY plane: e[0]*e[5] - e[1]*e[4]
           const det2D = e[0] * e[5] - e[1] * e[4];
           if (det2D < 0) {
             isReflected = true;
@@ -3051,7 +4120,7 @@ export class IfcStepImporter {
     const inner2DLoops: { x: number; y: number }[][] = [];
     let isParameterizedProfile = false;
 
-    // Perfiles paramétricos y estándar
+    // Parameterized and standard profiles
     if (sweptAreaRec.type === 'IFCRECTANGLEPROFILEDEF') {
       isParameterizedProfile = true;
       const rawX = typeof sweptAreaRec.params[3] === 'number' ? sweptAreaRec.params[3] : parseFloat(String(sweptAreaRec.params[3])) || 1.0;
@@ -3230,7 +4299,7 @@ export class IfcStepImporter {
       const b2 = b / 2;
 
       if (g <= t + GeometryTolerance.COINCIDENT_POINT) {
-        // Degrada limpiamente a canal U
+        // Cleanly degrades to U-channel
         profile2DPoints = [
           { x: -b2, y: -h2 },
           { x: b2, y: -h2 },
@@ -3242,7 +4311,7 @@ export class IfcStepImporter {
           { x: -b2, y: h2 },
         ];
       } else {
-        // Perfil costanera C de 12 vértices con pestañas rigidizadoras
+        // 12-vertex C-purlin profile with stiffener lips
         profile2DPoints = [
           { x: -b2, y: -h2 },
           { x: b2, y: -h2 },
@@ -3378,14 +4447,14 @@ export class IfcStepImporter {
         }
       }
     } else {
-      const msg = `Tipo de IfcProfileDef no soportado: #${sweptAreaRec.id} (${sweptAreaRec.type})`;
+      const msg = `Unsupported IfcProfileDef type: #${sweptAreaRec.id} (${sweptAreaRec.type})`;
       console.warn(`[IfcStepImporter] ${msg}`);
       this.importWarnings.push(msg);
       return [];
     }
 
     if (isParameterizedProfile) {
-      // Aplicar Position 2D (IFCAXIS2PLACEMENT2D) si existe
+      // Apply Position 2D (IFCAXIS2PLACEMENT2D) if present
       const pos2DParam = sweptAreaRec.params[2];
       if (pos2DParam && typeof pos2DParam === 'object' && 'ref' in pos2DParam) {
         const pos2DRec = this.records.get(pos2DParam.ref);
@@ -3422,7 +4491,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Resuelve la matriz 4x4 de un IfcCartesianTransformationOperator3D o 2D con fallbacks estrictos.
+   * Resolves the 4x4 matrix of an IfcCartesianTransformationOperator3D or 2D with strict fallbacks.
    */
   private resolveCartesianTransformationOperator(opRec: StepRecord): THREE.Matrix4 {
     const mat = new THREE.Matrix4();
@@ -3512,8 +4581,8 @@ export class IfcStepImporter {
   }
 
   /**
-   * Reconstruye la lista exhaustiva de sub-mallas desde un IfcMappedItem (instancia de componente)
-   * aplicando la transformación afín completa M_local = M_operator * M_mapOrigin^-1 sobre todos sus ítems.
+   * Reconstructs the exhaustive list of sub-meshes from an IfcMappedItem (component instance)
+   * applying the complete affine transformation M_local = M_operator * M_mapOrigin^-1 over all its items.
    */
   private rebuildSubMeshesFromMappedItem(
     rec: StepRecord,
@@ -3539,7 +4608,7 @@ export class IfcStepImporter {
     const geomItems = shapeRepRec.params[3];
     if (!Array.isArray(geomItems) || geomItems.length === 0) return result;
 
-    // 1. Matriz de MappingOrigin
+    // 1. MappingOrigin matrix
     let mMapOrigin = new THREE.Matrix4();
     const mapOriginParam = mapRec.params[0];
     if (typeof mapOriginParam === 'string' && mapOriginParam.startsWith('#')) {
@@ -3556,7 +4625,7 @@ export class IfcStepImporter {
     }
     const mMapOriginInv = new THREE.Matrix4().copy(mMapOrigin).invert();
 
-    // 2. Matriz de Operator
+    // 2. Operator matrix
     let mOperator = new THREE.Matrix4();
     if (targetRef && typeof targetRef === 'object' && 'ref' in targetRef) {
       const opRec = this.records.get(targetRef.ref);
@@ -3565,7 +4634,7 @@ export class IfcStepImporter {
       }
     }
 
-    // 3. Matriz combinada local: M_local = M_operator * M_mapOrigin^-1
+    // 3. Combined local matrix: M_local = M_operator * M_mapOrigin^-1
     const mLocal = new THREE.Matrix4().multiplyMatrices(mOperator, mMapOriginInv);
 
     const mappedItemStyleId = itemToStyleMap?.get(rec.id);
@@ -3575,7 +4644,7 @@ export class IfcStepImporter {
       if (!item || typeof item !== 'object' || !('ref' in item)) continue;
       const subMesh = this.rebuildMeshFromItem(item.ref, baseEntityId, itemToStyleMap, faceToStyleMap, visited);
       if (subMesh) {
-        // Aplicar transformación local mLocal a los vértices y bucles de huecos
+        // Apply local transformation mLocal to vertices and hole loops
         for (const v of subMesh.vertices.values()) {
           const p = new THREE.Vector3(v.position.x, v.position.y, v.position.z).applyMatrix4(mLocal);
           v.position = new Vec3(p.x, p.y, p.z);
@@ -3606,7 +4675,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Reconstruye un PolyMesh desde un IfcMappedItem (compatibilidad con llamadas individuales).
+   * Reconstructs a PolyMesh from an IfcMappedItem (compatibility with individual calls).
    */
   private rebuildFromMappedItem(
     rec: StepRecord,
@@ -3621,7 +4690,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Reconstruye un PolyMesh desde un IfcPolygonalFaceSet.
+   * Reconstructs a PolyMesh from an IfcPolygonalFaceSet.
    */
   private rebuildFromPolygonalFaceSet(rec: StepRecord, entityId: string): PolyMesh | null {
     // Param 0: Point list ref (IFCCARTESIANPOINTLIST3D)
@@ -3636,11 +4705,11 @@ export class IfcStepImporter {
     const points = this.extractPointList(pointListRec);
     if (points.length === 0) return null;
 
-    // Param 2: Lista de referencias a caras (IFCINDEXEDPOLYGONALFACE / WITHVOIDS)
+    // Param 2: List of face references (IFCINDEXEDPOLYGONALFACE / WITHVOIDS)
     const faceRefs = rec.params[IFC_GEOM_ATTRS.POLYGONAL_FACES];
     if (!Array.isArray(faceRefs)) return null;
 
-    // Param 3: PnIndex (opcional, 1-based, ISO 16739-1)
+    // Param 3: PnIndex (optional, 1-based, ISO 16739-1)
     const rawParam3 = rec.params[IFC_GEOM_ATTRS.POLYGONAL_PN_INDEX];
     const pnIndexRaw: StepParam[] | null = Array.isArray(rawParam3) ? rawParam3 : null;
 
@@ -3712,11 +4781,11 @@ export class IfcStepImporter {
   }
 
   /**
-   * Reconstruye un PolyMesh desde un IfcTriangulatedFaceSet (ISO 16739-1 / IFC 4.3).
-   * Cumple con:
-   * - Norma 11: Filtrado determinista de triángulos degenerados y colapsados.
-   * - Norma 18 y 21: Resolución formal del atributo CoordIndex (params[3]) distinguiéndolo de PnIndex.
-   * - Norma 22: Preservación de orientación antihoraria (CCW) hacia el exterior.
+   * Reconstructs a PolyMesh from an IfcTriangulatedFaceSet (ISO 16739-1 / IFC 4.3).
+   * Complies with:
+   * - Rule 11: Deterministic filtering of degenerate and collapsed triangles.
+   * - Rule 18 and 21: Formal resolution of CoordIndex attribute (params[3]) distinguishing it from PnIndex.
+   * - Rule 22: Preservation of counter-clockwise (CCW) outward orientation.
    */
   private rebuildFromTriangulatedFaceSet(rec: StepRecord, entityId: string): PolyMesh | null {
     const pointListRef = rec.params[0];
@@ -3730,12 +4799,12 @@ export class IfcStepImporter {
     const points = this.extractPointList(pointListRec);
     if (points.length === 0) return null;
 
-    // En IfcTriangulatedFaceSet canónico (ISO 16739-1), los atributos son:
+    // In canonical IfcTriangulatedFaceSet (ISO 16739-1), attributes are:
     // 0: Coordinates (IfcCartesianPointList3D)
-    // 1: Normals (opcional)
-    // 2: Closed (opcional, boolean)
+    // 1: Normals (optional)
+    // 2: Closed (optional, boolean)
     // 3: CoordIndex (LIST [1:?] OF LIST [3:3] OF IfcPositiveInteger)
-    // 4: PnIndex (opcional, LIST [1:?] OF IfcPositiveInteger)
+    // 4: PnIndex (optional, LIST [1:?] OF IfcPositiveInteger)
     let coordIndex: any = null;
     let pnIndexRaw: any = null;
 
@@ -3780,7 +4849,7 @@ export class IfcStepImporter {
     };
 
     const polyMesh = new PolyMesh(entityId);
-    const seenTriangles = new Set<string>();
+    const seenTriangles = new Set<bigint>();
 
     const maxIndexLimit = isPointPnIndex ? pnIndexRaw.length : points.length;
 
@@ -3799,11 +4868,18 @@ export class IfcStepImporter {
         continue;
       }
 
-      // Descartar si hay colapso de índices
+      // Discard if index collapsed
       if (idx0 === idx1 || idx1 === idx2 || idx2 === idx0) continue;
 
-      // Filtrar triángulos duplicados idénticos en el mismo IfcTriangulatedFaceSet (Norma 11)
-      const triSig = [idx0, idx1, idx2].sort((a, b) => a - b).join(':');
+      // Filter duplicate identical triangles in the same IfcTriangulatedFaceSet (Rule 11)
+      let a = idx0;
+      let b = idx1;
+      let c = idx2;
+      if (a > b) { const t = a; a = b; b = t; }
+      if (b > c) { const t = b; b = c; c = t; }
+      if (a > b) { const t = a; a = b; b = t; }
+
+      const triSig = (BigInt(a) << 64n) | (BigInt(b) << 32n) | BigInt(c);
       if (seenTriangles.has(triSig)) {
         continue;
       }
@@ -3815,7 +4891,7 @@ export class IfcStepImporter {
 
       if (!p0 || !p1 || !p2) continue;
 
-      // Filtrar triángulos colapsados, colineales o de área nula (Norma 11)
+      // Filter collapsed, collinear, or zero-area triangles (Rule 11)
       const v01 = p1.sub(p0);
       const v02 = p2.sub(p0);
       const cross = v01.cross(v02);
@@ -3828,7 +4904,7 @@ export class IfcStepImporter {
     }
 
     if (polyMesh.faces.size > 0) {
-      // Coalescencia coplanar para restaurar polígonos n-gonos arquitectónicos (Normas 6, 7, 11, 13, 16, 17, 21, 24)
+      // Coplanar coalescence to restore architectural n-gon polygons (Rules 6, 7, 11, 13, 16, 17, 21, 24)
       polyMesh.coalesceCoplanarFaces();
       polyMesh.resetVersion();
       return polyMesh;
@@ -3837,7 +4913,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Extrae lista de puntos Vec3 de un IFCCARTESIANPOINTLIST3D.
+   * Extracts list of Vec3 points from an IFCCARTESIANPOINTLIST3D.
    */
   private extractPointList(rec: StepRecord): Vec3[] {
     const coords = rec.params[0];
@@ -3856,9 +4932,9 @@ export class IfcStepImporter {
   }
 
   /**
-   * Agrega las caras de un IfcConnectedFaceSet / IfcClosedShell / IfcOpenShell al PolyMesh acumulador.
-   * Filtra bucles degenerados y deduplica puntos mediante GeometryTolerance.COINCIDENT_POINT (Norma 6, Norma 11).
-   * Asigna estilos y colores a nivel de cara y elemento según IFCSTYLEDITEM.
+   * Appends faces from an IfcConnectedFaceSet / IfcClosedShell / IfcOpenShell to the accumulator PolyMesh.
+   * Filters degenerate loops and deduplicates points using GeometryTolerance.COINCIDENT_POINT (Rule 6, Rule 11).
+   * Assigns styles and colors at face and element level according to IFCSTYLEDITEM.
    */
   private appendFacesFromConnectedFaceSet(
     shellRec: StepRecord,
@@ -3867,7 +4943,7 @@ export class IfcStepImporter {
     faceToStyleMap?: Map<number, string>,
     fallbackStyleId?: string
   ): number {
-    // shellRec.params[0] es la lista de referencias a IfcFace (CfsFaces - ISO 10303-42 / ISO 16739-1)
+    // shellRec.params[0] is the list of references to IfcFace (CfsFaces - ISO 10303-42 / ISO 16739-1)
     const faceRefsParam = shellRec.params[0];
     const faceRefs = Array.isArray(faceRefsParam)
       ? faceRefsParam
@@ -3876,7 +4952,7 @@ export class IfcStepImporter {
 
     let facesAdded = 0;
 
-    // Función auxiliar para deduplicar vértices colineales/coincidentes y cerrar bucles de polígonos
+    // Helper function to deduplicate collinear/coincident vertices and close polygon loops
     const cleanLoopPoints = (pts: Vec3[]): Vec3[] => {
       if (pts.length === 0) return [];
       const cleaned: Vec3[] = [pts[0]];
@@ -3885,8 +4961,8 @@ export class IfcStepImporter {
           cleaned.push(pts[i]);
         }
       }
-      // En STEP / ISO 10303-42, muchos exportadores repiten el primer vértice al final para cerrar el PolyLoop.
-      // PolyMesh.addFace espera bucles abiertos donde el último vértice se conecta implícitamente al primero.
+      // In STEP / ISO 10303-42, many exporters repeat the first vertex at the end to close the PolyLoop.
+      // PolyMesh.addFace expects open loops where the last vertex implicitly connects to the first.
       if (
         cleaned.length > 1 &&
         cleaned[cleaned.length - 1].distanceTo(cleaned[0]) < GeometryTolerance.COINCIDENT_POINT
@@ -3901,7 +4977,7 @@ export class IfcStepImporter {
       const faceRec = this.records.get(fRef.ref);
       if (!faceRec) continue;
 
-      // faceRec.params[0] es la lista de referencias a IfcFaceBound / IfcFaceOuterBound (Bounds)
+      // faceRec.params[0] is the list of references to IfcFaceBound / IfcFaceOuterBound (Bounds)
       const boundRefsParam = faceRec.params[0];
       const boundRefs = Array.isArray(boundRefsParam)
         ? boundRefsParam
@@ -3910,7 +4986,7 @@ export class IfcStepImporter {
       let outerLoop: Vec3[] | null = null;
       const innerHoles: Vec3[][] = [];
 
-      // Detectar si hay algún IFCFACEOUTERBOUND explícito en los límites de la cara
+      // Detect if there is any explicit IFCFACEOUTERBOUND in face boundaries
       const hasOuterBound = boundRefs.some((r: any) => {
         if (!r || typeof r !== 'object' || !('ref' in r)) return false;
         const b = this.records.get(r.ref);
@@ -3922,7 +4998,7 @@ export class IfcStepImporter {
         const boundRec = this.records.get(bRef.ref);
         if (!boundRec) continue;
 
-        // boundRec.params[0]: IfcLoop (típicamente IFCPOLYLOOP)
+        // boundRec.params[0]: IfcLoop (typically IFCPOLYLOOP)
         // boundRec.params[1]: Orientation (BOOLEAN)
         const loopRef = boundRec.params[0];
         if (!loopRef || typeof loopRef !== 'object' || !('ref' in loopRef)) continue;
@@ -3953,7 +5029,7 @@ export class IfcStepImporter {
         const loopPts = cleanLoopPoints(rawPts);
         if (loopPts.length < 3) continue;
 
-        // Verificar orientación geométrica del loop
+        // Verify geometric loop orientation
         const orientationParam = boundRec.params[1];
         let orientation = true;
         if (orientationParam === false) {
@@ -3976,7 +5052,7 @@ export class IfcStepImporter {
           loopPts.reverse();
         }
 
-        // Clasificación de contorno exterior vs huecos interiores
+        // Outer boundary vs inner voids classification
         const isOuter = boundRec.type === 'IFCFACEOUTERBOUND';
         if (isOuter && !outerLoop) {
           outerLoop = loopPts;
@@ -3995,7 +5071,7 @@ export class IfcStepImporter {
             innerHoles.length > 0 ? innerHoles : undefined
           );
 
-          // Asignación de material de presentación a la cara
+          // Assign presentation material to the face
           const matId =
             (fRef && faceToStyleMap?.get(fRef.ref)) ||
             (fRef && itemToStyleMap?.get(fRef.ref)) ||
@@ -4005,8 +5081,8 @@ export class IfcStepImporter {
           }
           facesAdded++;
         } catch (err: any) {
-          // Norma 13: Cero supresión silenciosa de errores
-          console.debug(`[IfcStepImporter] Cara ignorada por degeneración topológica #${faceRec.id}: ${err?.message || err}`);
+          // Rule 13: Zero silent suppression of errors
+          console.debug(`[IfcStepImporter] Face skipped due to topological degeneracy #${faceRec.id}: ${err?.message || err}`);
         }
       }
     }
@@ -4015,9 +5091,9 @@ export class IfcStepImporter {
   }
 
   /**
-   * Reconstruye un PolyMesh desde un IfcFacetedBrep, IfcClosedShell, IfcOpenShell o IfcConnectedFaceSet.
-   * Filtra bucles degenerados y deduplica puntos mediante GeometryTolerance.COINCIDENT_POINT (Norma 6).
-   * Asigna estilos y colores a nivel de cara y elemento según IFCSTYLEDITEM.
+   * Reconstructs a PolyMesh from an IfcFacetedBrep, IfcClosedShell, IfcOpenShell, or IfcConnectedFaceSet.
+   * Filters degenerate loops and deduplicates points using GeometryTolerance.COINCIDENT_POINT (Rule 6).
+   * Assigns styles and colors at face and element level according to IFCSTYLEDITEM.
    */
   private rebuildFromFacetedBrep(
     rec: StepRecord,
@@ -4080,9 +5156,9 @@ export class IfcStepImporter {
   }
 
   /**
-   * Reconstruye un PolyMesh desde un IfcFaceBasedSurfaceModel (ISO 16739-1 / IFC 4.3).
-   * Extrae la colección de IfcConnectedFaceSet (rec.params[0]) y acumula todas sus caras.
-   * Cumple con Norma 6, Norma 7, Norma 11, Norma 15 y Norma 21.
+   * Reconstructs a PolyMesh from an IfcFaceBasedSurfaceModel (ISO 16739-1 / IFC 4.3).
+   * Extracts the collection of IfcConnectedFaceSet (rec.params[0]) and accumulates all its faces.
+   * Complies with Rule 6, Rule 7, Rule 11, Rule 15, and Rule 21.
    */
   private rebuildFromFaceBasedSurfaceModel(
     rec: StepRecord,
@@ -4121,11 +5197,16 @@ export class IfcStepImporter {
   }
 
   /**
-   * Resuelve una matriz afín 4x4 a partir de un IFCAXIS2PLACEMENT3D.
-   * Aplica por defecto las direcciones estándar buildingSMART (ISO 10303-42):
+   * Resolves a 4x4 affine matrix from an IFCAXIS2PLACEMENT3D.
+   * Applies buildingSMART standard directions by default (ISO 10303-42):
    * Axis = (0, 0, 1), RefDirection = (1, 0, 0).
    */
   private resolveAxis2Placement3D(rec: StepRecord): THREE.Matrix4 {
+    const cached = this.axis2PlacementCache.get(rec.id);
+    if (cached) {
+      return cached.clone();
+    }
+
     const loc = new THREE.Vector3(0, 0, 0);
     const dirZ = new THREE.Vector3(0, 0, 1);
     const dirX = new THREE.Vector3(1, 0, 0);
@@ -4185,11 +5266,12 @@ export class IfcStepImporter {
     const m = new THREE.Matrix4();
     m.makeBasis(dirX, dirY, dirZ);
     m.setPosition(loc);
+    this.axis2PlacementCache.set(rec.id, m.clone());
     return m;
   }
 
   /**
-   * Resuelve la transformación 2D a partir de un IFCAXIS2PLACEMENT2D.
+   * Resolves the 2D transformation from an IFCAXIS2PLACEMENT2D.
    */
   private resolveAxis2Placement2D(rec: StepRecord): { origin: { x: number; y: number }; dirX: { x: number; y: number }; dirY: { x: number; y: number } } {
     let ox = 0, oy = 0;
@@ -4230,8 +5312,8 @@ export class IfcStepImporter {
   }
 
   /**
-   * Extrae puntos 2D discretizados en el plano local (u, v) a partir de cualquier entidad de curva STEP.
-   * Soporta IFCPOLYLINE, IFCCOMPOSITECURVE, IFCTRIMMEDCURVE, IFCCIRCLE (Normas 3, 6, 7, 13, 22).
+   * Extracts discretized 2D points in the local (u, v) plane from any STEP curve entity.
+   * Supports IFCPOLYLINE, IFCCOMPOSITECURVE, IFCTRIMMEDCURVE, IFCCIRCLE (Rules 3, 6, 7, 13, 22).
    */
   private extract2DCurvePoints(curveRef: number, visited = new Set<number>()): { x: number; y: number }[] {
     if (visited.has(curveRef) || visited.size >= 32) {
@@ -4266,15 +5348,15 @@ export class IfcStepImporter {
       return this.extractIndexedPolyCurve2DPoints(curveRec);
     }
 
-    // Registro de advertencia conforme a Norma 13 (Cero Supresión Silenciosa)
-    const msg = `Tipo de curva 2D no soportado o no implementado en STEP #${curveRec.id} (${curveRec.type})`;
+    // Warning logging in compliance with Rule 13 (Zero Silent Suppression)
+    const msg = `Unsupported or unimplemented 2D curve type in STEP #${curveRec.id} (${curveRec.type})`;
     console.warn(`[IfcStepImporter] ${msg}`);
     this.importWarnings.push(msg);
     return [];
   }
 
   /**
-   * Extrae puntos 2D de un IFCINDEXEDPOLYCURVE (IFC4 / IFC4.3) resolviendo su IFCCARTESIANPOINTLIST2D / 3D.
+   * Extracts 2D points from an IFCINDEXEDPOLYCURVE (IFC4 / IFC4.3) resolving its IFCCARTESIANPOINTLIST2D / 3D.
    */
   private extractIndexedPolyCurve2DPoints(curveRec: StepRecord): { x: number; y: number }[] {
     const pointsParam = curveRec.params[0];
@@ -4304,7 +5386,7 @@ export class IfcStepImporter {
     const segmentsParam = curveRec.params[1];
     let points: { x: number; y: number }[] = [];
 
-    // Si Segments es omitido ($ o null o []), los puntos se conectan en orden secuencial
+    // If Segments is omitted ($ or null or []), points are connected in sequential order
     if (!segmentsParam || !Array.isArray(segmentsParam) || segmentsParam.length === 0) {
       points = allPoints.slice();
     } else {
@@ -4340,7 +5422,7 @@ export class IfcStepImporter {
           }
         } else {
           for (const idx of indices) {
-            const p = allPoints[idx - 1]; // 1-based en el estándar IFC
+            const p = allPoints[idx - 1]; // 1-based in the IFC standard
             if (p) {
               if (points.length > 0) {
                 const last = points[points.length - 1];
@@ -4386,7 +5468,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Discretiza un arco circular 2D definido por 3 puntos (P1: inicio, P2: paso intermedio, P3: fin).
+   * Discretizes a 2D circular arc defined by 3 points (P1: start, P2: intermediate point, P3: end).
    */
   private discretize3PointArc2D(
     p1: { x: number; y: number },
@@ -4434,7 +5516,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Extrae puntos 2D de un IFCPOLYLINE escalados por lengthUnitScale.
+   * Extracts 2D points from an IFCPOLYLINE scaled by lengthUnitScale.
    */
   private extractPolyline2DPoints(curveRec: StepRecord): { x: number; y: number }[] {
     const points: { x: number; y: number }[] = [];
@@ -4466,7 +5548,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Extrae y ensambla los segmentos de un IFCCOMPOSITECURVE respetando SameSense y fusionando extremos.
+   * Extracts and assembles segments from an IFCCOMPOSITECURVE respecting SameSense and merging endpoints.
    */
   private extractCompositeCurvePoints(compositeRec: StepRecord, visited: Set<number>): { x: number; y: number }[] {
     const segmentsParam = compositeRec.params[0];
@@ -4491,7 +5573,7 @@ export class IfcStepImporter {
         segPoints.reverse();
       }
 
-      // Concatenación sin operador spread (Norma 7) y eliminación de vértices duplicados en extremos (Norma 6)
+      // Concatenation without spread operator (Rule 7) and duplicate vertex removal at endpoints (Rule 6)
       for (const p of segPoints) {
         if (points.length > 0) {
           const last = points[points.length - 1];
@@ -4503,7 +5585,7 @@ export class IfcStepImporter {
       }
     }
 
-    // Si el lazo es cerrado (último punto coincide con el primero), descartar el punto duplicado de cierre
+    // If the loop is closed (last point coincides with the first), discard closing duplicate point
     if (points.length >= 4) {
       const first = points[0];
       const last = points[points.length - 1];
@@ -4516,7 +5598,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Extrae puntos 2D discretizados de un IFCTRIMMEDCURVE (arcos de círculo, líneas, elipses o polilíneas recortadas).
+   * Extracts discretized 2D points from an IFCTRIMMEDCURVE (circular arcs, lines, ellipses, or trimmed polylines).
    */
   private extractTrimmedCurvePoints(trimmedRec: StepRecord, visited: Set<number>): { x: number; y: number }[] {
     const basisParam = trimmedRec.params[IFC_GEOM_ATTRS.TRIMMED_BASIS_CURVE];
@@ -4534,7 +5616,7 @@ export class IfcStepImporter {
     const trim2Val = this.extractAngleParameter(trim2Param);
 
     if (basisRec.type === 'IFCLINE') {
-      // 1. Intentar resolver extremos directos como puntos cartesianos
+      // 1. Attempt to resolve direct endpoints as cartesian points
       const p1 = this.extractPoint2D(trim1Param);
       const p2 = this.extractPoint2D(trim2Param);
 
@@ -4542,7 +5624,7 @@ export class IfcStepImporter {
         return senseAgreement ? [p1, p2] : [p2, p1];
       }
 
-      // 2. Si no vienen puntos cartesianos directos, evaluar analíticamente P(u) = P0 + u * V
+      // 2. If no direct cartesian points are provided, analytically evaluate P(u) = P0 + u * V
       const pntParam = basisRec.params[IFC_GEOM_ATTRS.LINE_PNT];
       const dirParam = basisRec.params[IFC_GEOM_ATTRS.LINE_DIR];
       let p0 = { x: 0, y: 0 };
@@ -4698,7 +5780,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Discretiza un IFCCIRCLE en puntos 2D en base a su IFCAXIS2PLACEMENT2D y radio.
+   * Discretizes an IFCCIRCLE into 2D points based on its IFCAXIS2PLACEMENT2D and radius.
    */
   private extractCircleCurvePoints(
     circleRec: StepRecord,
@@ -4763,7 +5845,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Discretiza un IFCELLIPSE en puntos 2D en base a su IFCAXIS2PLACEMENT2D y semiejes rx, ry.
+   * Discretizes an IFCELLIPSE into 2D points based on its IFCAXIS2PLACEMENT2D and semi-axes rx, ry.
    */
   private extractEllipseCurvePoints(
     ellipseRec: StepRecord,
@@ -4884,9 +5966,9 @@ export class IfcStepImporter {
   }
 
   /**
-   * Extrae puntos 3D formalmente tipados (Vec3) y estado cerrado a partir de cualquier entidad de curva 3D STEP.
-   * Cumple con Norma 6, Norma 7, Norma 11, Norma 13, Norma 18 y Norma 22.
-   * Soporta IFCPOLYLINE, IFCINDEXEDPOLYCURVE, IFCCOMPOSITECURVE, IFCTRIMMEDCURVE, IFCCIRCLE e IFCELLIPSE.
+   * Extracts formally typed 3D points (Vec3) and closed state from any STEP 3D curve entity.
+   * Complies with Rule 6, Rule 7, Rule 11, Rule 13, Rule 18, and Rule 22.
+   * Supports IFCPOLYLINE, IFCINDEXEDPOLYCURVE, IFCCOMPOSITECURVE, IFCTRIMMEDCURVE, IFCCIRCLE, and IFCELLIPSE.
    */
   private extract3DCurvePoints(
     curveRef: number,
@@ -4924,14 +6006,14 @@ export class IfcStepImporter {
       return this.extractEllipseCurve3DPoints(curveRec);
     }
 
-    const msg = `Tipo de curva 3D no soportado o no implementado en STEP #${curveRec.id} (${curveRec.type})`;
+    const msg = `Unsupported or unimplemented 3D curve type in STEP #${curveRec.id} (${curveRec.type})`;
     console.warn(`[IfcStepImporter] ${msg}`);
     this.importWarnings.push(msg);
     return { points: [], isClosed: false };
   }
 
   /**
-   * Extrae puntos 3D de un IFCPOLYLINE escalados por lengthUnitScale.
+   * Extracts 3D points from an IFCPOLYLINE scaled by lengthUnitScale.
    */
   private extractPolyline3DPoints(curveRec: StepRecord): { points: Vec3[]; isClosed: boolean } {
     const points: Vec3[] = [];
@@ -4978,7 +6060,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Extrae puntos 3D de un IFCINDEXEDPOLYCURVE (IFC 4.3).
+   * Extracts 3D points from an IFCINDEXEDPOLYCURVE (IFC 4.3).
    */
   private extractIndexedPolyCurve3DPoints(curveRec: StepRecord): { points: Vec3[]; isClosed: boolean } {
     const pointsParam = curveRec.params[0];
@@ -5078,7 +6160,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Extrae y concatena segmentos 3D de un IFCCOMPOSITECURVE.
+   * Extracts and concatenates 3D segments from an IFCCOMPOSITECURVE.
    */
   private extractCompositeCurve3DPoints(
     compositeRec: StepRecord,
@@ -5134,7 +6216,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Extrae puntos 3D de un IFCTRIMMEDCURVE (línea, círculo, elipse o curva recortada en 3D).
+   * Extracts 3D points from an IFCTRIMMEDCURVE (line, circle, ellipse, or trimmed 3D curve).
    */
   private extractTrimmedCurve3DPoints(
     trimmedRec: StepRecord,
@@ -5326,7 +6408,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Discretiza un IFCCIRCLE en puntos 3D según su IFCAXIS2PLACEMENT3D / 2D y radio.
+   * Discretizes an IFCCIRCLE into 3D points based on its IFCAXIS2PLACEMENT3D / 2D and radius.
    */
   private extractCircleCurve3DPoints(
     circleRec: StepRecord,
@@ -5411,7 +6493,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Discretiza un IFCELLIPSE en puntos 3D según su IFCAXIS2PLACEMENT3D / 2D y semiejes rx, ry.
+   * Discretizes an IFCELLIPSE into 3D points based on its IFCAXIS2PLACEMENT3D / 2D and semi-axes rx, ry.
    */
   private extractEllipseCurve3DPoints(
     ellipseRec: StepRecord,
@@ -5500,7 +6582,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Discretiza un arco circular 3D definido por 3 puntos en el espacio cartesiano.
+   * Discretizes a 3D circular arc defined by 3 points in cartesian space.
    */
   private discretize3PointArc3D(
     p1: Vec3,
@@ -5513,12 +6595,12 @@ export class IfcStepImporter {
     const normal = v1.cross(v2);
     const nLen = normal.length();
 
-    // Colineal o degenerado: degradar limpiamente a polilínea (Norma 11)
+    // Collinear or degenerate: cleanly degrade to polyline (Rule 11)
     if (nLen < GeometryTolerance.COINCIDENT_POINT) {
       return [p1, p2, p3];
     }
 
-    // Centro del círculo circunscrito en 3D
+    // 3D circumscribed circle center
     const v1Sq = v1.lengthSq();
     const v2Sq = v2.lengthSq();
     const term = v2.scale(v1Sq).sub(v1.scale(v2Sq));
@@ -5590,11 +6672,16 @@ export class IfcStepImporter {
   }
 
   /**
-   * Resuelve la matriz acumulada de colocación en el espacio del edificio a partir de un IFCLOCALPLACEMENT.
-   * Aísla las proyecciones UTM kilométricas y cotas s.n.m. de IfcSite para mantener el modelo centrado
-   * en el origen local (0, 0, 0) y preservar la precisión numérica de 32 bits en WebGL/Three.js.
+   * Resolves the cumulative placement matrix in building space from an IFCLOCALPLACEMENT.
+   * Isolates kilometric UTM projections and elevations above sea level from IfcSite to keep the model centered
+   * at the local origin (0, 0, 0) and preserve 32-bit numerical precision in WebGL/Three.js.
    */
   private resolveLocalPlacementMatrix(placementRef: number, visited = new Set<number>()): THREE.Matrix4 {
+    const cached = this.placementMatrixCache.get(placementRef);
+    if (cached) {
+      return cached.clone();
+    }
+
     const mat = new THREE.Matrix4();
     if (visited.has(placementRef)) return mat;
     visited.add(placementRef);
@@ -5620,8 +6707,8 @@ export class IfcStepImporter {
 
     const mCombined = new THREE.Matrix4().multiplyMatrices(mParent, mLocal);
 
-    // Si este placement pertenece a IfcSite, capturar las coordenadas geodésicas mundiales acumuladas (Norma 22)
-    // y neutralizar la traslación a (0, 0, 0) para mitigar pérdida de precisión IEEE 754 en WebGL.
+    // If this placement belongs to IfcSite, capture cumulative world geodetic coordinates (Rule 22)
+    // and neutralize translation to (0, 0, 0) to mitigate IEEE 754 precision loss in WebGL.
     if (this.sitePlacementRefs.has(placementRef)) {
       if (!this.siteGeoTranslationCaptured) {
         const el = mCombined.elements;
@@ -5632,12 +6719,13 @@ export class IfcStepImporter {
       mCombined.setPosition(0, 0, 0);
     }
 
+    this.placementMatrixCache.set(placementRef, mCombined.clone());
     return mCombined;
   }
 
   /**
-   * Convierte una matriz de colocación afín de IFC (Z-Up) al sistema de coordenadas de CROQUERA (Y-Up).
-   * det(C) = +1. Preserva rotaciones, reflexiones y escalas (Norma 21, Norma 22).
+   * Converts an affine IFC placement matrix (Z-Up) to the CROQUERA coordinate system (Y-Up).
+   * det(C) = +1. Preserves rotations, reflections, and scales (Rule 21, Rule 22).
    */
   public static convertIfcPlacementToCroquera(mIfc: THREE.Matrix4): THREE.Matrix4 {
     const C = new THREE.Matrix4().set(
@@ -5656,42 +6744,61 @@ export class IfcStepImporter {
   }
 
   /**
-   * Extrae el mapa de Property Sets asociados por ID de elemento STEP.
+   * Builds an O(1) lightweight index mapping STEP element IDs to their associated IFCPROPERTYSET references.
    */
-  private extractElementPsets(): Map<number, Record<string, Record<string, any>>> {
-    const map = new Map<number, Record<string, Record<string, any>>>();
-
-    const pendingFormulasByElem = new Map<
-      number,
-      Array<{ psetName: string; propertyName: string; formula: string }>
-    >();
-
+  private indexPsetRelations(): void {
+    this.psetRelationsByElement.clear();
     const relDefinesList = this.parser.getRecordsByType('IFCRELDEFINESBYPROPERTIES');
     for (const rel of relDefinesList) {
       const relElements = rel.params[4];
       const relPsetRef = rel.params[5];
-
-      if (!Array.isArray(relElements) || !relPsetRef || typeof relPsetRef !== 'object' || !('ref' in relPsetRef)) {
-        continue;
+      if (Array.isArray(relElements) && relPsetRef && typeof relPsetRef === 'object' && 'ref' in relPsetRef) {
+        const psetRef = (relPsetRef as any).ref;
+        for (const el of relElements) {
+          if (el && typeof el === 'object' && 'ref' in el) {
+            const elId = (el as any).ref;
+            let list = this.psetRelationsByElement.get(elId);
+            if (!list) {
+              list = [];
+              this.psetRelationsByElement.set(elId, list);
+            }
+            list.push(psetRef);
+          }
+        }
       }
+    }
+  }
 
-      const psetRec = this.records.get(relPsetRef.ref);
+  /**
+   * Pre-resolves Property Sets for spatial containers (IfcProject, IfcSite, IfcBuilding, IfcBuildingStorey).
+   */
+  private resolveSpatialContainerPsets(): void {
+    for (const proj of this.parser.getRecordsByType('IFCPROJECT')) this.resolveElementProperties(proj.id);
+    for (const site of this.parser.getRecordsByType('IFCSITE')) this.resolveElementProperties(site.id);
+    for (const bldg of this.parser.getRecordsByType('IFCBUILDING')) this.resolveElementProperties(bldg.id);
+    for (const storey of this.parser.getRecordsByType('IFCBUILDINGSTOREY')) this.resolveElementProperties(storey.id);
+  }
+
+  /**
+   * Resolves and extracts Property Sets (Psets) and quantities on-demand for a specific STEP element ID.
+   * Resolves in O(1) via pre-indexed psetRelationsByElement pointer lookup.
+   */
+  public resolveElementProperties(stepId: number): Record<string, Record<string, any>> {
+    const cached = this.elemPsetsMap.get(stepId);
+    if (cached && Object.keys(cached).length > 0) {
+      return cached;
+    }
+
+    const psets: Record<string, Record<string, any>> = cached || {};
+    const psetRefs = this.psetRelationsByElement.get(stepId) || [];
+
+    for (const psetRefId of psetRefs) {
+      const psetRec = this.records.get(psetRefId);
       if (!psetRec || psetRec.type !== 'IFCPROPERTYSET') continue;
 
       const psetName = this.getParamString(psetRec.params[2]) || 'Pset_Unknown';
       const propRefs = psetRec.params[4];
       if (!Array.isArray(propRefs)) continue;
-
-      // Normalizar nombre de Pset y deserializar JSON de reglas si aplica
-      let effectivePsetName = psetName;
-      const isParametricPset = psetName === 'Pset_CroqueraParametric' || psetName === 'CroqueraParametric';
-      const isLinksPset = psetName === 'Pset_CroqueraLinks' || psetName === 'CroqueraLinks';
-
-      if (isParametricPset) {
-        effectivePsetName = '__CROQUERA_PARAMETRIC_RULES__';
-      } else if (isLinksPset) {
-        effectivePsetName = '__CROQUERA_PARAMETRIC_LINKS__';
-      }
 
       const psetValues: Record<string, any> = {};
 
@@ -5718,188 +6825,19 @@ export class IfcStepImporter {
           else valType = 'IfcLabel';
         } else {
           val = nominal;
-          valType = typeof val === 'number' ? 'IfcLengthMeasure' : typeof val === 'boolean' ? 'IfcBoolean' : 'IfcLabel';
         }
 
-        // Detección y curación de dobles empaquetados JSON legados (e.g. '{"type":"IfcLengthMeasure","value":8.18}')
-        if (typeof val === 'string' && val.startsWith('{"type":') && val.includes('"value":')) {
-          try {
-            const parsed = JSON.parse(val);
-            if (parsed && typeof parsed === 'object' && 'value' in parsed) {
-              val = parsed.value;
-              if (parsed.type) valType = parsed.type;
-            }
-          } catch { /* mantener val */ }
-        }
-
-        if (isParametricPset || effectivePsetName === '__CROQUERA_PARAMETRIC_RULES__') {
-          let ruleJson = typeof val === 'string' ? val : JSON.stringify(val);
-          // Desenvolver si venía con doble wrapping de tipo { type: 'IfcLabel', value: ... }
-          if (typeof ruleJson === 'string' && ruleJson.startsWith('{')) {
-            try {
-              const parsed = JSON.parse(ruleJson);
-              if (parsed && typeof parsed === 'object' && 'value' in parsed && typeof parsed.value === 'string') {
-                ruleJson = parsed.value;
-              }
-            } catch { /* mantener ruleJson */ }
-          }
-
-          let parsedObj: any = null;
-          if (typeof ruleJson === 'string' && ruleJson.startsWith('{')) {
-            try { parsedObj = JSON.parse(ruleJson); } catch { parsedObj = null; }
-          }
-
-          // Detección y registro de fórmulas paramétricas
-          if (propName.startsWith('Formula.') || propName.startsWith('Formula:') || (parsedObj && typeof parsedObj.formula === 'string')) {
-            let targetPset = parsedObj?.psetName;
-            let targetProp = parsedObj?.propertyName;
-            let formulaStr = parsedObj?.formula || ruleJson;
-
-            if (!targetPset || !targetProp) {
-              const cleanKey = propName.replace(/^Formula[:.]/, '');
-              const dotIdx = cleanKey.lastIndexOf('.');
-              if (dotIdx !== -1) {
-                targetPset = cleanKey.slice(0, dotIdx);
-                targetProp = cleanKey.slice(dotIdx + 1);
-              }
-            }
-
-            if (targetPset && targetProp && formulaStr) {
-              for (const elemRef of relElements) {
-                if (!elemRef || typeof elemRef !== 'object' || !('ref' in elemRef)) continue;
-                let list = pendingFormulasByElem.get(elemRef.ref);
-                if (!list) {
-                  list = [];
-                  pendingFormulasByElem.set(elemRef.ref, list);
-                }
-                list.push({ psetName: targetPset, propertyName: targetProp, formula: String(formulaStr) });
-              }
-            }
-          } else if (parsedObj && typeof parsedObj.formula === 'string' && parsedObj.psetName && parsedObj.propertyName) {
-            for (const elemRef of relElements) {
-              if (!elemRef || typeof elemRef !== 'object' || !('ref' in elemRef)) continue;
-              let list = pendingFormulasByElem.get(elemRef.ref);
-              if (!list) {
-                list = [];
-                pendingFormulasByElem.set(elemRef.ref, list);
-              }
-              list.push({ psetName: parsedObj.psetName, propertyName: parsedObj.propertyName, formula: String(parsedObj.formula) });
-            }
-          }
-
-          psetValues[propName] = {
-            type: 'IfcLabel',
-            value: ruleJson,
-          };
-        } else {
-          psetValues[propName] = {
-            type: valType,
-            value: val,
-          };
-        }
+        psetValues[propName] = { type: valType, value: val };
       }
 
-      for (const elemRef of relElements) {
-        if (!elemRef || typeof elemRef !== 'object' || !('ref' in elemRef)) continue;
-        const elemId = elemRef.ref;
-        let elemPsets = map.get(elemId);
-        if (!elemPsets) {
-          elemPsets = {};
-          map.set(elemId, elemPsets);
-        }
-        elemPsets[effectivePsetName] = psetValues;
-        if (effectivePsetName !== psetName) {
-          elemPsets[psetName] = psetValues;
-        }
-      }
+      psets[psetName] = psetValues;
     }
 
-    // Rehidratación determinista final de fórmulas en sus Psets de origen
-    for (const [elemId, formulas] of pendingFormulasByElem.entries()) {
-      let elemPsets = map.get(elemId);
-      if (!elemPsets) {
-        elemPsets = {};
-        map.set(elemId, elemPsets);
-      }
-      for (const pf of formulas) {
-        if (!elemPsets[pf.psetName]) {
-          elemPsets[pf.psetName] = {};
-        }
-        const existing = elemPsets[pf.psetName][pf.propertyName];
-        if (existing && typeof existing === 'object') {
-          existing.value = pf.formula;
-        } else {
-          elemPsets[pf.psetName][pf.propertyName] = {
-            type: 'IfcLengthMeasure',
-            value: pf.formula,
-          };
-        }
-      }
-    }
-
-    return map;
+    this.elemPsetsMap.set(stepId, psets);
+    return psets;
   }
 
-  /**
-   * Extrae los metadatos de BuildingFramework de Pset_CroqueraBuildingFramework si existen.
-   */
-  private extractFrameworkMetadata(): {
-    minBound?: Vec3;
-    maxBound?: Vec3;
-    levels?: any[];
-    sections?: any[];
-  } | null {
-    const psetRecords = this.parser.getRecordsByType('IFCPROPERTYSET');
 
-    for (const pset of psetRecords) {
-      const name = this.getParamString(pset.params[2]);
-      if (name === 'Pset_CroqueraBuildingFramework') {
-        const propRefs = pset.params[4];
-        if (!Array.isArray(propRefs)) continue;
-
-        let minBound: Vec3 | undefined;
-        let maxBound: Vec3 | undefined;
-        let levels: any[] | undefined;
-        let sections: any[] | undefined;
-
-        for (const pRef of propRefs) {
-          if (!pRef || typeof pRef !== 'object' || !('ref' in pRef)) continue;
-          const p = this.records.get(pRef.ref);
-          if (!p || p.type !== 'IFCPROPERTYSINGLEVALUE') continue;
-
-          const pName = this.getParamString(p.params[0]);
-          const rawVal = p.params[2];
-          const valStr = rawVal && typeof rawVal === 'object' && 'params' in rawVal ? rawVal.params[0] : rawVal;
-
-          if (pName === 'MinBound' && typeof valStr === 'string') {
-            const m = valStr.match(/\(([^,]+),([^,]+),([^)]+)\)/);
-            if (m) minBound = new Vec3(parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3]));
-          } else if (pName === 'MaxBound' && typeof valStr === 'string') {
-            const m = valStr.match(/\(([^,]+),([^,]+),([^)]+)\)/);
-            if (m) maxBound = new Vec3(parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3]));
-          } else if (pName === 'LevelsJson' && typeof valStr === 'string') {
-            try { levels = JSON.parse(valStr); } catch { /* ignore */ }
-          } else if (pName === 'SectionsJson' && typeof valStr === 'string') {
-            try {
-              const parsed = JSON.parse(valStr);
-              sections = parsed.map((s: any) => ({
-                id: s.id,
-                name: s.name,
-                origin: new Vec3(s.origin[0], s.origin[1], s.origin[2]),
-                normal: new Vec3(s.normal[0], s.normal[1], s.normal[2]),
-                isGrid: s.isGrid,
-                gridLabel: s.gridLabel,
-              }));
-            } catch { /* ignore */ }
-          }
-        }
-
-        return { minBound, maxBound, levels, sections };
-      }
-    }
-
-    return null;
-  }
 
   private getParamString(p: StepParam): string | null {
     if (typeof p === 'string') return p;
@@ -5922,8 +6860,8 @@ export class IfcStepImporter {
   }
 
   /**
-   * Extrae los parámetros de georreferenciación formal LoGeoRef 50 (IFC 4.3).
-   * Resuelve IFCGEOMETRICREPRESENTATIONCONTEXT, IFCMAPCONVERSION e IFCPROJECTEDCRS.
+   * Extracts formal LoGeoRef 50 georeferencing parameters (IFC 4.3).
+   * Resolves IFCGEOMETRICREPRESENTATIONCONTEXT, IFCMAPCONVERSION, and IFCPROJECTEDCRS.
    */
   private extractGeorefFromContext(): void {
     if (this.extractedGeoref) return;
@@ -5931,13 +6869,13 @@ export class IfcStepImporter {
     const contexts = this.parser.getRecordsByType('IFCGEOMETRICREPRESENTATIONCONTEXT');
     if (contexts.length === 0) return;
 
-    // Priorizar el contexto geométrico principal cuyo ContextType sea 'Model'
+    // Prioritize main geometric context whose ContextType is 'Model'
     const targetContext = contexts.find((c) => {
       const typeStr = this.getParamString(c.params[1]);
       return typeStr && typeStr.toLowerCase() === 'model';
     }) || contexts[0];
 
-    // 1. Extraer TrueNorth del contexto
+    // 1. Extract TrueNorth from context
     let trueNorthX = 0.0;
     let trueNorthY = 1.0;
     const tnParam = targetContext.params[5];
@@ -5958,7 +6896,7 @@ export class IfcStepImporter {
       this.extractedTrueNorth = { x: trueNorthX, y: trueNorthY };
     }
 
-    // 2. Buscar operaciones de coordenadas (relación inversa HasCoordinateOperation)
+    // 2. Search coordinate operations (inverse relationship HasCoordinateOperation)
     const mapConversions = [
       ...this.parser.getRecordsByType('IFCMAPCONVERSION'),
       ...this.parser.getRecordsByType('IFCMAPCONVERSIONSCALED'),
@@ -5987,7 +6925,7 @@ export class IfcStepImporter {
       return;
     }
 
-    // 3. Extraer parámetros numéricos de MapConversion
+    // 3. Extract numerical parameters from MapConversion
     const eastings = this.getParamNumber(opRec.params[2], 0.0);
     const northings = this.getParamNumber(opRec.params[3], 0.0);
     const orthogonalHeight = this.getParamNumber(opRec.params[4], 0.0);
@@ -5995,7 +6933,7 @@ export class IfcStepImporter {
     const xAxisOrdinate = this.getParamNumber(opRec.params[6], 0.0);
     const scale = this.getParamNumber(opRec.params[7], 1.0);
 
-    // 4. Extraer IFCPROJECTEDCRS
+    // 4. Extract IFCPROJECTEDCRS
     let crsName: string | null = null;
     let crsDescription: string | null = null;
     let geodeticDatum: string | null = null;
@@ -6050,8 +6988,8 @@ export class IfcStepImporter {
   }
 
   /**
-   * Consolida la georreferenciación final considerando LoGeoRef 50 formal
-   * o fallback de traslación geodésica de IfcSite.
+   * Consolidates final georeferencing considering formal LoGeoRef 50
+   * or IfcSite geodetic translation fallback.
    */
   public finalizeGeoref(): GeorefData | null {
     if (this.extractedGeoref) {
@@ -6079,7 +7017,7 @@ export class IfcStepImporter {
 
         this.extractedGeoref = {
           crsName: null,
-          crsDescription: 'Coordenadas geodésicas capturadas de IfcSite',
+          crsDescription: 'Geodetic coordinates captured from IfcSite',
           geodeticDatum: null,
           verticalDatum: null,
           mapProjection: null,
@@ -6098,11 +7036,11 @@ export class IfcStepImporter {
       }
     }
 
-    // Si no hubo traslación de IfcSite ni MapConversion formal, pero sí un TrueNorth rotado en el contexto:
+    // If there was no IfcSite translation nor formal MapConversion, but a rotated TrueNorth in context exists:
     if (this.extractedTrueNorth) {
       this.extractedGeoref = {
         crsName: null,
-        crsDescription: 'Orientación TrueNorth de GeometricRepresentationContext',
+        crsDescription: 'TrueNorth orientation from GeometricRepresentationContext',
         geodeticDatum: null,
         verticalDatum: null,
         mapProjection: null,
@@ -6160,7 +7098,7 @@ export class IfcStepImporter {
       if (predType) return predType;
     }
 
-    // El último parámetro suele ser el PredefinedType si es un enum
+    // Last parameter is usually PredefinedType if it is an enum
     const last = rec.params[rec.params.length - 1];
     if (last && typeof last === 'object' && 'enum' in last) {
       return last.enum;
@@ -6169,8 +7107,8 @@ export class IfcStepImporter {
   }
 
   /**
-   * Pre-pass O(N) para indexar estilos de presentación e instanciar materiales relacionales.
-   * Resuelve la cadena buildingSMART:
+   * O(N) pre-pass to index presentation styles and instantiate relational materials.
+   * Resolves the buildingSMART chain:
    * IFCSTYLEDITEM -> [IFCPRESENTATIONSTYLEASSIGNMENT] -> IFCSURFACESTYLE -> IFCSURFACESTYLERENDERING / IFCSURFACESTYLESHADING -> IFCCOLOURRGB
    */
   private parseStyledItems(): {
@@ -6337,15 +7275,15 @@ export class IfcStepImporter {
   }
 
   /**
-   * Importa y rehidrata los materiales PBR definidos en el archivo STEP.
-   * Retorna un mapa del StepId del elemento al ID del MaterialRecord.
+   * Imports and rehydrates PBR materials defined in the STEP file.
+   * Returns a map from element StepId to MaterialRecord ID.
    */
   private importMaterials(_db?: any): Map<number, string> {
     const elemToMatIdMap = new Map<number, string>();
     const relMaterials = this.parser.getRecordsByType('IFCRELASSOCIATESMATERIAL');
     if (relMaterials.length === 0) return elemToMatIdMap;
 
-    // Cache de materialStepId -> MaterialRecord.id
+    // Cache of materialStepId -> MaterialRecord.id
     const resolvedMaterialMap = new Map<number, string>();
 
     for (const rel of relMaterials) {
@@ -6380,7 +7318,7 @@ export class IfcStepImporter {
   }
 
   /**
-   * Resuelve recursivamente la definición de un material a partir de su referencia STEP.
+   * Recursively resolves a material definition from its STEP reference.
    */
   private resolveMaterialRecord(matStepRef: number, __db?: any): MaterialRecord | null {
     const rec = this.records.get(matStepRef);
@@ -6425,10 +7363,10 @@ export class IfcStepImporter {
     const matName = targetMatRec ? this.getParamString(targetMatRec.params[0]) || 'Material' : 'Material';
     const matCategory = targetMatRec ? this.getParamString(targetMatRec.params[2]) || 'other' : 'other';
 
-    // Buscar IFCSURFACESTYLE asociado
+    // Search associated IFCSURFACESTYLE
     let surfaceStyleRec: StepRecord | null = null;
 
-    // 1. A través de IFCMATERIALDEFINITIONREPRESENTATION
+    // 1. Via IFCMATERIALDEFINITIONREPRESENTATION
     const defReps = this.parser.getRecordsByType('IFCMATERIALDEFINITIONREPRESENTATION');
     for (const defRep of defReps) {
       const repMatParam = defRep.params[3];
@@ -6449,7 +7387,7 @@ export class IfcStepImporter {
               surfaceStyleRec = candidate;
               break;
             } else if (candidate.type === 'IFCSTYLEDREPRESENTATION') {
-              // Navegar Items (params[3]) -> StyledItem (params[1]) -> SurfaceStyle (M-7)
+              // Navigate Items (params[3]) -> StyledItem (params[1]) -> SurfaceStyle (M-7)
               const itemsParam = candidate.params[3];
               if (Array.isArray(itemsParam)) {
                 for (const itRef of itemsParam) {
@@ -6480,7 +7418,7 @@ export class IfcStepImporter {
       if (surfaceStyleRec) break;
     }
 
-    // 2. Si no se encontró, buscar por nombre exacto de IFCSURFACESTYLE
+    // 2. If not found, search by exact IFCSURFACESTYLE name
     if (!surfaceStyleRec) {
       const allStyles = this.parser.getRecordsByType('IFCSURFACESTYLE');
       for (const s of allStyles) {
@@ -6493,6 +7431,9 @@ export class IfcStepImporter {
 
     let baseColor = '#D4D4D8';
     let opacity = 1.0;
+    let roughness = 0.7;
+    let metalness = 0.05;
+    let effectiveCategory: string | undefined = matCategory !== 'other' ? matCategory : undefined;
     let textureBlob: string | null = null;
     let textureMime: string | null = null;
 
@@ -6535,7 +7476,7 @@ export class IfcStepImporter {
           }
 
           if (elRec.type === 'IFCSURFACESTYLERENDERING' || elRec.type === 'IFCSURFACESTYLESHADING') {
-            // Color RGB
+            // RGB Color
             const colorParam = elRec.params[0];
             if (colorParam && typeof colorParam === 'object' && 'ref' in colorParam) {
               const colorRec = this.records.get(colorParam.ref);
@@ -6550,14 +7491,19 @@ export class IfcStepImporter {
               }
             }
 
-            // Transparencia -> Opacidad
+            // Transparency -> Opacity
             const transParam = elRec.params[1];
             if (typeof transParam === 'number' || typeof transParam === 'string') {
               const trans = parseFloat(String(transParam)) || 0;
               opacity = Number(Math.max(0, Math.min(1, 1.0 - trans)).toFixed(3));
+              if (opacity < 0.99) {
+                roughness = 0.1;
+                metalness = 0.1;
+                if (!effectiveCategory) effectiveCategory = 'glass';
+              }
             }
 
-            // Textura
+            // Texture
             if (elRec.type === 'IFCSURFACESTYLERENDERING' && elRec.params.length > 9) {
               const texParam = elRec.params[9];
               if (texParam && typeof texParam === 'object' && 'ref' in texParam) {
@@ -6581,22 +7527,255 @@ export class IfcStepImporter {
           }
         }
       }
+    } else {
+      // Inferencia semántica universal cuando el archivo STEP omite IFCSURFACESTYLE
+      const inferred = this.inferPbrFromMaterialMetadata(matName, matCategory);
+      baseColor = inferred.baseColor;
+      opacity = inferred.opacity;
+      roughness = inferred.roughness;
+      metalness = inferred.metalness;
+      if (!effectiveCategory) {
+        effectiveCategory = inferred.category;
+      }
     }
 
     const cleanName = matName.toLowerCase().replace(/[^a-z0-9]/g, '_');
-    const matId = `mat_${cleanName}_${matStepRef}`;
+    const cleanHex = baseColor.toLowerCase();
+    const clampedOpacity = Math.max(0, Math.min(1, opacity));
+    const alphaSuffix = clampedOpacity < 0.99 ? `_a${Math.round(clampedOpacity * 100)}` : '';
+    const matId = textureBlob
+      ? `mat_${cleanName}_${cleanHex.replace('#', '')}_${matStepRef}`
+      : `mat_${cleanName}_${cleanHex.replace('#', '')}${alphaSuffix}`;
+
+    const existing = this.materialCatalog.get(matId);
+    if (existing) {
+      return existing;
+    }
 
     const materialRecord: MaterialRecord = {
       id: matId,
       name: matName,
+      category: effectiveCategory,
       baseColor,
       colorHex: baseColor,
-      roughness: 0.7,
-      metalness: 0.05,
-      opacity,
+      roughness,
+      metalness,
+      opacity: clampedOpacity,
+      transparent: clampedOpacity < 0.99,
+      textureBlob,
+      textureMime,
     };
 
     this.materialCatalog.set(materialRecord.id, materialRecord);
     return materialRecord;
+  }
+
+  /**
+   * Infers physically plausible PBR parameters (color, roughness, metalness, opacity, transparency)
+   * from the lexical name and category of an IfcMaterial when explicit IfcSurfaceStyle is omitted.
+   * Universal, deterministic architectural classifier.
+   */
+  private inferPbrFromMaterialMetadata(
+    matName: string,
+    matCategory?: string
+  ): {
+    baseColor: string;
+    roughness: number;
+    metalness: number;
+    opacity: number;
+    transparent: boolean;
+    category?: string;
+  } {
+    const raw = `${matName} ${matCategory || ''}`.toLowerCase();
+
+    // 1. Glass & Glazing
+    if (
+      raw.includes('glass') ||
+      raw.includes('glaz') ||
+      raw.includes('vidrio') ||
+      raw.includes('cristal') ||
+      raw.includes('low-e')
+    ) {
+      return {
+        baseColor: '#A5C8E1',
+        roughness: 0.1,
+        metalness: 0.1,
+        opacity: 0.35,
+        transparent: true,
+        category: 'glass',
+      };
+    }
+
+    // 2. Concrete, Cement, Mortar, Grout
+    if (
+      raw.includes('concrete') ||
+      raw.includes('cip') ||
+      raw.includes('hormigon') ||
+      raw.includes('hormigón') ||
+      raw.includes('concreto') ||
+      raw.includes('mortar') ||
+      raw.includes('mortero') ||
+      raw.includes('cement') ||
+      raw.includes('grout')
+    ) {
+      return {
+        baseColor: '#9CA3AF',
+        roughness: 0.85,
+        metalness: 0.05,
+        opacity: 1.0,
+        transparent: false,
+        category: 'concrete',
+      };
+    }
+
+    // 3. Metals (Steel, Aluminium, Iron, Copper, Zinc, Brass)
+    if (
+      raw.includes('aluminium') ||
+      raw.includes('aluminum') ||
+      raw.includes('aluminio')
+    ) {
+      return {
+        baseColor: '#94A3B8',
+        roughness: 0.3,
+        metalness: 0.85,
+        opacity: 1.0,
+        transparent: false,
+        category: 'metal',
+      };
+    }
+    if (
+      raw.includes('steel') ||
+      raw.includes('acero') ||
+      raw.includes('metal') ||
+      raw.includes('iron') ||
+      raw.includes('hierro') ||
+      raw.includes('copper') ||
+      raw.includes('cobre') ||
+      raw.includes('zinc') ||
+      raw.includes('brass') ||
+      raw.includes('bronze')
+    ) {
+      return {
+        baseColor: '#64748B',
+        roughness: 0.35,
+        metalness: 0.8,
+        opacity: 1.0,
+        transparent: false,
+        category: 'metal',
+      };
+    }
+
+    // 4. Wood & Timber
+    if (
+      raw.includes('wood') ||
+      raw.includes('timber') ||
+      raw.includes('madera') ||
+      raw.includes('plywood') ||
+      raw.includes('terciado') ||
+      raw.includes('lumber') ||
+      raw.includes('oak') ||
+      raw.includes('pine') ||
+      raw.includes('pino') ||
+      raw.includes('roble') ||
+      raw.includes('cedar')
+    ) {
+      return {
+        baseColor: '#B48B57',
+        roughness: 0.75,
+        metalness: 0.0,
+        opacity: 1.0,
+        transparent: false,
+        category: 'wood',
+      };
+    }
+
+    // 5. Masonry, Brick, Stone, Ceramic, Terracotta, Tile
+    if (
+      raw.includes('brick') ||
+      raw.includes('ladrillo') ||
+      raw.includes('terra cotta') ||
+      raw.includes('terracotta')
+    ) {
+      return {
+        baseColor: '#B45309',
+        roughness: 0.8,
+        metalness: 0.05,
+        opacity: 1.0,
+        transparent: false,
+        category: 'ceramic',
+      };
+    }
+    if (
+      raw.includes('stone') ||
+      raw.includes('piedra') ||
+      raw.includes('granite') ||
+      raw.includes('granito') ||
+      raw.includes('marble') ||
+      raw.includes('marmol') ||
+      raw.includes('mármol') ||
+      raw.includes('ceramic') ||
+      raw.includes('ceramica') ||
+      raw.includes('cerámica') ||
+      raw.includes('tile') ||
+      raw.includes('porcelan')
+    ) {
+      return {
+        baseColor: '#D1D5DB',
+        roughness: 0.65,
+        metalness: 0.05,
+        opacity: 1.0,
+        transparent: false,
+        category: 'stone',
+      };
+    }
+
+    // 6. Insulation, Drywall, Gypsum, Sheathing, Membrane, Soffit
+    if (
+      raw.includes('insulat') ||
+      raw.includes('aisla') ||
+      raw.includes('gypsum') ||
+      raw.includes('sheathing') ||
+      raw.includes('drywall') ||
+      raw.includes('pladur') ||
+      raw.includes('volcanita') ||
+      raw.includes('soffit') ||
+      raw.includes('fascia') ||
+      raw.includes('membrane')
+    ) {
+      return {
+        baseColor: '#E2E8F0',
+        roughness: 0.9,
+        metalness: 0.0,
+        opacity: 1.0,
+        transparent: false,
+        category: 'other',
+      };
+    }
+
+    // 7. Photovoltaic / Solar Cells
+    if (
+      raw.includes('photovoltaic') ||
+      raw.includes('solar') ||
+      raw.includes('pv')
+    ) {
+      return {
+        baseColor: '#1E293B',
+        roughness: 0.2,
+        metalness: 0.6,
+        opacity: 1.0,
+        transparent: false,
+        category: 'other',
+      };
+    }
+
+    // 8. Default architectural neutral
+    return {
+      baseColor: '#D4D4D8',
+      roughness: 0.7,
+      metalness: 0.05,
+      opacity: 1.0,
+      transparent: false,
+      category: matCategory !== 'other' ? matCategory : undefined,
+    };
   }
 }

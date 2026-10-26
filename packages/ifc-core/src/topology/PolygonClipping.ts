@@ -337,75 +337,6 @@ export class PolygonClipping {
   }
 
   /**
-   * Test if two coplanar 3D polygons overlap, intersect, or contain each other.
-   */
-  static polygonsOverlapOnPlane(polyA: Vec3[], polyB: Vec3[], holesA: Vec3[][] = [], normal?: Vec3): boolean {
-    if (polyA.length < 3 || polyB.length < 3) return false;
-    const n = normal || Vec3.Y;
-    const basis = this.getLocalBasis(polyA[0], n);
-    const a2D = polyA.map((p) => this.projectTo2D(p, basis));
-    const b2D = polyB.map((p) => this.projectTo2D(p, basis));
-
-    // 1. Check if any vertex of B is inside solid area of A
-    for (const p of b2D) {
-      if (this.pointInPolygon2D(p, a2D)) {
-        let inHole = false;
-        for (const h of holesA) {
-          const h2D = h.map((hp) => this.projectTo2D(hp, basis));
-          if (this.pointInPolygon2D(p, h2D)) {
-            inHole = true;
-            break;
-          }
-        }
-        if (!inHole) return true;
-      }
-    }
-
-    // 2. Check if any vertex of A is inside B
-    for (const p of a2D) {
-      if (this.pointInPolygon2D(p, b2D)) return true;
-    }
-
-    // 3. Check if centroid of B is inside solid area of A
-    const centerB = b2D.reduce((acc, p) => ({ x: acc.x + p.x, y: acc.y + p.y }), { x: 0, y: 0 });
-    centerB.x /= b2D.length;
-    centerB.y /= b2D.length;
-    if (this.pointInPolygon2D(centerB, a2D)) {
-      let inHole = false;
-      for (const h of holesA) {
-        const h2D = h.map((hp) => this.projectTo2D(hp, basis));
-        if (this.pointInPolygon2D(centerB, h2D)) {
-          inHole = true;
-          break;
-        }
-      }
-      if (!inHole) return true;
-    }
-
-    // 4. Check if any edge of A intersects any edge of B
-    const nA = a2D.length;
-    const nB = b2D.length;
-    for (let i = 0; i < nA; i++) {
-      const a1 = a2D[i];
-      const a2 = a2D[(i + 1) % nA];
-      for (let j = 0; j < nB; j++) {
-        const b1 = b2D[j];
-        const b2 = b2D[(j + 1) % nB];
-        const det = (a2.x - a1.x) * (b2.y - b1.y) - (a2.y - a1.y) * (b2.x - b1.x);
-        if (Math.abs(det) > 1e-6) {
-          const tA = ((b1.x - a1.x) * (b2.y - b1.y) - (b1.y - a1.y) * (b2.x - b1.x)) / det;
-          const tB = ((b1.x - a1.x) * (a2.y - a1.y) - (b1.y - a1.y) * (a2.x - a1.x)) / det;
-          if (tA > 1e-4 && tA < 1 - 1e-4 && tB > 1e-4 && tB < 1 - 1e-4) {
-            return true;
-          }
-        }
-      }
-    }
-
-    return false;
-  }
-
-  /**
    * Split a 2D polygon with a line segment [s1, s2] that intersects the boundary.
    */
   /**
@@ -468,7 +399,7 @@ export class PolygonClipping {
       return [poly];
     }
 
-    // Extraer segmentos interiores (cuerdas de corte interiores)
+    // Extract interior segments (internal cutting chords)
     const chords: { p1: Vec2D; p2: Vec2D }[] = [];
     for (let i = 0; i < uniqueIntersections.length - 1; i++) {
       const pA = uniqueIntersections[i].point;
@@ -489,7 +420,7 @@ export class PolygonClipping {
       return [poly];
     }
 
-    // Particionar sucesivamente las piezas con cada cuerda interior válida
+    // Sequentially partition polygon pieces using each valid interior chord
     let pieces: Vec2D[][] = [this.ensureCCW(poly)];
 
     for (const chord of chords) {
@@ -510,7 +441,7 @@ export class PolygonClipping {
       pieces = nextPieces;
     }
 
-    // Filtrar piezas degeneradas o con área nula
+    // Filter out degenerate or zero-area pieces
     const validPieces = pieces.filter(
       (p) => p.length >= 3 && Math.abs(this.signedArea2D(p)) > GeometryTolerance.MIN_FACE_AREA
     );
@@ -519,7 +450,7 @@ export class PolygonClipping {
   }
 
   /**
-   * Divide un polígono CCW en dos usando una cuerda interior [p1, p2] cuyos extremos yacen en su frontera.
+   * Splits a CCW polygon in two using an interior chord [p1, p2] whose endpoints lie on its boundary.
    */
   static splitPolygonWithSingleChord(
     poly: Vec2D[],
@@ -530,7 +461,7 @@ export class PolygonClipping {
     if (poly.length < 3) return null;
     const ccw = this.ensureCCW(poly);
 
-    // Helper para proyectar/insertar un punto en la frontera del polígono
+    // Helper to project/insert a point onto the polygon boundary
     const insertOnBoundary = (pts: Vec2D[], target: Vec2D): { pts: Vec2D[]; index: number } | null => {
       for (let i = 0; i < pts.length; i++) {
         if (Math.hypot(pts[i].x - target.x, pts[i].y - target.y) <= tol) {
@@ -596,143 +527,7 @@ export class PolygonClipping {
     return [this.ensureCCW(polyA), this.ensureCCW(polyB)];
   }
 
-  /**
-   * Splits a 2D CCW polygon with a cutting segment [s1, s2].
-   * Returns [polyA, polyB] if the segment cuts the polygon from boundary to boundary.
-   */
-  static splitPolygonWithSegment(
-    poly: Vec2D[],
-    s1: Vec2D,
-    s2: Vec2D,
-    tolerance = 0.02
-  ): Vec2D[][] | null {
-    if (poly.length < 3) return null;
-    const ccwPoly = this.ensureCCW(poly);
 
-    // Validar si el segmento cortante toca o cruza el polígono antes de proceder
-    const midSeg: Vec2D = { x: (s1.x + s2.x) * 0.5, y: (s1.y + s2.y) * 0.5 };
-    const segIntersects =
-      this.pointInPolygon2D(s1, ccwPoly) ||
-      this.pointInPolygon2D(s2, ccwPoly) ||
-      this.pointInPolygon2D(midSeg, ccwPoly) ||
-      this.isPointInOrOnPolygon2D(s1, ccwPoly, tolerance) ||
-      this.isPointInOrOnPolygon2D(s2, ccwPoly, tolerance);
-
-    let crossesBoundary = false;
-    const n = ccwPoly.length;
-    for (let i = 0; i < n; i++) {
-      const p1 = ccwPoly[i];
-      const p2 = ccwPoly[(i + 1) % n];
-      const d1x = s2.x - s1.x, d1y = s2.y - s1.y;
-      const d2x = p2.x - p1.x, d2y = p2.y - p1.y;
-      const det = d1x * d2y - d1y * d2x;
-      if (Math.abs(det) > 1e-8) {
-        const t1 = ((p1.x - s1.x) * d2y - (p1.y - s1.y) * d2x) / det;
-        const t2 = ((p1.x - s1.x) * d1y - (p1.y - s1.y) * d1x) / det;
-        if (t1 >= -1e-4 && t1 <= 1 + 1e-4 && t2 >= -1e-4 && t2 <= 1 + 1e-4) {
-          crossesBoundary = true;
-          break;
-        }
-      }
-    }
-
-    if (!segIntersects && !crossesBoundary) {
-      return null;
-    }
-
-    // Helper: distance from point to 2D line segment
-    const distToSeg = (p: Vec2D, a: Vec2D, b: Vec2D) => {
-      const dx = b.x - a.x, dy = b.y - a.y;
-      const l2 = dx * dx + dy * dy;
-      if (l2 < 1e-8) return Math.hypot(p.x - a.x, p.y - a.y);
-      const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / l2));
-      return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
-    };
-
-    // Helper: find or insert point on polygon boundary
-    const insertPointOnBoundary = (pts: Vec2D[], target: Vec2D): { pts: Vec2D[]; index: number } | null => {
-      // 1. Check existing vertex
-      for (let i = 0; i < pts.length; i++) {
-        if (Math.hypot(pts[i].x - target.x, pts[i].y - target.y) <= tolerance) {
-          return { pts, index: i };
-        }
-      }
-      // 2. Check edges
-      for (let i = 0; i < pts.length; i++) {
-        const a = pts[i];
-        const b = pts[(i + 1) % pts.length];
-        if (distToSeg(target, a, b) <= tolerance) {
-          const newPts = [...pts.slice(0, i + 1), { x: target.x, y: target.y }, ...pts.slice(i + 1)];
-          return { pts: newPts, index: i + 1 };
-        }
-      }
-      return null;
-    };
-
-    let workingPoly = [...ccwPoly];
-    const res1 = insertPointOnBoundary(workingPoly, s1);
-    if (!res1) {
-      const resLine = this.splitPolygonWithLine(ccwPoly, s1, s2);
-      if (resLine.length >= 2) {
-        return resLine;
-      }
-      return null;
-    }
-    workingPoly = res1.pts;
-
-    const res2 = insertPointOnBoundary(workingPoly, s2);
-    if (!res2) {
-      const resLine = this.splitPolygonWithLine(ccwPoly, s1, s2);
-      if (resLine.length >= 2) {
-        return resLine;
-      }
-      return null;
-    }
-    workingPoly = res2.pts;
-
-    let idx1 = workingPoly.findIndex((p) => Math.hypot(p.x - s1.x, p.y - s1.y) <= tolerance);
-    let idx2 = res2.index;
-
-    if (idx1 === -1 || idx2 === -1 || idx1 === idx2) {
-      const resLine = this.splitPolygonWithLine(ccwPoly, s1, s2);
-      if (resLine.length >= 2) {
-        return resLine;
-      }
-      return null;
-    }
-
-    if (idx1 > idx2) {
-      const tmp = idx1;
-      idx1 = idx2;
-      idx2 = tmp;
-    }
-
-    const polyA: Vec2D[] = [];
-    for (let i = idx1; i <= idx2; i++) {
-      polyA.push(workingPoly[i]);
-    }
-
-    const polyB: Vec2D[] = [];
-    for (let i = idx2; i < workingPoly.length; i++) {
-      polyB.push(workingPoly[i]);
-    }
-    for (let i = 0; i <= idx1; i++) {
-      polyB.push(workingPoly[i]);
-    }
-
-    if (polyA.length < 3 || polyB.length < 3) {
-      return null;
-    }
-
-    const areaA = Math.abs(this.signedArea2D(polyA));
-    const areaB = Math.abs(this.signedArea2D(polyB));
-
-    if (areaA < 1e-4 || areaB < 1e-4) {
-      return null;
-    }
-
-    return [this.ensureCCW(polyA), this.ensureCCW(polyB)];
-  }
 
   /**
    * Check if a 4-vertex 2D polygon is strictly an axis-aligned rectangle.
@@ -881,114 +676,5 @@ export class PolygonClipping {
     });
 
     return remnantPieces.map((p) => this.ensureCCW(p));
-  }
-
-  /**
-   * Generates a 2D offset polygon.
-   * - distance < 0: inward offset (contracción hacia el interior).
-   * - distance > 0: outward offset (expansión hacia el exterior).
-   * Returns the offset polygon vertices, or null if the polygon collapses.
-   */
-  static offsetPolygon2D(polygon: Vec2D[], distance: number): Vec2D[] | null {
-    const n = polygon.length;
-    if (n < 3) return null;
-    if (Math.abs(distance) < GeometryTolerance.MATH_EPSILON) {
-      return polygon.map((p) => ({ ...p }));
-    }
-
-    const ccw = this.ensureCCW(polygon);
-    const origArea = this.signedArea2D(ccw);
-    if (origArea <= GeometryTolerance.MATH_EPSILON) return null;
-
-    // For CCW polygon, inward normal is (-t_y, t_x).
-    // If distance < 0 (inward): we shift along inward normal by |distance| = -distance.
-    // If distance > 0 (outward): we shift opposite to inward normal by distance.
-    const shiftInward = -distance;
-
-    const shiftedLines: { p: Vec2D; d: Vec2D; n: Vec2D }[] = [];
-    for (let i = 0; i < n; i++) {
-      const pA = ccw[i];
-      const pB = ccw[(i + 1) % n];
-      const dx = pB.x - pA.x;
-      const dy = pB.y - pA.y;
-      const len = Math.hypot(dx, dy);
-      if (len < GeometryTolerance.MATH_EPSILON) continue;
-
-      const tx = dx / len;
-      const ty = dy / len;
-      // Inward normal (pointing inside CCW polygon): (-ty, tx)
-      const nx = -ty;
-      const ny = tx;
-
-      const pShifted = {
-        x: pA.x + shiftInward * nx,
-        y: pA.y + shiftInward * ny,
-      };
-      shiftedLines.push({ p: pShifted, d: { x: tx, y: ty }, n: { x: nx, y: ny } });
-    }
-
-    const m = shiftedLines.length;
-    if (m < 3) return null;
-
-    const offsetVerts: Vec2D[] = [];
-    for (let i = 0; i < m; i++) {
-      const l1 = shiftedLines[(i - 1 + m) % m];
-      const l2 = shiftedLines[i];
-
-      // Intersect line 1 (p1 + s*d1) with line 2 (p2 + t*d2)
-      const det = l1.d.y * l2.d.x - l1.d.x * l2.d.y;
-      if (Math.abs(det) < GeometryTolerance.MATH_EPSILON) {
-        // Parallel or collinear edges: fallback to vertex shift
-        offsetVerts.push({ x: l2.p.x, y: l2.p.y });
-      } else {
-        const dx = l2.p.x - l1.p.x;
-        const dy = l2.p.y - l1.p.y;
-        const detS = dy * l2.d.x - dx * l2.d.y;
-        const s = detS / det;
-        offsetVerts.push({
-          x: l1.p.x + s * l1.d.x,
-          y: l1.p.y + s * l1.d.y,
-        });
-      }
-    }
-
-    // Validation:
-    const newArea = this.signedArea2D(offsetVerts);
-    if (distance < 0) {
-      if (newArea <= GeometryTolerance.MATH_EPSILON || newArea >= origArea) {
-        return null; // Collapsed or inverted
-      }
-      // For inward offset, each vertex must lie on the inward side of all shifted edge lines
-      for (const q of offsetVerts) {
-        for (const line of shiftedLines) {
-          const dot = (q.x - line.p.x) * line.n.x + (q.y - line.p.y) * line.n.y;
-          if (dot < -GeometryTolerance.COINCIDENT_VERTEX) {
-            return null; // Edges crossed; polygon collapsed
-          }
-        }
-      }
-    } else {
-      if (newArea <= origArea) {
-        return null;
-      }
-    }
-
-    return offsetVerts;
-  }
-
-  /**
-   * Generates a 3D offset polygon on the plane defined by `normal`.
-   * - distance < 0: inward offset (contracción hacia el interior).
-   * - distance > 0: outward offset (expansión hacia el exterior).
-   */
-  static offsetPolygon3D(positions: Vec3[], normal: Vec3, distance: number): Vec3[] | null {
-    if (positions.length < 3) return null;
-    const basis = this.getLocalBasis(positions[0], normal);
-    const poly2D = positions.map((p) => this.projectTo2D(p, basis));
-
-    const offset2D = this.offsetPolygon2D(poly2D, distance);
-    if (!offset2D) return null;
-
-    return offset2D.map((p) => this.unprojectTo3D(p, basis));
   }
 }

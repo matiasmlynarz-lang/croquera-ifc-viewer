@@ -32,8 +32,8 @@ export class CameraRig {
 
   constructor(options: CameraRigOptions = {}) {
     const fov = options.fov || 45;
-    const near = options.near || 0.1;
-    const far = options.far || 5000;
+    const near = options.near || 0.5;
+    const far = options.far || 1500;
     this.damping = options.damping || 0.12;
 
     this.camera = new THREE.PerspectiveCamera(fov, 1, near, far);
@@ -84,6 +84,11 @@ export class CameraRig {
 
     this.desiredTarget.copy(center);
     this.targetSpherical.radius = Math.max(distance, 2.0);
+
+    // Calibrate depth precision to model scale (near/far ratio <= 1000)
+    this.camera.near = Math.max(0.1, distance * 0.01);
+    this.camera.far = Math.max(500, distance * 10);
+    this.camera.updateProjectionMatrix();
   }
 
   public update(): void {

@@ -75,20 +75,16 @@ body, html, #app {
 .app-brand {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
-  color: var(--text-primary);
-  font-size: 12px;
-  text-transform: uppercase;
-  padding-right: 8px;
+  justify-content: center;
+  padding-right: 10px;
   border-right: 1px solid var(--border-subtle);
 }
 
-.brand-icon {
-  width: 16px;
-  height: 16px;
-  fill: var(--accent-blue);
+.brand-logo {
+  width: 26px;
+  height: 26px;
+  display: block;
+  cursor: pointer;
 }
 
 /* ─── Buttons & Inputs ────────────────────────────────────────── */

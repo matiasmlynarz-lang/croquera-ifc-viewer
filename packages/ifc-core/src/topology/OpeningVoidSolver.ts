@@ -49,7 +49,7 @@ export class OpeningVoidSolver {
     }
 
     for (const hostFace of hostMesh.faces.values()) {
-      if (hostFace.openingId) continue;
+      if (hostFace.openingId && hostFace.openingId === openingGroupId) continue;
       const hostPositions = hostFace.getPositions();
       const hostNormal = hostFace.normal;
       const hostCentroid = hostFace.centroid;
@@ -83,6 +83,12 @@ export class OpeningVoidSolver {
     isIdentity: boolean = true,
     requireThrough: boolean = false
   ): boolean {
+    // Early exit if the opening void is already fully carved into the host solid topology
+    const alreadyTagged = this.tagExistingJambas(hostMesh, openingMesh, openingGroupId, matrix, isIdentity);
+    if (alreadyTagged >= 2) {
+      return true;
+    }
+
     interface OpFaceData {
       positions: Vec3[];
       normal: Vec3;
@@ -105,10 +111,85 @@ export class OpeningVoidSolver {
 
     if (transformedOpFaces.length === 0) return false;
 
+    // Strict 3D Bounding Box (AABB) intersection check:
+    // A void volume can only cut the host solid if they overlap in 3D space with non-zero volume.
+    // If the opening is vertically or horizontally disjoint from host, it cannot carve any valid cavity.
+    let minAx = Infinity, maxAx = -Infinity, minAy = Infinity, maxAy = -Infinity, minAz = Infinity, maxAz = -Infinity;
+    for (const v of hostMesh.vertices.values()) {
+      const p = v.position;
+      if (p.x < minAx) minAx = p.x; if (p.x > maxAx) maxAx = p.x;
+      if (p.y < minAy) minAy = p.y; if (p.y > maxAy) maxAy = p.y;
+      if (p.z < minAz) minAz = p.z; if (p.z > maxAz) maxAz = p.z;
+    }
+
+    let minBx = Infinity, maxBx = -Infinity, minBy = Infinity, maxBy = -Infinity, minBz = Infinity, maxBz = -Infinity;
+    for (const of of transformedOpFaces) {
+      for (const p of of.positions) {
+        if (p.x < minBx) minBx = p.x; if (p.x > maxBx) maxBx = p.x;
+        if (p.y < minBy) minBy = p.y; if (p.y > maxBy) maxBy = p.y;
+        if (p.z < minBz) minBz = p.z; if (p.z > maxBz) maxBz = p.z;
+      }
+    }
+
+    const minTol = GeometryTolerance.COINCIDENT_VERTEX;
+    const overlapX = Math.min(maxAx, maxBx) - Math.max(minAx, minBx);
+    const overlapY = Math.min(maxAy, maxBy) - Math.max(minAy, minBy);
+    const overlapZ = Math.min(maxAz, maxBz) - Math.max(minAz, minBz);
+
+    // Vertical elevation check: an opening can only cut a host element if it physically
+    // penetrates the host's vertical elevation range (overlapY > minTol).
+    // An opening entirely below or above the host cannot carve it (prevents lintels from extruding downwards).
+    if (overlapY <= minTol) {
+      return false;
+    }
+
+    // Planar proximity check: the opening must overlap with the host in at least one horizontal direction (X or Z).
+    // (The other direction may represent multi-layer wall thickness penetrated along the face normal).
+    if (overlapX < -minTol && overlapZ < -minTol) {
+      return false;
+    }
+
+    // Boundary roof trim & top cut detection:
+    // If the opening reaches or exceeds the highest elevation of the host solid,
+    // a 2D interior face-loop cannot remove the top cap of the wall.
+    // Dispatch immediately to exact 3D B-Rep BooleanCSGKernel.subtract.
+    const hostMaxY = maxAy;
+    const opMaxY = maxBy;
+
+    const isTopBoundaryCut = opMaxY >= hostMaxY - GeometryTolerance.COINCIDENT_VERTEX * 10;
+    if (isTopBoundaryCut) {
+      try {
+        const subtracted = BooleanCSGKernel.subtract(hostMesh, openingMesh, {
+          openingGroupId,
+          matrixB: isIdentity ? undefined : matrix,
+        });
+        const hasCarvedFaces = Array.from(subtracted.faces.values()).some(
+          (f) => f.openingId === openingGroupId || (f.holes && f.holes.length > 0 && f.holeOwners?.includes(openingGroupId))
+        );
+        if (hasCarvedFaces || (subtracted.faces.size > 0 && subtracted.faces.size !== hostMesh.faces.size)) {
+          this.applySubtractedMeshToHost(hostMesh, subtracted);
+          return true;
+        }
+      } catch {
+        // Fall back to piercing if CSG encounters an unhandled topological condition
+      }
+    }
+
     const allOpPoints: Vec3[] = [];
     for (const of of transformedOpFaces) {
+      let hMaxProj = -Infinity;
+      for (const v of hostMesh.vertices.values()) {
+        const proj = v.position.dot(of.normal);
+        if (proj > hMaxProj) hMaxProj = proj;
+      }
       for (const pos of of.positions) {
         allOpPoints.push(pos);
+        // Extend along face normal through host thickness to account for coplanar / multi-layer wall bounds
+        const forwardDist = Math.max(
+          GeometryTolerance.OPENING_PIERCING_EXTENSION_MARGIN,
+          (hMaxProj - pos.dot(of.normal)) + GeometryTolerance.OPENING_PIERCING_EXTENSION_MARGIN
+        );
+        allOpPoints.push(pos.add(of.normal.scale(forwardDist)));
       }
     }
 
@@ -117,6 +198,7 @@ export class OpeningVoidSolver {
       loop3D: Vec3[];
       cap: OpFaceData;
       basis: LocalBasis;
+      allVertsIn: boolean;
     }
 
     const piercedHostFaces: PiercedFace[] = [];
@@ -165,7 +247,17 @@ export class OpeningVoidSolver {
         ofCenter2D.x /= of2D.length;
         ofCenter2D.y /= of2D.length;
 
-        const allVertsIn = of2D.every((p) => PolygonClipping.isPointInOrOnPolygon2D(p, hf2D, GeometryTolerance.COINCIDENT_VERTEX * 10));
+        const insideOuter = of2D.every((p) =>
+          PolygonClipping.isPointInOrOnPolygon2D(p, hf2D, GeometryTolerance.COINCIDENT_VERTEX * 10)
+        );
+        const overlapsExistingHole =
+          hf.hasHoles() &&
+          hf.holes.some((h) => {
+            const h2D = h.map((hp) => PolygonClipping.projectTo2D(hp, basis));
+            return of2D.some((p) => PolygonClipping.pointInPolygon2D(p, h2D));
+          });
+        const allVertsIn = insideOuter && !overlapsExistingHole;
+
         const centroidIn = PolygonClipping.isPointInOrOnPolygon2D(ofCenter2D, hf2D);
         const anyVertIn = of2D.some((p) => PolygonClipping.pointInPolygon2D(p, hf2D));
         const anyHfVertIn = !centroidIn && !anyVertIn && hf2D.some((p) => PolygonClipping.pointInPolygon2D(p, of2D));
@@ -175,7 +267,7 @@ export class OpeningVoidSolver {
         if (isValidPiercing) {
           if (!piercedHostFaces.some((p) => p.face.id === hf.id)) {
             const projectedLoop3D = of2D.map((p2d) => PolygonClipping.unprojectTo3D(p2d, basis));
-            piercedHostFaces.push({ face: hf, cap: of, basis, loop3D: projectedLoop3D });
+            piercedHostFaces.push({ face: hf, cap: of, basis, loop3D: projectedLoop3D, allVertsIn });
             break;
           }
         }
@@ -219,118 +311,126 @@ export class OpeningVoidSolver {
         (p) => p.face.normal.dot(p2!.face.normal) > GeometryTolerance.OPENING_DIRECTION_ALIGNMENT_DOT
       );
 
-      for (const pf of frontFaces) {
-        this.applyVoidCutToHostFace(hostMesh, pf.face, pf.loop3D, openingGroupId, pf.basis);
-      }
+      const isFullyContainedThroughHole = p1.allVertsIn && p2.allVertsIn;
 
-      const l1 = p1.loop3D;
-      const n = l1.length;
-      const cap1 = p1.cap;
-      const oppCap =
-        transformedOpFaces.find(
-          (f) => f.normal.dot(cap1.normal) < GeometryTolerance.OPENING_STRICT_OPPOSITE_DOT
-        ) || p2.cap;
-      const basis2 = p2.basis;
-      const opp2D = oppCap.positions.map((p) => PolygonClipping.projectTo2D(p, basis2));
-      const rawL2 = opp2D.map((p2d) => PolygonClipping.unprojectTo3D(p2d, basis2));
+      if (isFullyContainedThroughHole) {
+        const validFrontFaces = frontFaces.filter((pf) => pf.allVertsIn);
+        for (const pf of validFrontFaces) {
+          this.applyVoidCutToHostFace(hostMesh, pf.face, pf.loop3D, openingGroupId, pf.basis);
+        }
 
-      let alignedL2: Vec3[] = [];
-      if (rawL2.length === n) {
-        const targets = l1.map((pt) => p2!.face.plane.projectPoint(pt));
-        let bestScore = Infinity;
-        let bestOffset = 0;
-        let bestDir = 1;
+        const l1 = p1.loop3D;
+        const n = l1.length;
+        const cap1 = p1.cap;
+        const oppCap =
+          transformedOpFaces.find(
+            (f) => f.normal.dot(cap1.normal) < GeometryTolerance.OPENING_STRICT_OPPOSITE_DOT
+          ) || p2.cap;
+        const basis2 = p2.basis;
+        const opp2D = oppCap.positions.map((p) => PolygonClipping.projectTo2D(p, basis2));
+        const rawL2 = opp2D.map((p2d) => PolygonClipping.unprojectTo3D(p2d, basis2));
 
-        for (const dir of [1, -1]) {
-          for (let s = 0; s < n; s++) {
-            let score = 0;
-            for (let i = 0; i < n; i++) {
-              const idx = (s + dir * i + n * 10) % n;
-              score += targets[i].distanceToSq(rawL2[idx]);
-            }
-            if (score < bestScore) {
-              bestScore = score;
-              bestOffset = s;
-              bestDir = dir;
+        let alignedL2: Vec3[] = [];
+        if (rawL2.length === n) {
+          const targets = l1.map((pt) => p2!.face.plane.projectPoint(pt));
+          let bestScore = Infinity;
+          let bestOffset = 0;
+          let bestDir = 1;
+
+          for (const dir of [1, -1]) {
+            for (let s = 0; s < n; s++) {
+              let score = 0;
+              for (let i = 0; i < n; i++) {
+                const idx = (s + dir * i + n * 10) % n;
+                score += targets[i].distanceToSq(rawL2[idx]);
+              }
+              if (score < bestScore) {
+                bestScore = score;
+                bestOffset = s;
+                bestDir = dir;
+              }
             }
           }
+
+          for (let i = 0; i < n; i++) {
+            const idx = (bestOffset + bestDir * i + n * 10) % n;
+            alignedL2.push(rawL2[idx]);
+          }
+        } else {
+          alignedL2 = l1.map((pt) => p2!.face.plane.projectPoint(pt));
         }
+
+        const validBackFaces = backFaces.filter((pb) => pb.allVertsIn);
+        for (const pb of validBackFaces) {
+          const pbLoop = alignedL2.map((pt) => pb.face.plane.projectPoint(pt));
+          this.applyVoidCutToHostFace(hostMesh, pb.face, pbLoop, openingGroupId, pb.basis);
+        }
+
+        const c1 = l1.reduce((acc, p) => acc.add(p), Vec3.ZERO).scale(1 / n);
+        const c2 = alignedL2.reduce((acc, p) => acc.add(p), Vec3.ZERO).scale(1 / n);
+        const holeCenter = c1.add(c2).scale(0.5);
 
         for (let i = 0; i < n; i++) {
-          const idx = (bestOffset + bestDir * i + n * 10) % n;
-          alignedL2.push(rawL2[idx]);
+          const next = (i + 1) % n;
+          let quad = [l1[i], l1[next], alignedL2[next], alignedL2[i]];
+          const v1 = quad[1].sub(quad[0]);
+          const v2 = quad[3].sub(quad[0]);
+          let normal = v1.cross(v2).normalize();
+          const quadCenter = quad.reduce((acc, p) => acc.add(p), Vec3.ZERO).scale(0.25);
+          const toHole = holeCenter.sub(quadCenter);
+          if (normal.dot(toHole) < 0) {
+            quad.reverse();
+            normal = normal.negate();
+          }
+          const jamba = hostMesh.addFace(quad, normal);
+          jamba.openingId = openingGroupId;
         }
-      } else {
-        alignedL2 = l1.map((pt) => p2!.face.plane.projectPoint(pt));
+
+        hostMesh.rebuildTopology();
+        return true;
       }
-
-      for (const pb of backFaces) {
-        const pbLoop = alignedL2.map((pt) => pb.face.plane.projectPoint(pt));
-        this.applyVoidCutToHostFace(hostMesh, pb.face, pbLoop, openingGroupId, pb.basis);
-      }
-
-      const c1 = l1.reduce((acc, p) => acc.add(p), Vec3.ZERO).scale(1 / n);
-      const c2 = alignedL2.reduce((acc, p) => acc.add(p), Vec3.ZERO).scale(1 / n);
-      const holeCenter = c1.add(c2).scale(0.5);
-
-      for (let i = 0; i < n; i++) {
-        const next = (i + 1) % n;
-        let quad = [l1[i], l1[next], alignedL2[next], alignedL2[i]];
-        const v1 = quad[1].sub(quad[0]);
-        const v2 = quad[3].sub(quad[0]);
-        let normal = v1.cross(v2).normalize();
-        const quadCenter = quad.reduce((acc, p) => acc.add(p), Vec3.ZERO).scale(0.25);
-        const toHole = holeCenter.sub(quadCenter);
-        if (normal.dot(toHole) < 0) {
-          quad.reverse();
-          normal = normal.negate();
-        }
-        const jamba = hostMesh.addFace(quad, normal);
-        jamba.openingId = openingGroupId;
-      }
-
-      hostMesh.rebuildTopology();
-      return true;
     } else if (!requireThrough && piercedHostFaces.length >= 1) {
       const singleP = p1 || piercedHostFaces[0];
-      this.applyVoidCutToHostFace(hostMesh, singleP.face, singleP.loop3D, openingGroupId, singleP.basis);
+      if (singleP.allVertsIn) {
+        this.applyVoidCutToHostFace(hostMesh, singleP.face, singleP.loop3D, openingGroupId, singleP.basis);
 
-      const cap1 = singleP.cap;
-      const oppCap = transformedOpFaces.find(
-        (f) => f.normal.dot(cap1.normal) < GeometryTolerance.OPENING_STRICT_OPPOSITE_DOT
-      );
-      const depth = oppCap
-        ? Math.abs(cap1.normal.dot(oppCap.positions[0].sub(cap1.positions[0])))
-        : 0.2;
+        const cap1 = singleP.cap;
+        const oppCap = transformedOpFaces.find(
+          (f) => f.normal.dot(cap1.normal) < GeometryTolerance.OPENING_STRICT_OPPOSITE_DOT
+        );
+        const depth = oppCap
+          ? Math.abs(cap1.normal.dot(oppCap.positions[0].sub(cap1.positions[0])))
+          : 0.2;
 
-      const rayDir = singleP.face.normal.negate();
-      const l1 = singleP.loop3D;
-      const n = l1.length;
-      const lBottom = l1.map((p) => p.add(rayDir.scale(depth)));
+        const rayDir = singleP.face.normal.negate();
+        const l1 = singleP.loop3D;
+        const n = l1.length;
+        const lBottom = l1.map((p) => p.add(rayDir.scale(depth)));
 
-      const bottomFace = hostMesh.addFace([...lBottom].reverse(), rayDir.negate());
-      bottomFace.openingId = openingGroupId;
+        const bottomFace = hostMesh.addFace([...lBottom].reverse(), rayDir.negate());
+        bottomFace.openingId = openingGroupId;
 
-      const holeCenter = l1.reduce((acc, p) => acc.add(p), Vec3.ZERO).scale(1 / n);
+        const holeCenter = l1.reduce((acc, p) => acc.add(p), Vec3.ZERO).scale(1 / n);
 
-      for (let i = 0; i < n; i++) {
-        const next = (i + 1) % n;
-        let quad = [l1[i], l1[next], lBottom[next], lBottom[i]];
-        const v1 = quad[1].sub(quad[0]);
-        const v2 = quad[3].sub(quad[0]);
-        let normal = v1.cross(v2).normalize();
-        const quadCenter = quad.reduce((acc, p) => acc.add(p), Vec3.ZERO).scale(0.25);
-        const toHole = holeCenter.sub(quadCenter);
-        if (normal.dot(toHole) < 0) {
-          quad.reverse();
-          normal = normal.negate();
+        for (let i = 0; i < n; i++) {
+          const next = (i + 1) % n;
+          let quad = [l1[i], l1[next], lBottom[next], lBottom[i]];
+          const v1 = quad[1].sub(quad[0]);
+          const v2 = quad[3].sub(quad[0]);
+          let normal = v1.cross(v2).normalize();
+          const quadCenter = quad.reduce((acc, p) => acc.add(p), Vec3.ZERO).scale(0.25);
+          const toHole = holeCenter.sub(quadCenter);
+          if (normal.dot(toHole) < 0) {
+            quad.reverse();
+            normal = normal.negate();
+          }
+          const jamba = hostMesh.addFace(quad, normal);
+          jamba.openingId = openingGroupId;
         }
-        const jamba = hostMesh.addFace(quad, normal);
-        jamba.openingId = openingGroupId;
-      }
 
-      hostMesh.rebuildTopology();
-      return true;
+        hostMesh.rebuildTopology();
+        return true;
+      }
     }
 
     // CSG Fallback
@@ -342,20 +442,8 @@ export class OpeningVoidSolver {
       const hasCarvedFaces = Array.from(subtracted.faces.values()).some(
         (f) => f.openingId === openingGroupId || (f.holes && f.holes.length > 0 && f.holeOwners?.includes(openingGroupId))
       );
-      if (hasCarvedFaces) {
-        hostMesh.faces.clear();
-        hostMesh.vertices.clear();
-        hostMesh.edges.clear();
-        for (const f of subtracted.faces.values()) {
-          const newF = hostMesh.addFace(f.getPositions(), f.normal);
-          newF.materialId = f.materialId;
-          newF.openingId = f.openingId;
-          if (f.holes && f.holes.length > 0) {
-            newF.holes = f.holes.map((h) => [...h]);
-            newF.holeOwners = f.holeOwners ? [...f.holeOwners] : [];
-          }
-        }
-        hostMesh.rebuildTopology();
+      if (hasCarvedFaces || (subtracted.faces.size > 0 && subtracted.faces.size !== hostMesh.faces.size)) {
+        this.applySubtractedMeshToHost(hostMesh, subtracted);
         return true;
       }
     } catch {
@@ -363,6 +451,22 @@ export class OpeningVoidSolver {
     }
 
     return false;
+  }
+
+  private static applySubtractedMeshToHost(hostMesh: PolyMesh, subtracted: PolyMesh): void {
+    hostMesh.faces.clear();
+    hostMesh.vertices.clear();
+    hostMesh.edges.clear();
+    for (const f of subtracted.faces.values()) {
+      const newF = hostMesh.addFace(f.getPositions(), f.normal);
+      newF.materialId = f.materialId;
+      newF.openingId = f.openingId;
+      if (f.holes && f.holes.length > 0) {
+        newF.holes = f.holes.map((h) => [...h]);
+        newF.holeOwners = f.holeOwners ? [...f.holeOwners] : [];
+      }
+    }
+    hostMesh.rebuildTopology();
   }
 
   private static isOnPolygonBoundary2D(

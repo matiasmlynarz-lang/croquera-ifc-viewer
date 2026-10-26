@@ -10,7 +10,7 @@
     "dev": "npm run dev --workspace=apps/web-viewer",
     "build": "npm run build --workspaces",
     "test": "vitest run",
-    "typecheck": "tsc --build --noEmit"
+    "typecheck": "tsc --build"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

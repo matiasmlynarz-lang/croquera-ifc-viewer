@@ -1,38 +1,36 @@
 /**
- * GeometryPrototypeDetector — Detector de congruencia geométrica y prototipos para IFC (Etapa B).
+ * GeometryPrototypeDetector — Geometric congruence and prototype detector for IFC components.
  *
- * Analiza mallas y sólidos B-Rep en segundo plano para identificar geometrías idénticas
- * o congruentes (e.g. 96k barandas o placas en ElManzano.ifc) y colapsarlas en prototipos
- * maestros y matrices de instancia en GPU (Norma 4: matrixId / InstancedMesh).
+ * Analyzes meshes and B-Rep solids in background threads to identify identical
+ * or congruent geometries (e.g. repetitive railings, columns, or panel instances)
+ * and collapses them into master prototypes and GPU instanced matrices.
  *
- * Cumplimiento normativo (NORMAS_DESARROLLO_CROQUERA.md):
- * - Norma 6: Uso exclusivo de GeometryTolerance.IMPORTED_VERTEX_WELD para tolerancia de congruencia (D1).
- * - Norma 7: Complejidad O(V) por malla, amortizado O(N) para la escena.
- * - Norma 11: Manejo robusto de casos degenerados (malla vacía, 1 vértice, colisión de hash forzada).
- * - Norma 17: Fidelidad de matrices 4x4 en frontera (Float32Array 16 floats).
+ * Uses Principal Component Analysis (PCA) to derive canonical orientation and
+ * decouple baked rotations (e.g. 90°, 180°, or arbitrary rotations).
  */
 
 import * as THREE from 'three';
 import { GeometryTolerance } from '../math/GeometryTolerance';
+import { PCAAligner, type PCAResult } from '../math/PCAAligner';
 import type { PolyMesh } from '../topology/PolyMesh';
 
 const FNV_PRIME = 1099511628211n;
 const FNV_OFFSET_BASIS = 14695981039346656037n;
 
 /**
- * Cambio de base canónico IFC Z-up -> Croquera Y-up.
+ * Canonical basis transformation IFC Z-up -> Croquera Y-up.
  * X_croq = X_ifc,  Y_croq = Z_ifc,  Z_croq = -Y_ifc  (det = +1)
  *
- * Para cualquier matrix M en espacio IFC:
+ * For any matrix M in IFC space:
  *   M_croq = M_CANONICAL · M · M_CANONICAL_INV
  */
-const M_CANONICAL = new THREE.Matrix4().set(
+export const M_CANONICAL = new THREE.Matrix4().set(
   1,  0,  0, 0,
   0,  0,  1, 0,
   0, -1,  0, 0,
   0,  0,  0, 1
 );
-const M_CANONICAL_INV = new THREE.Matrix4().set(
+export const M_CANONICAL_INV = new THREE.Matrix4().set(
   1,  0,  0, 0,
   0,  0, -1, 0,
   0,  1,  0, 0,
@@ -45,6 +43,7 @@ export interface PrototypeRecord {
   hash: bigint;
   vertexCount: number;
   faceCount: number;
+  extents: [number, number, number];
   dx: number;
   dy: number;
   dz: number;
@@ -52,15 +51,22 @@ export interface PrototypeRecord {
   placementMatrix: THREE.Matrix4;
   instanceCount: number;
   sortedDistances: Float32Array;
+  canonicalSample: Float32Array;
+  pcaRotation: THREE.Matrix4;
 }
 
 export interface PrototypeMatchResult {
   isInstance: boolean;
   prototypeId: string;
   prototypeStepId: number;
-  transform: Float32Array; // 16 floats
-  /** Centroide del prototipo en IFC local space (AABB midpoint) — usar para centrar la geometría emitida */
+  transform: Float32Array; // 16 floats (M_croq)
+  /** Prototype centroid in local IFC space */
   centroid_ifc: [number, number, number];
+  /**
+   * 4x4 matrix transforming local IFC geometry to Croquera canonical space:
+   * M_to_proto_croq = M_CANONICAL · R^T · T(-c)
+   */
+  toCanonicalCroqueraMatrix: THREE.Matrix4;
 }
 
 export class GeometryPrototypeDetector {
@@ -71,7 +77,7 @@ export class GeometryPrototypeDetector {
   public totalInstancesDetected: number = 0;
 
   /**
-   * Limpia el registro de prototipos.
+   * Clears the prototype registry.
    */
   public clear(): void {
     this.prototypesByHash.clear();
@@ -81,8 +87,8 @@ export class GeometryPrototypeDetector {
   }
 
   /**
-   * Evalúa una geometría. Si es congruente con un prototipo existente, devuelve isInstance = true
-   * con la referencia al prototipo y la matriz 4x4. Si es nueva, la registra como prototipo.
+   * Evaluates a geometry. If congruent with an existing prototype, returns isInstance = true
+   * with the prototype reference and 4x4 matrix. If novel, registers it as a prototype.
    */
   public checkOrRegister(
     entityId: string,
@@ -112,7 +118,7 @@ export class GeometryPrototypeDetector {
 
     const vertexCount = Math.floor(positions.length / 3);
 
-    // Caso degenerado: Malla vacía o sin vértices (Norma 11)
+    // Degenerate case: Empty mesh or mesh without vertices (Rule 11)
     if (vertexCount === 0) {
       const M_croq_degen = M_CANONICAL.clone().multiply(placementMatrix).multiply(M_CANONICAL_INV);
       return {
@@ -121,30 +127,31 @@ export class GeometryPrototypeDetector {
         prototypeStepId: stepId,
         transform: new Float32Array(M_croq_degen.elements),
         centroid_ifc: [0, 0, 0],
+        toCanonicalCroqueraMatrix: new THREE.Matrix4().identity(),
       };
     }
 
     const signature = this.computeSignature(positions, faceCount);
     const weld = GeometryTolerance.IMPORTED_VERTEX_WELD;
 
-    // Buscar en el bucket de hash
+    // Look up in hash bucket
     const bucket = this.prototypesByHash.get(signature.hash);
     if (bucket) {
       for (const candidate of bucket) {
-        if (this.areCongruent(signature, candidate, weld)) {
-          // Coincidencia confirmada: Es una instancia del prototipo existente
+        const matchingRotation = this.areCongruent(signature, candidate, weld);
+        if (matchingRotation) {
+          // Match confirmed: It is an instance of an existing prototype
           candidate.instanceCount++;
           this.totalInstancesDetected++;
 
-          // M_ifc = mProduct (placementMatrix) · T(centroid_ifc de esta ocurrencia)
-          // El centroid de la signatura está en espacio IFC local (coordenadas crudas de los vértices del ítem).
-          // mProduct lleva ese centroid local al espacio mundo IFC.
+          // M_ifc = mProduct (placementMatrix) · T(occurrence centroid_ifc) · R_instance
+          // The signature centroid is in local IFC space.
+          // matchingRotation rotates canonical coordinates into this occurrence's local space.
           // M_croq = M_CANONICAL · M_ifc · M_CANONICAL_INV
-          // (Norma 17: transform en Croquera Y-up space para InstancedMesh GPU)
           const [cx, cy, cz] = signature.centroid;
-          const M_ifc = placementMatrix.clone().multiply(
-            new THREE.Matrix4().makeTranslation(cx, cy, cz)
-          );
+          const M_ifc = placementMatrix.clone()
+            .multiply(new THREE.Matrix4().makeTranslation(cx, cy, cz))
+            .multiply(matchingRotation);
           const M_croq = M_CANONICAL.clone().multiply(M_ifc).multiply(M_CANONICAL_INV);
 
           return {
@@ -153,25 +160,29 @@ export class GeometryPrototypeDetector {
             prototypeStepId: candidate.stepId,
             transform: new Float32Array(M_croq.elements),
             centroid_ifc: signature.centroid,
+            toCanonicalCroqueraMatrix: new THREE.Matrix4().identity(),
           };
         }
       }
     }
 
-    // No se encontró coincidencia: Registrar como nuevo prototipo
+    // No match found: Register as new prototype
     const newProto: PrototypeRecord = {
       prototypeId: entityId,
       stepId,
       hash: signature.hash,
       vertexCount: signature.vertexCount,
       faceCount: signature.faceCount,
-      dx: signature.dx,
-      dy: signature.dy,
-      dz: signature.dz,
+      extents: signature.extents,
+      dx: signature.extents[0],
+      dy: signature.extents[1],
+      dz: signature.extents[2],
       centroid: signature.centroid,
       placementMatrix: placementMatrix.clone(),
       instanceCount: 1,
       sortedDistances: signature.sortedDistances,
+      canonicalSample: signature.canonicalSample,
+      pcaRotation: signature.rotationMatrix,
     };
 
     if (!bucket) {
@@ -182,13 +193,20 @@ export class GeometryPrototypeDetector {
     this.prototypesById.set(entityId, newProto);
     this.totalPrototypes++;
 
-    // Prototipo nuevo: la geometría será centrada en Croquera space (x-cx, z-cz, -(y-cy))
-    // por IfcStepImporter antes de emitirla. Aquí devolvemos la M_croq del prototipo mismo
-    // para que la primera ocurrencia también se renderice en su posición correcta.
+    // New prototype:
+    // 1. Transform to canonical Croquera space:
+    //    M_to_proto_croq = M_CANONICAL · R^T · T(-c)
     const [pcx, pcy, pcz] = signature.centroid;
-    const M_ifc_proto = placementMatrix.clone().multiply(
-      new THREE.Matrix4().makeTranslation(pcx, pcy, pcz)
-    );
+    const T_minus_c = new THREE.Matrix4().makeTranslation(-pcx, -pcy, -pcz);
+    const R_inv = signature.rotationMatrix.clone().transpose();
+    const M_to_proto_croq = M_CANONICAL.clone().multiply(R_inv).multiply(T_minus_c);
+
+    // 2. Instance transform for the first occurrence:
+    //    M_ifc_proto = placementMatrix · T(c) · R
+    //    M_croq_proto = M_CANONICAL · M_ifc_proto · M_CANONICAL_INV
+    const M_ifc_proto = placementMatrix.clone()
+      .multiply(new THREE.Matrix4().makeTranslation(pcx, pcy, pcz))
+      .multiply(signature.rotationMatrix);
     const M_croq_proto = M_CANONICAL.clone().multiply(M_ifc_proto).multiply(M_CANONICAL_INV);
 
     return {
@@ -197,31 +215,30 @@ export class GeometryPrototypeDetector {
       prototypeStepId: stepId,
       transform: new Float32Array(M_croq_proto.elements),
       centroid_ifc: [pcx, pcy, pcz],
+      toCanonicalCroqueraMatrix: M_to_proto_croq,
     };
   }
 
   /**
-   * Obtiene un prototipo registrado por su entityId.
+   * Retrieves a registered prototype by its entityId.
    */
   public getPrototype(prototypeId: string): PrototypeRecord | undefined {
     return this.prototypesById.get(prototypeId);
   }
 
   /**
-   * Calcula la firma geométrica invariante a la traslación.
+   * Computes rotation-invariant geometric signature via PCA.
    */
   public computeSignature(
     positions: Float32Array,
     faceCount: number
-  ): {
+  ): PCAResult & {
     hash: bigint;
     vertexCount: number;
     faceCount: number;
     dx: number;
     dy: number;
     dz: number;
-    centroid: [number, number, number];
-    sortedDistances: Float32Array;
   } {
     const vertexCount = Math.floor(positions.length / 3);
     if (vertexCount === 0) {
@@ -229,65 +246,37 @@ export class GeometryPrototypeDetector {
         hash: 0n,
         vertexCount: 0,
         faceCount: 0,
+        centroid: [0, 0, 0],
+        eigenvalues: [0, 0, 0],
+        extents: [0, 0, 0],
         dx: 0,
         dy: 0,
         dz: 0,
-        centroid: [0, 0, 0],
+        rotationMatrix: new THREE.Matrix4().identity(),
         sortedDistances: new Float32Array(0),
+        canonicalSample: new Float32Array(0),
       };
     }
 
-    let minX = positions[0], maxX = positions[0];
-    let minY = positions[1], maxY = positions[1];
-    let minZ = positions[2], maxZ = positions[2];
+    const pca = PCAAligner.computePCA(positions);
 
-    for (let i = 1; i < vertexCount; i++) {
-      const x = positions[i * 3];
-      const y = positions[i * 3 + 1];
-      const z = positions[i * 3 + 2];
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
-      if (z < minZ) minZ = z;
-      if (z > maxZ) maxZ = z;
-    }
-
-    const dx = maxX - minX;
-    const dy = maxY - minY;
-    const dz = maxZ - minZ;
-
-    const cx = (minX + maxX) * 0.5;
-    const cy = (minY + maxY) * 0.5;
-    const cz = (minZ + maxZ) * 0.5;
-
-    const distances = new Float32Array(vertexCount);
-    for (let i = 0; i < vertexCount; i++) {
-      const px = positions[i * 3] - cx;
-      const py = positions[i * 3 + 1] - cy;
-      const pz = positions[i * 3 + 2] - cz;
-      distances[i] = Math.hypot(px, py, pz);
-    }
-
-    distances.sort();
-
-    // Hash FNV-1a sobre los invariantes
+    // FNV-1a hash over geometric invariants (vertexCount, faceCount, principal extents, radial distances)
     const weld = GeometryTolerance.IMPORTED_VERTEX_WELD;
-    const qDx = Math.round(dx / weld);
-    const qDy = Math.round(dy / weld);
-    const qDz = Math.round(dz / weld);
+    const qL0 = Math.round(pca.extents[0] / weld);
+    const qL1 = Math.round(pca.extents[1] / weld);
+    const qL2 = Math.round(pca.extents[2] / weld);
 
     let h = FNV_OFFSET_BASIS;
     h = this.fnvMixInt(h, vertexCount);
     h = this.fnvMixInt(h, faceCount);
-    h = this.fnvMixInt(h, qDx);
-    h = this.fnvMixInt(h, qDy);
-    h = this.fnvMixInt(h, qDz);
+    h = this.fnvMixInt(h, qL0);
+    h = this.fnvMixInt(h, qL1);
+    h = this.fnvMixInt(h, qL2);
 
-    // Muestreo estratificado de distancias radiales (hasta 64 muestras)
+    // Stratified sampling of radial distances (up to 64 samples)
     const step = Math.max(1, Math.floor(vertexCount / 64));
     for (let i = 0; i < vertexCount; i += step) {
-      const qDist = Math.round(distances[i] / weld);
+      const qDist = Math.round(pca.sortedDistances[i] / weld);
       h = this.fnvMixInt(h, qDist);
     }
 
@@ -295,45 +284,32 @@ export class GeometryPrototypeDetector {
       hash: h,
       vertexCount,
       faceCount,
-      dx,
-      dy,
-      dz,
-      centroid: [cx, cy, cz],
-      sortedDistances: distances,
+      dx: pca.extents[0],
+      dy: pca.extents[1],
+      dz: pca.extents[2],
+      ...pca,
     };
   }
 
   /**
-   * Verificación secundaria estricta de congruencia geométrica (Mitigación de colisiones).
+   * Strict secondary geometric congruence verification (Collision mitigation).
+   * Returns the matching 4x4 rotation matrix if congruent, or null if not congruent.
    */
   private areCongruent(
-    sigA: {
-      vertexCount: number;
-      faceCount: number;
-      dx: number;
-      dy: number;
-      dz: number;
-      sortedDistances: Float32Array;
-    },
+    sigA: PCAResult & { vertexCount: number; faceCount: number },
     cand: PrototypeRecord,
     weld: number
-  ): boolean {
-    if (sigA.vertexCount !== cand.vertexCount) return false;
-    if (sigA.faceCount !== cand.faceCount) return false;
-    if (Math.abs(sigA.dx - cand.dx) > weld) return false;
-    if (Math.abs(sigA.dy - cand.dy) > weld) return false;
-    if (Math.abs(sigA.dz - cand.dz) > weld) return false;
+  ): THREE.Matrix4 | null {
+    if (sigA.vertexCount !== cand.vertexCount) return null;
+    if (sigA.faceCount !== cand.faceCount) return null;
 
-    // Comparar distancias radiales ordenadas
-    const v = sigA.vertexCount;
-    const step = Math.max(1, Math.floor(v / 32));
-    for (let i = 0; i < v; i += step) {
-      if (Math.abs(sigA.sortedDistances[i] - cand.sortedDistances[i]) > weld) {
-        return false;
-      }
-    }
-
-    return true;
+    return PCAAligner.testCongruence(
+      sigA,
+      cand.extents,
+      cand.sortedDistances,
+      cand.canonicalSample,
+      weld
+    );
   }
 
   private fnvMixInt(h: bigint, val: number): bigint {

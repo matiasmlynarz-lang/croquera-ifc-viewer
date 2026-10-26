@@ -1,10 +1,10 @@
 /**
  * SweepKernel.ts — Computational Geometry Kernel for Sweep / Follow Me Extrusion.
  *
- * Satisface todas las reglas vinculantes de NORMAS_DESARROLLO_CROQUERA.md:
- * - Regla 6: Tolerancias centralizadas de GeometryTolerance.
- * - Regla 7: Complejidad controlada O(N*K) en transformaciones.
- * - Regla 11: Aserciones reales y casos degenerados.
+ * Adheres strictly to topological manifold requirements:
+ * - Centralized tolerances from GeometryTolerance.ts.
+ * - O(N*K) bounded complexity in profile transformations.
+ * - Robust handling of closed loops, open polyline paths, and degenerate singularities.
  */
 import { Vec3 } from '../math/Vec3';
 import { GeometryTolerance } from '../math/GeometryTolerance';
@@ -18,7 +18,7 @@ export interface ChainedPath {
 
 export class SweepKernel {
   /**
-   * Calcula la normal unitaria del polígono del perfil utilizando el método de Newell.
+   * Computes the unit normal of the profile polygon using Newell's method.
    */
   public static computePolygonNormal(vertices: Vec3[]): Vec3 {
     let nx = 0;
@@ -42,7 +42,7 @@ export class SweepKernel {
   }
 
   /**
-   * Encadena una colección de aristas no ordenadas en una polilínea 3D continua.
+   * Chains an unordered collection of line segments into a continuous 3D polyline path.
    */
   public static chainPathSegments(edges: { a: Vec3; b: Vec3 }[]): ChainedPath | null {
     if (!edges || edges.length === 0) return null;
@@ -116,8 +116,8 @@ export class SweepKernel {
   }
 
   /**
-   * Alinea canónicamente el origen (s = 0) y el sentido de avance de la trayectoria
-   * respecto a la posición y orientación de la cara del perfil.
+   * Canonically aligns path origin (s = 0) and progression direction
+   * relative to the position and orientation of the profile face.
    */
   public static alignPathToProfile(
     pathPoints: Vec3[],
@@ -151,8 +151,8 @@ export class SweepKernel {
       const M = uniqueNodes.length;
       if (M < 3) return { alignedPath: pathPoints, isClosed };
 
-      // Buscar el punto más cercano de la trayectoria a cualquier vértice del perfil.
-      // Puede ser un vértice existente o un punto interior sobre una arista del polígono.
+      // Search for the closest point on the path to any profile vertex.
+      // Can be an existing vertex or an interior point along a polygon edge.
       let bestSeg = 0;
       let bestT = 0;
       let bestProjPoint = uniqueNodes[0];
@@ -183,19 +183,19 @@ export class SweepKernel {
 
       let shifted: Vec3[] = [];
       if (bestT < 0.01) {
-        // Coincide con uniqueNodes[bestSeg]
+        // Coincides with uniqueNodes[bestSeg]
         for (let i = 0; i < M; i++) {
           shifted.push(uniqueNodes[(bestSeg + i) % M]);
         }
       } else if (bestT > 0.99) {
-        // Coincide con uniqueNodes[(bestSeg + 1) % M]
+        // Coincides with uniqueNodes[(bestSeg + 1) % M]
         const nextIdx = (bestSeg + 1) % M;
         for (let i = 0; i < M; i++) {
           shifted.push(uniqueNodes[(nextIdx + i) % M]);
         }
       } else {
-        // El perfil está en el interior de una arista (ej. en medio del borde superior de una caja).
-        // Se inserta bestProjPoint como nodo inicial para que la distancia de anclaje sea 0.
+        // Profile lies in the interior of an edge (e.g. middle of a box top border).
+        // Insert bestProjPoint as initial node so anchor distance is 0.
         shifted.push(bestProjPoint);
         for (let i = 1; i <= M; i++) {
           shifted.push(uniqueNodes[(bestSeg + i) % M]);
@@ -225,7 +225,7 @@ export class SweepKernel {
       return { alignedPath: finalNodes, isClosed: true };
     }
 
-    // Trayectorias abiertas: insertar anclaje si el perfil está en el interior de un segmento
+    // Open paths: insert anchor if profile lies in the interior of a segment
     let bestSegOpen = -1;
     let bestTOpen = 0;
     let bestProjOpen = cleaned[0];
@@ -276,8 +276,8 @@ export class SweepKernel {
   }
 
   /**
-   * Calcula la normal del plano que contiene a una trayectoria (si es planar).
-   * Utiliza la fórmula de Newell y verifica que todos los nodos pertenezcan al plano.
+   * Computes the normal vector of the plane containing a 3D path (if planar).
+   * Utilizes Newell's formula and verifies that all path vertices lie on the plane.
    */
   public static computePathPlaneNormal(pathPoints: Vec3[]): Vec3 | null {
     if (pathPoints.length < 3) return null;
@@ -301,7 +301,7 @@ export class SweepKernel {
       if (allOnPlane) return norm;
     }
 
-    // Si Newell es casi cero (ej. segmentos abiertos colineales o cancelados), calcular producto cruz
+    // If Newell is near zero (e.g. collinear or cancelling open segments), compute cross product
     let t0: Vec3 | null = null;
     for (let i = 0; i < n - 1; i++) {
       const seg = pathPoints[i + 1].sub(pathPoints[i]);
@@ -330,18 +330,18 @@ export class SweepKernel {
   }
 
   /**
-   * Barre una sección poligonal plana a lo largo de una trayectoria continua 3D.
+   * Sweeps a planar polygonal section along a continuous 3D path.
    *
-   * Algoritmo: Marco de Superficie (Darboux Frame) con Up-Vector Canónico Invariante
-   * y corrección bisectriz de inglete (Miter Joint) en esquinas vivas (>= 20°).
+   * Algorithm: Surface Frame (Darboux Frame) with Invariant Canonical Up-Vector
+   * and miter joint bisector correction at sharp corners (>= 20°).
    *
-   * Garantías matemáticas (NORMAS_DESARROLLO_CROQUERA):
-   *   1. En tramos rectos entre esquinas, la base ortonormal (U_i, V_i) es 100% idéntica
-   *      en ambos extremos del tramo, eliminando cualquier torsión helicoidal espuria.
-   *   2. En bucles sobre planos (como la cara superior de una caja), el eje vertical V
-   *      permanece estrictamente perpendicular al plano (constante en todo el perímetro).
-   *   3. En las esquinas angulares (>= 20°), las secciones entrante y saliente se proyectan
-   *      de forma exacta sobre el plano bisector normalize(tIn - tOut).
+   * Mathematical guarantees (NORMAS_DESARROLLO_CROQUERA):
+   *   1. On straight spans between corners, the orthonormal basis (U_i, V_i) is 100% identical
+   *      at both segment endpoints, eliminating any spurious helical twisting.
+   *   2. In loops lying on planes (such as the top face of a box), the vertical axis V
+   *      remains strictly perpendicular to the plane (constant along the entire perimeter).
+   *   3. At angular corners (>= 20°), incoming and outgoing sections are projected
+   *      exactly onto the bisector plane normalize(tIn - tOut).
    */
   public static sweepProfileAlongPath(
     profileVertices: Vec3[],
@@ -353,7 +353,7 @@ export class SweepKernel {
       return null;
     }
 
-    // 1. Alinear canónicamente el origen y la orientación de la trayectoria
+    // 1. Canonically align path origin and orientation
     const alignment = this.alignPathToProfile(pathPoints, isClosed, profileVertices);
     const cleanedPath = alignment.alignedPath;
     const closed = alignment.isClosed;
@@ -363,7 +363,7 @@ export class SweepKernel {
     const numNodes = cleanedPath.length;
     const k = profileVertices.length;
 
-    // 2. Calcular tangentes unitarias de cada segmento
+    // 2. Compute unit tangents for each segment
     const segTangents: Vec3[] = [];
     for (let i = 0; i < numNodes - 1; i++) {
       const dir = cleanedPath[i + 1].sub(cleanedPath[i]);
@@ -371,7 +371,7 @@ export class SweepKernel {
       segTangents.push(len > GeometryTolerance.MATH_EPSILON ? dir.scale(1 / len) : Vec3.Y);
     }
 
-    // 3. Determinar nodo de anclaje y segmento efectivo de adjunción
+    // 3. Determine anchor node and effective attachment segment
     let attachNodeIdx = 0;
     let minDist = Infinity;
     for (let i = 0; i < numNodes; i++) {
@@ -399,21 +399,21 @@ export class SweepKernel {
     const anchor = cleanedPath[attachNodeIdx];
     const T_attach = segTangents[effectiveAttachSeg];
 
-    // 4. Determinar base ortonormal canónica e invariante de la trayectoria (Marco de Darboux)
+    // 4. Determine canonical invariant path orthonormal basis (Darboux Frame)
     const pathPlaneNormal = SweepKernel.computePathPlaneNormal(cleanedPath);
     const isPlanar = pathPlaneNormal !== null;
 
-    // 5. Construir base ortonormal canónica (U_i, V_i) para cada tramo de la trayectoria
+    // 5. Construct canonical orthonormal basis (U_i, V_i) for each path segment
     const segU: Vec3[] = [];
     const segV: Vec3[] = [];
 
     if (isPlanar) {
-      // Marco de Superficie Canónico (Darboux):
-      // Para cualquier trayectoria contenida en un plano (horizontal, vertical o inclinada),
-      // todos los segmentos T_i yacen en el plano (T_i · N_plane = 0).
-      // Por tanto, la normal del plano N_plane es estrictamente ortogonal a todos los segmentos T_i:
-      // - V_i es la normal a la superficie de la cara (constante en todo el bucle, profundidad de moldura)
-      // - U_i es la normal intrínseca en la superficie (T_i x V_i, orientada uniformemente en el plano)
+      // Canonical Surface Frame (Darboux):
+      // For any path contained in a plane (horizontal, vertical, or tilted),
+      // all segments T_i lie in the plane (T_i · N_plane = 0).
+      // Therefore, the plane normal N_plane is strictly orthogonal to all segments T_i:
+      // - V_i is the normal to the face surface (constant across the whole loop, molding depth)
+      // - U_i is the intrinsic surface normal (T_i x V_i, uniformly oriented in the plane)
       let N_plane = pathPlaneNormal!;
       if (Math.abs(N_plane.dot(Vec3.Y)) > 0.7 && N_plane.y < 0) {
         N_plane = N_plane.negate();
@@ -427,7 +427,7 @@ export class SweepKernel {
         segV.push(V_i);
       }
     } else {
-      // Trayectoria 3D libre no coplanar (Parallel Transport)
+      // Non-coplanar 3D free path (Parallel Transport)
       const V_up = Vec3.Y;
       for (let i = 0; i < segTangents.length; i++) {
         const T_i = segTangents[i];
@@ -446,8 +446,8 @@ export class SweepKernel {
     const U_attach = segU[effectiveAttachSeg];
     const V_attach = segV[effectiveAttachSeg];
 
-    // 6. Descomponer el perfil en coordenadas invariantes locales (u_k, v_k)
-    //    referenciadas a la base transversal (U_attach, V_attach) en el anclaje.
+    // 6. Decompose profile into local invariant coordinates (u_k, v_k)
+    //    referenced to the transverse basis (U_attach, V_attach) at the anchor.
     const N_prof = SweepKernel.computePolygonNormal(profileVertices);
     const uCoords: number[] = [];
     const vCoords: number[] = [];
@@ -457,7 +457,7 @@ export class SweepKernel {
     const isTransversal = Math.abs(dotNormal) > 0.5;
 
     if (isTransversal) {
-      // El perfil ya fue dibujado en el plano transversal a la trayectoria
+      // Profile was already drawn on the transverse plane to the path
       for (const pv of profileVertices) {
         const r = pv.sub(anchor);
         uCoords.push(r.dot(U_attach));
@@ -465,8 +465,8 @@ export class SweepKernel {
         maxDistFromAnchor = Math.max(maxDistFromAnchor, pv.distanceTo(anchor));
       }
     } else {
-      // El perfil fue dibujado coplanar a una cara que contiene a T_attach (ej. en la pared).
-      // Se rota su vector relativo hacia el plano transversal ortogonal a T_attach
+      // Profile was drawn coplanar to a face containing T_attach (e.g. on a wall).
+      // Rotate its relative vector toward the transverse plane orthogonal to T_attach
       const effNormal = dotNormal >= 0 ? N_prof : N_prof.negate();
       const alignCross = effNormal.cross(T_attach);
       const alignAxis = alignCross.lengthSq() > GeometryTolerance.MATH_EPSILON
@@ -484,7 +484,7 @@ export class SweepKernel {
     }
     const profileDiagonal = Math.max(0.1, maxDistFromAnchor * 2);
 
-    // 7. Generar las secciones transversales en cada nodo de la trayectoria
+    // 7. Generate transverse cross-sections at each path node
     const numSections = closed ? numNodes - 1 : numNodes;
     const sections: Vec3[][] = [];
     const numSegs = segTangents.length;
@@ -505,7 +505,7 @@ export class SweepKernel {
         U_node = segU[nextSegIdx];
         V_node = segV[nextSegIdx];
         const dotIn = Math.max(-1, Math.min(1, tIn.dot(tOut)));
-        isCorner = dotIn < 0.9397; // Esquina >= 20°
+        isCorner = dotIn < 0.9397; // Corner >= 20°
       } else {
         if (i === 0) {
           tIn = segTangents[0];
@@ -532,12 +532,12 @@ export class SweepKernel {
       const nodeSection: Vec3[] = [];
 
       if (!isCorner) {
-        // Tramo recto: sección transversal ortogonal directa
+        // Straight span: direct orthogonal cross-section
         for (let j = 0; j < k; j++) {
           nodeSection.push(nodePos.add(U_node.scale(uCoords[j])).add(V_node.scale(vCoords[j])));
         }
       } else {
-        // Quiebre con inglete: la normal exacta al plano bisector de corte es normalize(tIn + tOut)
+        // Miter corner: the exact normal to the cutting bisector plane is normalize(tIn + tOut)
         const miterDiff = tIn.add(tOut);
         const miterNormal = miterDiff.lengthSq() > GeometryTolerance.MATH_EPSILON
           ? miterDiff.normalize()
@@ -562,13 +562,13 @@ export class SweepKernel {
       sections.push(nodeSection);
     }
 
-    // 8. Construir la malla B-Rep (PolyMesh)
+    // 8. Construct B-Rep mesh (PolyMesh)
     const polyMesh = new PolyMesh(meshId);
 
-    // 8.1 Caras laterales (Quads / Triangles según coplanaridad)
-    //     Para bucles abiertos: sections.length == numNodes, iteramos i=0..numNodes-2.
-    //     Para bucles cerrados: sections.length == numNodes-1 (nodos únicos), iteramos todos
-    //     con cierre modular: sB = sections[(i+1) % sections.length].
+    // 8.1 Lateral faces (Quads / Triangles depending on coplanarity)
+    //     For open loops: sections.length == numNodes, iterate i=0..numNodes-2.
+    //     For closed loops: sections.length == numNodes-1 (unique nodes), iterate all
+    //     with modular closure: sB = sections[(i+1) % sections.length].
     const numFaceSteps = closed ? sections.length : sections.length - 1;
     for (let i = 0; i < numFaceSteps; i++) {
       const sA = sections[i];
@@ -596,7 +596,7 @@ export class SweepKernel {
       }
     }
 
-    // 8.2 Tapas de cierre en trayectorias abiertas
+    // 8.2 End caps on open paths
     if (!closed) {
       polyMesh.addFace([...sections[0]].reverse(), segTangents[0].negate());
       polyMesh.addFace([...sections[sections.length - 1]], segTangents[segTangents.length - 1]);
@@ -607,7 +607,7 @@ export class SweepKernel {
   }
 
   /**
-   * Rota un vector 3D alrededor de un eje arbitrario unitario por un ángulo en radianes (Fórmula de Rodrigues).
+   * Rotates a 3D vector around an arbitrary unit axis by an angle in radians (Rodrigues' rotation formula).
    */
   private static rotateVectorAroundAxis(v: Vec3, axis: Vec3, angle: number): Vec3 {
     const cosA = Math.cos(angle);
