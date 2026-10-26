@@ -34,6 +34,21 @@ Try it directly in your browser with zero installation:
 - **Precision Snapping Measurement:** Point-to-point and edge measurement with BVH-accelerated raycasting.
 - **Direct Bridge:** Instant "Edit in Croquera" action to seamlessly open your model in [Croquera.com](https://croquera.com).
 
+### Performance & Benchmarks
+
+`croquera-ifc-viewer` is engineered for extreme streaming throughput and instant in-browser response, eliminating the memory and parsing bottlenecks that freeze web browsers when opening massive IFC files.
+
+Tested under identical Node.js v24 execution environments against `ifclite` (Rust / WASM):
+
+| Model | File Size | Entities | Ingestion & STEP Indexing | Time-to-First-Frame (AABB) | Total Processing |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **EmergenciaNorte_Base** *(Building)* | 4.81 MB | 80,397 | **Croquera: 25 ms** (12x faster)<br>IFCLite: 302 ms | **Croquera: 54 ms**<br>IFCLite: > 300 ms | **1.63 s** (Croquera)<br>1.48 s (IFCLite) |
+| **Luminarias_Original** *(MEP)* | 5.75 MB | 91,204 | **Croquera: 35 ms** (11.7x faster)<br>IFCLite: 410 ms | **Croquera: 3 ms**<br>IFCLite: > 400 ms | **358 ms** (Croquera)<br>506 ms (IFCLite) |
+| **model_6_arc** *(Architecture)* | 535.8 MB | 10,906,295 | **Croquera: 1.56 s** (24.2x faster)<br>IFCLite: 37.97 s | **Croquera: 76 ms** (Ready in 1.6 s)<br>IFCLite: > 38 s | **57.2 s** (Croquera)<br>55.2 s (IFCLite) |
+| **VespucioNorte** *(Infrastructure)* | 924.6 MB | 16,786,443 | **Croquera: 2.70 s** (22.1x faster)<br>IFCLite: 59.92 s | **Croquera: 470 ms** (Ready in 3.1 s)<br>IFCLite: > 60 s | **3.0 min** (Croquera)<br>2.9 min (IFCLite) |
+
+> See the full methodology, hardware specifications, and all 7 tested models in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
 ### Packages
 - **`@croquera/ifc-core`**: Decoupled IFC 4.3 streaming parser, topological B-Rep solver, and geometry evaluation engine.
 - **`@croquera/ifc-viewer`**: Buffer-first Three.js rendering layer, batched pools, camera rig, and measurement tools.
@@ -66,6 +81,11 @@ Pruébalo directamente en el navegador sin instalar dependencias:
 - **Búsqueda Instantánea de GUID:** Localización O(1) con auto-encuadre de cámara.
 - **Herramienta de Medición con Snap:** Medición de precisión sobre aristas y vértices acelerada con BVH.
 - **Puente Directo:** Botón "Editar en Croquera" para continuar modelando en [Croquera.com](https://croquera.com) con un solo clic.
+
+### Rendimiento y Benchmarks
+- **22x a 24x más rápido en ingesta masiva:** `ChunkedStreamScanner` indexa 16,7 millones de entidades en **2,7 segundos** (frente a 60 s en parsers tradicionales).
+- **Cámara lista en menos de 3,2 s sobre 1 GB:** Encuadre AABB instantáneo para que el usuario navegue de inmediato mientras las mallas se descargan en segundo plano.
+- Detalles metodológicos completos y los 7 modelos analizados en [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ---
 
