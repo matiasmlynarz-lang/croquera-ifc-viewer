@@ -5,9 +5,16 @@
 
 An ultra-performant, zero-dependency, open-source IFC 4.3 viewer designed for instant in-browser loading, zero-copy GPU tessellation, GUID search, and high-precision spatial measurements.
 
+**Live Demo / Demostración en Vivo:**  
+[https://www.vivemejor.cl/croquera/viewer/](https://www.vivemejor.cl/croquera/viewer/)
+
 ---
 
 ## English
+
+### Live Demo
+Try it directly in your browser with zero installation:  
+[https://www.vivemejor.cl/croquera/viewer/](https://www.vivemejor.cl/croquera/viewer/)
 
 ### Highlights
 - **Lightning Fast Streaming:** Progressive 3-stage loading with instant camera framing (< 500 ms) and zero-copy `ArrayBuffer` transfer to Web Workers.
@@ -37,6 +44,10 @@ npm test
 ---
 
 ## Español
+
+### Demostración en Línea
+Pruébalo directamente en el navegador sin instalar dependencias:  
+[https://www.vivemejor.cl/croquera/viewer/](https://www.vivemejor.cl/croquera/viewer/)
 
 ### Características Destacadas
 - **Streaming Ultrarrápido:** Ingesta progresiva en 3 etapas con encuadre de cámara instantáneo (< 500 ms) y transferencia `zero-copy` a Web Workers.
