@@ -8,8 +8,8 @@
 [![Web Workers](https://img.shields.io/badge/Web_Workers-Multi--Threaded-6366F1.svg)](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API)
 [![Live Demo](https://img.shields.io/badge/Live_Demo-Online-2563EB.svg)](https://www.vivemejor.cl/croquera/viewer/)
 
-> **The fastest web-based IFC viewer in the market.**  
-> *El visualizador IFC en navegador más rápido del mercado.*
+> **One of the fastest web-based IFC viewers in the market.**  
+> *Uno de los visualizadores IFC en navegador más rápidos del mercado.*
 
 An ultra-performant, zero-dependency, open-source IFC 4.3 viewer designed for instant in-browser loading, zero-copy GPU tessellation, GUID search, and high-precision spatial measurements.
 
@@ -36,18 +36,20 @@ Try it directly in your browser with zero installation:
 
 ### Performance & Benchmarks
 
-`croquera-ifc-viewer` is engineered for extreme streaming throughput and instant in-browser response, eliminating the memory and parsing bottlenecks that freeze web browsers when opening massive IFC files.
+`croquera-ifc-viewer` prioritizes **early model availability and interactive responsiveness**, while recognizing that compiled native engines (such as IFCLite's Rust/WASM) offer higher raw throughput in pure geometric computation.
 
-Tested under identical Node.js v24 execution environments against `ifclite` (Rust / WASM):
+For an interactive 3D viewer, the most critical user experience factor is how quickly the user can inspect, orbit, and navigate the model:
 
-| Model | File Size | Entities | Ingestion & STEP Indexing | Time-to-First-Frame (AABB) | Total Processing |
+| Model | File Size | Entities | STEP Ingestion & Indexing | Time-to-First-Frame (AABB) | Total End-to-End |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **EmergenciaNorte_Base** *(Building)* | 4.81 MB | 80,397 | **Croquera: 25 ms** (12x faster)<br>IFCLite: 302 ms | **Croquera: 54 ms**<br>IFCLite: > 300 ms | **1.63 s** (Croquera)<br>1.48 s (IFCLite) |
 | **Luminarias_Original** *(MEP)* | 5.75 MB | 91,204 | **Croquera: 35 ms** (11.7x faster)<br>IFCLite: 410 ms | **Croquera: 3 ms**<br>IFCLite: > 400 ms | **358 ms** (Croquera)<br>506 ms (IFCLite) |
 | **model_6_arc** *(Architecture)* | 535.8 MB | 10,906,295 | **Croquera: 1.56 s** (24.2x faster)<br>IFCLite: 37.97 s | **Croquera: 76 ms** (Ready in 1.6 s)<br>IFCLite: > 38 s | **57.2 s** (Croquera)<br>55.2 s (IFCLite) |
 | **VespucioNorte** *(Infrastructure)* | 924.6 MB | 16,786,443 | **Croquera: 2.70 s** (22.1x faster)<br>IFCLite: 59.92 s | **Croquera: 470 ms** (Ready in 3.1 s)<br>IFCLite: > 60 s | **3.0 min** (Croquera)<br>2.9 min (IFCLite) |
 
-> See the full methodology, hardware specifications, and all 7 tested models in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+> **Architectural Takeaway:** Croquera prioritizes early model availability; IFCLite offers higher raw throughput in pure geometric computation. By indexing gigabyte-scale models in 2.7 seconds instead of 60 seconds, Croquera delivers an interactive camera and spatial hierarchy almost immediately, while geometry streams progressively in the background.
+>
+> *Note: Croquera outputs consolidated semantic elements (`IfcProduct`), whereas IFCLite emits granular batch primitives (`MeshData`). Full methodology and metrics in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).*
 
 ### Packages
 - **`@croquera/ifc-core`**: Decoupled IFC 4.3 streaming parser, topological B-Rep solver, and geometry evaluation engine.
@@ -83,9 +85,10 @@ Pruébalo directamente en el navegador sin instalar dependencias:
 - **Puente Directo:** Botón "Editar en Croquera" para continuar modelando en [Croquera.com](https://croquera.com) con un solo clic.
 
 ### Rendimiento y Benchmarks
-- **22x a 24x más rápido en ingesta masiva:** `ChunkedStreamScanner` indexa 16,7 millones de entidades en **2,7 segundos** (frente a 60 s en parsers tradicionales).
-- **Cámara lista en menos de 3,2 s sobre 1 GB:** Encuadre AABB instantáneo para que el usuario navegue de inmediato mientras las mallas se descargan en segundo plano.
-- Detalles metodológicos completos y los 7 modelos analizados en [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+- **Ingesta ultrarrápida (22x a 24x más veloz):** `ChunkedStreamScanner` indexa 16,7 millones de entidades en **2,7 segundos** (frente a 60 s en parsers tradicionales).
+- **Cámara lista en segundos (Time-to-First-Frame):** Encuadre AABB instantáneo (< 500 ms promedio, 3,1 s sobre 1 GB) para que el usuario navegue de inmediato mientras las mallas se descargan en segundo plano.
+- **Perfil de Teselación:** Los motores nativos (Rust/WASM) calculan mallas triangulares 1,5x a 3,2x más rápido, pero la ingesta plana de Croquera absorbe esa diferencia logrando tiempos globales equivalentes y visualización instantánea.
+- Detalles metodológicos completos y comparativa de los 7 modelos en [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ---
 

@@ -10,11 +10,14 @@
     "dev": "npm run dev --workspace=apps/web-viewer",
     "build": "npm run build --workspaces",
     "test": "vitest run",
+    "benchmark": "tsx scripts/benchmark.ts",
+    "benchmark:large": "node --max-old-space-size=8192 --loader tsx scripts/benchmark.ts",
     "typecheck": "tsc --build"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/three": "^0.174.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.8.2",
     "vite": "^6.2.0",
     "vitest": "^4.1.11"
