@@ -143,8 +143,6 @@ const viewer = new Viewer3D({
           window.backend.recibirElementoSeleccionado(element.id || String(element.stepId));
         }
       }
-    } else {
-      propertiesCard.hide();
     }
   },
 });
@@ -229,6 +227,86 @@ const combinedSceneBounds = new THREE.Box3();
 let hasEstablishedGlobalRenderOffset = false;
 const globalWorldRenderOffset = new THREE.Vector3(0, 0, 0);
 
+let currentIngestId = 0;
+let isIsolated = false;
+let mainDwgGroup: THREE.Group | null = null;
+let idPeticionGlobal = 0;
+let procesandoCola = false;
+let totalEnColaHist = 0;
+let procesadosContextos = 0;
+
+interface ContextQueueItem {
+  url: string;
+  nombre: string;
+}
+const colaDeCarga: ContextQueueItem[] = [];
+
+// Context Pools para modelos IFC (un BatchedMeshPool por modelo para gestión limpia)
+const contextIfcPools = new Map<string, BatchedMeshPool>();
+// Context Groups para modelos DWG
+const contextDwgGroups = new Map<string, THREE.Group>();
+
+function restoreIsolation() {
+  if (!isIsolated) return;
+  const elements = viewer.meshPool.getAllElements();
+  for (const el of elements) {
+    if ((el.mesh as any).isBatchedMesh && el.batchId !== undefined) {
+      (el.mesh as THREE.BatchedMesh).setVisibleAt(el.batchId, true);
+    } else if (el.mesh instanceof THREE.Mesh) {
+      el.mesh.visible = true;
+    }
+  }
+  isIsolated = false;
+}
+
+/**
+ * Limpia integralmente el viewport, geometrías, árboles, memorias intermedias y tarjetas de propiedades.
+ * Garantiza que cada nueva carga sustituya por completo la escena previa, permitiendo la federación
+ * exclusivamente cuando el usuario selecciona múltiples archivos en una sola acción.
+ */
+function resetViewportScene(): void {
+  currentIngestId++;
+  idPeticionGlobal++;
+  colaDeCarga.length = 0;
+  procesandoCola = false;
+  totalEnColaHist = 0;
+  procesadosContextos = 0;
+
+  restoreIsolation();
+  viewer.meshPool.clear();
+  viewer.clearSelection();
+  modelManager.clear();
+  hasEstablishedGlobalRenderOffset = false;
+  globalWorldRenderOffset.set(0, 0, 0);
+
+  if (mainDwgGroup) {
+    viewer.scene.remove(mainDwgGroup);
+    mainDwgGroup = null;
+  }
+
+  for (const [, pool] of contextIfcPools) {
+    pool.dispose();
+  }
+  contextIfcPools.clear();
+
+  for (const [, group] of contextDwgGroups) {
+    viewer.scene.remove(group);
+    group.traverse((c) => {
+      if ((c as THREE.Mesh).geometry) (c as THREE.Mesh).geometry.dispose();
+    });
+  }
+  contextDwgGroups.clear();
+  combinedSceneBounds.makeEmpty();
+
+  propertiesCard.closeAll();
+  searchFlyout.clear();
+  searchEngine.markDirty();
+  topHud.setMeasureActive(false);
+  measureTool.deactivate();
+  condIdToStepIdsMap.clear();
+  stepIdToCondIdMap.clear();
+}
+
 // ── Fase 3: ModelManager — Federación de Múltiples Modelos IFC ─────────────────
 export interface LoadedModelEntry {
   modelId: string;
@@ -293,6 +371,10 @@ const modelManager = new ModelManager();
 async function loadIfcFilesBatch(files: File[]): Promise<void> {
   if (files.length === 0) return;
 
+  // Limpiar viewport y estado antes de iniciar la nueva carga.
+  // La federación ocurre exclusivamente entre los modelos seleccionados juntos en este lote.
+  resetViewportScene();
+
   const batchStartTime = performance.now();
   const totalFiles = files.length;
 
@@ -315,7 +397,6 @@ async function loadIfcFile(file: File, batchIndex: number = 1, batchTotal: numbe
   const prefix = batchTotal > 1 ? `[Cargando ${batchIndex} de ${batchTotal} archivos] ` : '';
   statusHud.setLoading(`${prefix}Streaming ${file.name} (${(file.size / (1024 * 1024)).toFixed(1)} MB)...`);
 
-  propertiesCard.hide();
   searchEngine.markDirty();
   topHud.setMeasureActive(false);
   measureTool.deactivate();
@@ -331,8 +412,6 @@ async function loadIfcFile(file: File, batchIndex: number = 1, batchTotal: numbe
 }
 
 // ── Core Buffer Ingestion Engine (Federated Multi-Model Support) ───────────────
-let currentIngestId = 0;
-
 function parseIfcBufferFederated(
   buffer: ArrayBuffer,
   filename: string,
@@ -518,17 +597,7 @@ window.cargarModeloIFC = async function (url: string, archivo: string): Promise<
   statusHud.setLoading(`Descargando geometría IFC: ${archivo}...`);
   const startTime = performance.now();
 
-  restoreIsolation();
-  viewer.meshPool.clear();
-  modelManager.clear();
-  hasEstablishedGlobalRenderOffset = false;
-  globalWorldRenderOffset.set(0, 0, 0);
-  combinedSceneBounds.makeEmpty();
-  propertiesCard.hide();
-  searchFlyout.clear();
-  searchEngine.markDirty();
-  topHud.setMeasureActive(false);
-  measureTool.deactivate();
+  resetViewportScene();
 
   try {
     const response = await fetch(url);
@@ -598,21 +667,6 @@ window.resaltarElementoPorID = async function (id: string, expressIDs?: number[]
 };
 
 // ── AIF IPC API: Aislar Elementos por ExpressIDs ─────────────────────────────────
-let isIsolated = false;
-
-function restoreIsolation() {
-  if (!isIsolated) return;
-  const elements = viewer.meshPool.getAllElements();
-  for (const el of elements) {
-    if ((el.mesh as any).isBatchedMesh && el.batchId !== undefined) {
-      (el.mesh as THREE.BatchedMesh).setVisibleAt(el.batchId, true);
-    } else if (el.mesh instanceof THREE.Mesh) {
-      el.mesh.visible = true;
-    }
-  }
-  isIsolated = false;
-}
-
 window.aislarPorExpressIDs = async function (expressIDs: number[]): Promise<void> {
   if (!expressIDs || expressIDs.length === 0) {
     restoreIsolation();
@@ -644,8 +698,6 @@ window.aislarPorExpressIDs = async function (expressIDs: number[]): Promise<void
 };
 
 // ── AIF IPC API: Carga de Geometría DWG Principal ──────────────────────────────
-let mainDwgGroup: THREE.Group | null = null;
-
 function createTextMesh(text: string, colorHex: string, height: number, align?: string): THREE.Mesh {
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d')!;
@@ -760,22 +812,6 @@ window.cargarModeloDWG = async function (url: string, archivo: string): Promise<
 };
 
 // ── AIF IPC API: Carga Secuencial de Modelos de Contexto (IFC y DWG) ────────────
-interface ContextQueueItem {
-  url: string;
-  nombre: string;
-}
-
-const colaDeCarga: ContextQueueItem[] = [];
-let procesandoCola = false;
-let totalEnColaHist = 0;
-let procesadosContextos = 0;
-let idPeticionGlobal = 0;
-
-// Context Pools para modelos IFC (un BatchedMeshPool por modelo para gestión limpia)
-const contextIfcPools = new Map<string, BatchedMeshPool>();
-// Context Groups para modelos DWG
-const contextDwgGroups = new Map<string, THREE.Group>();
-
 const contextGhostMaterial = new THREE.MeshPhysicalMaterial({
   color: 0x94a3b8, // Slate gray arquitectónico
   transparent: true,
@@ -1023,46 +1059,7 @@ window.limpiarContextos = function (): void {
 
 // ── AIF IPC API: Limpieza Completa de la Escena ────────────────────────────────
 window.limpiarEscenaCompleta = function (): void {
-  currentIngestId++;
-  idPeticionGlobal++;
-  colaDeCarga.length = 0;
-  procesandoCola = false;
-  totalEnColaHist = 0;
-  procesadosContextos = 0;
-
-  restoreIsolation();
-  viewer.meshPool.clear();
-  viewer.clearSelection();
-  modelManager.clear();
-  hasEstablishedGlobalRenderOffset = false;
-  globalWorldRenderOffset.set(0, 0, 0);
-
-  if (mainDwgGroup) {
-    viewer.scene.remove(mainDwgGroup);
-    mainDwgGroup = null;
-  }
-
-  for (const [, pool] of contextIfcPools) {
-    pool.dispose();
-  }
-  contextIfcPools.clear();
-
-  for (const [, group] of contextDwgGroups) {
-    viewer.scene.remove(group);
-    group.traverse((c) => {
-      if ((c as THREE.Mesh).geometry) (c as THREE.Mesh).geometry.dispose();
-    });
-  }
-  contextDwgGroups.clear();
-  combinedSceneBounds.makeEmpty();
-
-  propertiesCard.hide();
-  searchFlyout.clear();
-  searchEngine.markDirty();
-  topHud.setMeasureActive(false);
-  measureTool.deactivate();
-  condIdToStepIdsMap.clear();
-  stepIdToCondIdMap.clear();
+  resetViewportScene();
   statusHud.setReady('Escena limpia y lista.');
 };
 

@@ -251,25 +251,33 @@ body, html, #app {
   to { opacity: 1; }
 }
 
-/* ─── Element Properties Floating Card (Bottom-Right) ────────── */
+/* ─── Element Properties Floating Cards (Multi-Card Draggable) ─ */
+.properties-cards-root {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 20;
+}
+
 .properties-card {
   position: absolute;
-  bottom: 16px;
-  right: 16px;
   width: 320px;
   max-height: 480px;
   background: var(--bg-surface);
   border-radius: 12px;
   box-shadow: var(--shadow-floating);
   border: 1px solid rgba(255, 255, 255, 0.7);
-  z-index: 10;
-  display: none;
+  pointer-events: auto;
+  display: flex;
   flex-direction: column;
   overflow: hidden;
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
 }
 
-.properties-card.visible {
-  display: flex;
+.properties-card.highlight {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.4), var(--shadow-floating);
 }
 
 .card-header {
@@ -279,12 +287,22 @@ body, html, #app {
   align-items: center;
   justify-content: space-between;
   background: var(--bg-elevated);
+  cursor: grab;
+  user-select: none;
+}
+
+.card-header.is-dragging {
+  cursor: grabbing;
 }
 
 .card-title {
   font-weight: 700;
   font-size: 12px;
   color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 250px;
 }
 
 .card-close {
@@ -292,12 +310,16 @@ body, html, #app {
   border: none;
   cursor: pointer;
   color: var(--text-muted);
-  font-size: 16px;
+  font-size: 18px;
   line-height: 1;
+  padding: 2px 6px;
+  border-radius: 4px;
+  transition: color 0.15s ease, background 0.15s ease;
 }
 
 .card-close:hover {
-  color: var(--text-primary);
+  color: var(--accent-red);
+  background: rgba(239, 68, 68, 0.1);
 }
 
 .card-body {
@@ -311,7 +333,52 @@ body, html, #app {
 .prop-row {
   display: flex;
   justify-content: space-between;
+  align-items: center;
   font-size: 11px;
+}
+
+.prop-row-guid {
+  align-items: center;
+}
+
+.prop-guid-container {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 65%;
+}
+
+.prop-guid-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+}
+
+.btn-copy-guid {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  padding: 3px 5px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.btn-copy-guid:hover {
+  color: var(--accent-blue);
+  border-color: var(--accent-blue);
+  background: #ffffff;
+}
+
+.btn-copy-guid.copied {
+  border-color: #16a34a;
+  background: rgba(22, 163, 74, 0.1);
+  color: #16a34a;
 }
 
 .prop-label {
