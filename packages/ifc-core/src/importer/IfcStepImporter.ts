@@ -1050,6 +1050,7 @@ export class IfcStepImporter {
       parsedLevels: this.parsedLevels,
       defaultBuildingId: this.defaultBuildingId,
       georef: this.finalizeGeoref(),
+      siteOffset: this.getSiteOffsetCroquera(),
     };
   }
 
@@ -1320,6 +1321,7 @@ export class IfcStepImporter {
         min: [modelMin.x, modelMin.y, modelMin.z],
         max: [modelMax.x, modelMax.y, modelMax.z],
       },
+      siteOffset: this.getSiteOffsetCroquera(),
     };
 
     return this.cachedBoundsPayload;
@@ -9128,6 +9130,23 @@ export class IfcStepImporter {
   }
 
   /**
+   * Retorna el vector de compensación en coordenadas Croquera (Y-Up, Float64) correspondiente
+   * a la traslación neutralizada de IfcSite para mantener precisión milimétrica en Float32Array.
+   */
+  public getSiteOffsetCroquera(): [number, number, number] {
+    if (this.siteGeoTranslationCaptured) {
+      // IFC Z-Up: (X=Easting, Y=Northing, Z=Elevation)
+      // Croquera Y-Up: (X=Easting, Y=Elevation, Z=-Northing)
+      return [
+        this.capturedSiteTranslation.x,
+        this.capturedSiteTranslation.z,
+        -this.capturedSiteTranslation.y,
+      ];
+    }
+    return [0, 0, 0];
+  }
+
+  /**
    * Consolidates final georeferencing considering formal LoGeoRef 50
    * or IfcSite geodetic translation fallback.
    */
@@ -9143,6 +9162,22 @@ export class IfcStepImporter {
         this.extractedGeoref.trueNorthX = this.extractedTrueNorth.x;
         this.extractedGeoref.trueNorthY = this.extractedTrueNorth.y;
       }
+
+      // Si IFCMAPCONVERSION vino con coordenadas nulas (0,0,0) pero IfcSite tiene traslación capturada:
+      if (
+        this.siteGeoTranslationCaptured &&
+        Math.abs(this.extractedGeoref.eastings || 0) < 1e-4 &&
+        Math.abs(this.extractedGeoref.northings || 0) < 1e-4 &&
+        Math.abs(this.extractedGeoref.orthogonalHeight || 0) < 1e-4
+      ) {
+        const { x, y, z } = this.capturedSiteTranslation;
+        if (Math.abs(x) > 1e-4 || Math.abs(y) > 1e-4 || Math.abs(z) > 1e-4) {
+          this.extractedGeoref.eastings = x;
+          this.extractedGeoref.northings = y;
+          this.extractedGeoref.orthogonalHeight = z;
+        }
+      }
+
       return this.extractedGeoref;
     }
 

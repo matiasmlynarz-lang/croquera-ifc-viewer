@@ -227,6 +227,7 @@ layout.appendChild(dropOverlay.container);
 // ── Bounding Box Global de la Escena (Modelos Federados + Contextos) ───────────
 const combinedSceneBounds = new THREE.Box3();
 let hasEstablishedGlobalRenderOffset = false;
+const globalWorldRenderOffset = new THREE.Vector3(0, 0, 0);
 
 // ── Fase 3: ModelManager — Federación de Múltiples Modelos IFC ─────────────────
 export interface LoadedModelEntry {
@@ -403,27 +404,39 @@ function parseIfcBufferFederated(
         const min = boundsPayload.modelAABB.min;
         const max = boundsPayload.modelAABB.max;
 
+        const siteOff = boundsPayload.siteOffset
+          ? new THREE.Vector3(boundsPayload.siteOffset[0], boundsPayload.siteOffset[1], boundsPayload.siteOffset[2])
+          : new THREE.Vector3(0, 0, 0);
+
+        // Coordenadas absolutas de mundo (Float64) sumando siteOffset al bounding box local
+        const worldMin = new THREE.Vector3(min[0], min[1], min[2]).add(siteOff);
+        const worldMax = new THREE.Vector3(max[0], max[1], max[2]).add(siteOff);
+
         // Establecer renderOffset global únicamente con el primer modelo de la escena federada
         if (!hasEstablishedGlobalRenderOffset) {
-          const centerX = (min[0] + max[0]) / 2;
-          const centerZ = (min[2] + max[2]) / 2;
-          const minY = min[1];
+          const centerX = (worldMin.x + worldMax.x) / 2;
+          const centerZ = (worldMin.z + worldMax.z) / 2;
+          const minY = worldMin.y;
           const horizontalDist = Math.hypot(centerX, centerZ);
           const isGeoreferenced = horizontalDist > 50 || Math.abs(minY) > 50;
 
           if (isGeoreferenced) {
             const offsetY = Math.abs(minY) > 5 ? minY : 0;
-            viewer.meshPool.setRenderOffset(new THREE.Vector3(centerX, offsetY, centerZ));
+            globalWorldRenderOffset.set(centerX, offsetY, centerZ);
           } else {
-            viewer.meshPool.setRenderOffset(new THREE.Vector3(0, 0, 0));
+            globalWorldRenderOffset.set(0, 0, 0);
           }
           hasEstablishedGlobalRenderOffset = true;
         }
 
-        const off = viewer.meshPool.getRenderOffset();
+        // Calcular la compensación relativa específica para este modelo:
+        // v_GPU = v_local - modelDelta = (v_world - siteOff) - (globalWorldRenderOffset - siteOff) = v_world - globalWorldRenderOffset
+        const modelDelta = globalWorldRenderOffset.clone().sub(siteOff);
+        viewer.meshPool.setRenderOffset(modelDelta);
+
         initialBox = new THREE.Box3(
-          new THREE.Vector3(min[0] - off.x, min[1] - off.y, min[2] - off.z),
-          new THREE.Vector3(max[0] - off.x, max[1] - off.y, max[2] - off.z)
+          worldMin.clone().sub(globalWorldRenderOffset),
+          worldMax.clone().sub(globalWorldRenderOffset)
         );
         modelBox.copy(initialBox);
         combinedSceneBounds.union(initialBox);
@@ -509,6 +522,7 @@ window.cargarModeloIFC = async function (url: string, archivo: string): Promise<
   viewer.meshPool.clear();
   modelManager.clear();
   hasEstablishedGlobalRenderOffset = false;
+  globalWorldRenderOffset.set(0, 0, 0);
   combinedSceneBounds.makeEmpty();
   propertiesCard.hide();
   searchFlyout.clear();
@@ -899,20 +913,30 @@ async function cargarModeloIFCContexto(url: string, nombre: string, myId: number
       }
 
       if (response.type === 'STAGE_BOUNDS_AABB') {
+        const boundsPayload = response as Stage2BoundsPayload;
+        const min = boundsPayload.modelAABB.min;
+        const max = boundsPayload.modelAABB.max;
+
+        const siteOff = boundsPayload.siteOffset
+          ? new THREE.Vector3(boundsPayload.siteOffset[0], boundsPayload.siteOffset[1], boundsPayload.siteOffset[2])
+          : new THREE.Vector3(0, 0, 0);
+
+        const worldMin = new THREE.Vector3(min[0], min[1], min[2]).add(siteOff);
+        const worldMax = new THREE.Vector3(max[0], max[1], max[2]).add(siteOff);
+
         // Si no se había definido el renderOffset global (primer modelo), definirlo
-        if (!hasEstablishedGlobalRenderOffset && viewer.meshPool.getRenderOffset().lengthSq() === 0) {
-          const boundsPayload = response as Stage2BoundsPayload;
-          const min = boundsPayload.modelAABB.min;
-          const max = boundsPayload.modelAABB.max;
-          const centerX = (min[0] + max[0]) / 2;
-          const centerZ = (min[2] + max[2]) / 2;
-          const minY = min[1];
+        if (!hasEstablishedGlobalRenderOffset && globalWorldRenderOffset.lengthSq() === 0) {
+          const centerX = (worldMin.x + worldMax.x) / 2;
+          const centerZ = (worldMin.z + worldMax.z) / 2;
+          const minY = worldMin.y;
           if (Math.hypot(centerX, centerZ) > 50 || Math.abs(minY) > 50) {
-            viewer.meshPool.setRenderOffset(new THREE.Vector3(centerX, Math.abs(minY) > 5 ? minY : 0, centerZ));
+            globalWorldRenderOffset.set(centerX, Math.abs(minY) > 5 ? minY : 0, centerZ);
           }
           hasEstablishedGlobalRenderOffset = true;
-          contextPool.setRenderOffset(viewer.meshPool.getRenderOffset());
         }
+
+        const modelDelta = globalWorldRenderOffset.clone().sub(siteOff);
+        contextPool.setRenderOffset(modelDelta);
       } else if (response.type === 'STAGE_GEOMETRY_CHUNK') {
         const chunk = response as Stage3GeometryChunkPayload;
         contextPool.ingestChunk(chunk.elements);
@@ -1011,6 +1035,7 @@ window.limpiarEscenaCompleta = function (): void {
   viewer.clearSelection();
   modelManager.clear();
   hasEstablishedGlobalRenderOffset = false;
+  globalWorldRenderOffset.set(0, 0, 0);
 
   if (mainDwgGroup) {
     viewer.scene.remove(mainDwgGroup);

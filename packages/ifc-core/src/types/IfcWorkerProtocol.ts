@@ -221,6 +221,7 @@ export interface Stage1SpatialPayload {
   parsedLevels: { id: string; name: string; elevation: number }[];
   defaultBuildingId?: string | null;
   georef?: GeorefData | null;
+  siteOffset?: [number, number, number];
 }
 
 export interface Stage2BoundsPayload {
@@ -232,6 +233,7 @@ export interface Stage2BoundsPayload {
     min: [number, number, number];
     max: [number, number, number];
   };
+  siteOffset?: [number, number, number];
 }
 
 export interface Stage3GeometryChunkPayload {
