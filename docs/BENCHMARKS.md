@@ -1,6 +1,6 @@
 # Performance & Benchmarks — Croquera IFC Core vs. IFCLite (Motor medido en Node.js)
 
-This document provides the benchmark methodology and comparative performance analysis of **`@croquera/ifc-core`** against **`ifclite`** (`@ifc-lite/parser` v1.9.10 and `@ifc-lite/geometry` v1.9.10 Rust/WASM) across a 12-model engineering benchmark suite ranging from hospital facilities (4.81 MB) to civil infrastructure (924.65 MB).
+This document provides the benchmark methodology and comparative performance analysis of **`@croquera/ifc-core`** against **`ifclite`** (`@ifc-lite/parser` v9.6.0 and `@ifc-lite/geometry` v7.9.0 Rust/WASM) across a 12-model engineering benchmark suite ranging from hospital facilities (4.81 MB) to civil infrastructure (924.65 MB).
 
 > **Important Scope Notice (Engine Measured in Node.js):** All timings in this document measure the **core parsing and geometry engines running headlessly in Node.js v24 (V8 CLI)**, not in-browser rendering. Browser execution adds WebGL buffer uploads, shader compilation, and Web Worker message transfer overhead.
 
@@ -35,8 +35,8 @@ This document provides the benchmark methodology and comparative performance ana
 - **Memory Allocation:** Node `--max-old-space-size=8192` (8 GB heap)
 - **Engine Packages:**
   - `@croquera/ifc-core` v0.1.0 (`ChunkedStreamScanner`, `IfcStepImporter`, `StaticProfileTemplates`, `DirectCylinderGenerator`, `OpeningVoidSolver`)
-  - `@ifc-lite/parser` v1.9.10 (`IfcParser.parseColumnar`)
-  - `@ifc-lite/geometry` v1.9.10 (`GeometryProcessor.processStreaming`, WASM streaming)
+  - `@ifc-lite/parser` v9.6.0 (`parseModel` / `IfcParser.parseColumnar`)
+  - `@ifc-lite/geometry` v7.9.0 (`GeometryProcessor.processStreaming`, WASM streaming)
 
 ---
 
