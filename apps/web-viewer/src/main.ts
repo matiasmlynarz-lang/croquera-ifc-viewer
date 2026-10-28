@@ -2,8 +2,8 @@
  * main.ts — Application entry point for croquera-ifc-viewer.
  *
  * Connects the 3-stage progressive ingestion worker with buffer-first Three.js rendering,
- * GUID search, distance measurement, zero-copy bridge to croquera.com,
- * and the bidirectional QWebChannel IPC bridge for AIF_BIM_02 (supporting multiple models).
+ * native multi-file IFC federation (ModelManager), GUID search, distance measurement,
+ * zero-copy bridge to Croquera, and the bidirectional QWebChannel IPC bridge for AIF_BIM_02.
  */
 
 import './styles/viewer.css';
@@ -16,6 +16,7 @@ import { IfcAdaptiveWorkerPool } from '@croquera/ifc-core';
 import type {
   Stage2BoundsPayload,
   Stage3GeometryChunkPayload,
+  SpatialNodeDTO,
 } from '@croquera/ifc-core';
 import type { RenderedElementRecord } from '@croquera/ifc-viewer';
 
@@ -172,16 +173,25 @@ const searchFlyout = new SearchFlyout(searchEngine, {
   },
 });
 
+// ── Fase 1 & 2: Selector Nativo Múltiple e Iteración Asíncrona ─────────────────
 const fileInput = document.createElement('input');
+fileInput.id = 'ifc-file-input';
 fileInput.type = 'file';
-fileInput.accept = '.ifc,.step';
+fileInput.multiple = true;
+fileInput.accept = '.ifc,.step,.stp';
 fileInput.style.display = 'none';
 document.body.appendChild(fileInput);
 
-fileInput.addEventListener('change', () => {
-  if (fileInput.files && fileInput.files[0]) {
-    loadIfcFile(fileInput.files[0]);
-  }
+fileInput.addEventListener('change', async (event) => {
+  const target = event.target as HTMLInputElement;
+  const files = target.files;
+  if (!files || files.length === 0) return;
+
+  const fileList = Array.from(files);
+  // Limpiar el valor inmediatamente para permitir volver a cargar los mismos archivos si es necesario
+  fileInput.value = '';
+
+  await loadIfcFilesBatch(fileList);
 });
 
 const topHud = new TopHud({
@@ -205,23 +215,106 @@ topHud.getSearchSlot().appendChild(searchFlyout.container);
 layout.appendChild(topHud.container);
 
 const dropOverlay = new DropOverlay({
+  onFilesDropped: (files: File[]) => {
+    void loadIfcFilesBatch(files);
+  },
   onFileDropped: (file: File) => {
-    loadIfcFile(file);
+    void loadIfcFilesBatch([file]);
   },
 });
 layout.appendChild(dropOverlay.container);
 
-// ── Bounding Box Global de la Escena (Modelo Principal + Contextos) ─────────────
+// ── Bounding Box Global de la Escena (Modelos Federados + Contextos) ───────────
 const combinedSceneBounds = new THREE.Box3();
+let hasEstablishedGlobalRenderOffset = false;
 
-// ── Progressive IFC Streaming Ingestion (File / Local) ──────────────────────────
-async function loadIfcFile(file: File): Promise<void> {
-  statusHud.setLoading(`Streaming ${file.name} (${(file.size / (1024 * 1024)).toFixed(1)} MB)...`);
+// ── Fase 3: ModelManager — Federación de Múltiples Modelos IFC ─────────────────
+export interface LoadedModelEntry {
+  modelId: string;
+  name: string;
+  elementCount: number;
+  spatialTree: SpatialNodeDTO[];
+  bounds: THREE.Box3;
+  loadedAt: number;
+}
 
-  const startTime = performance.now();
-  viewer.meshPool.clear();
+class ModelManager {
+  public readonly loadedModels: Map<string, LoadedModelEntry> = new Map();
+  private modelSeq: number = 0;
+
+  public generateUniqueId(filename: string): string {
+    this.modelSeq++;
+    const cleanName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+    return `mdl_${this.modelSeq}_${cleanName}`;
+  }
+
+  public getTotalElements(): number {
+    let sum = 0;
+    for (const m of this.loadedModels.values()) {
+      sum += m.elementCount;
+    }
+    return sum;
+  }
+
+  public async addModel(
+    file: File,
+    buffer: ArrayBuffer,
+    batchInfo?: { current: number; total: number }
+  ): Promise<LoadedModelEntry> {
+    const modelId = this.generateUniqueId(file.name);
+    const startTime = performance.now();
+
+    const parsedData = await parseIfcBufferFederated(buffer, file.name, modelId, startTime, batchInfo);
+
+    const entry: LoadedModelEntry = {
+      modelId,
+      name: file.name,
+      elementCount: parsedData.elementCount,
+      spatialTree: parsedData.spatialNodes,
+      bounds: parsedData.modelBox,
+      loadedAt: Date.now(),
+    };
+
+    this.loadedModels.set(modelId, entry);
+    return entry;
+  }
+
+  public clear(): void {
+    this.loadedModels.clear();
+    this.modelSeq = 0;
+  }
+}
+
+const modelManager = new ModelManager();
+(window as any).__CROQUERA_MODEL_MANAGER__ = modelManager;
+
+// ── Fase 2 & 4: Carga Individual y por Lotes con Feedback Global ───────────────
+async function loadIfcFilesBatch(files: File[]): Promise<void> {
+  if (files.length === 0) return;
+
+  const batchStartTime = performance.now();
+  const totalFiles = files.length;
+
+  for (let i = 0; i < totalFiles; i++) {
+    const file = files[i];
+    await loadIfcFile(file, i + 1, totalFiles);
+  }
+
+  if (totalFiles > 1) {
+    const totalElapsed = (performance.now() - batchStartTime).toFixed(0);
+    const totalModels = modelManager.loadedModels.size;
+    const totalElements = modelManager.getTotalElements();
+    statusHud.setReady(
+      `Lote completado: ${totalFiles} archivos cargados (${totalModels} modelos en escena, ${totalElements} elementos en ${totalElapsed} ms). Viewport 120 FPS.`
+    );
+  }
+}
+
+async function loadIfcFile(file: File, batchIndex: number = 1, batchTotal: number = 1): Promise<void> {
+  const prefix = batchTotal > 1 ? `[Cargando ${batchIndex} de ${batchTotal} archivos] ` : '';
+  statusHud.setLoading(`${prefix}Streaming ${file.name} (${(file.size / (1024 * 1024)).toFixed(1)} MB)...`);
+
   propertiesCard.hide();
-  searchFlyout.clear();
   searchEngine.markDirty();
   topHud.setMeasureActive(false);
   measureTool.deactivate();
@@ -229,22 +322,49 @@ async function loadIfcFile(file: File): Promise<void> {
   try {
     croqueraBridge.setFile(file);
     const buffer = await file.arrayBuffer();
-    await parseIfcBuffer(buffer, file.name, startTime);
+    croqueraBridge.setFile(buffer, file.name);
+    await modelManager.addModel(file, buffer, { current: batchIndex, total: batchTotal });
   } catch (err: any) {
-    statusHud.setError(`Failed to process model: ${err?.message || err}`);
+    statusHud.setError(`${prefix}Failed to process ${file.name}: ${err?.message || err}`);
   }
 }
 
-// ── Core Buffer Ingestion Engine (Modelo Principal) ────────────────────────────
+// ── Core Buffer Ingestion Engine (Federated Multi-Model Support) ───────────────
 let currentIngestId = 0;
 
-function parseIfcBuffer(buffer: ArrayBuffer, filename: string, startTime: number): Promise<void> {
+function parseIfcBufferFederated(
+  buffer: ArrayBuffer,
+  filename: string,
+  modelId: string,
+  startTime: number,
+  batchInfo?: { current: number; total: number }
+): Promise<{ elementCount: number; spatialNodes: SpatialNodeDTO[]; modelBox: THREE.Box3 }> {
   currentIngestId++;
   const thisIngestId = currentIngestId;
 
   let totalParsed = 0;
   let totalExpected = 0;
   let initialBox: THREE.Box3 | null = null;
+  let spatialNodes: SpatialNodeDTO[] = [];
+  const modelBox = new THREE.Box3();
+  const remappedIdTable = new Map<string, string>();
+
+  const batchPrefix =
+    batchInfo && batchInfo.total > 1
+      ? `Cargando ${batchInfo.current} de ${batchInfo.total} archivos (${filename}) — `
+      : '';
+
+  const resolveUniqueElementId = (rawId: string): string => {
+    const cached = remappedIdTable.get(rawId);
+    if (cached) return cached;
+    if (viewer.meshPool.getElement(rawId) || viewer.meshPool.getGroup(rawId)) {
+      const namespaced = `${modelId}:${rawId}`;
+      remappedIdTable.set(rawId, namespaced);
+      return namespaced;
+    }
+    remappedIdTable.set(rawId, rawId);
+    return rawId;
+  };
 
   const updateHudProgress = () => {
     if (totalExpected > 0) {
@@ -252,42 +372,52 @@ function parseIfcBuffer(buffer: ArrayBuffer, filename: string, startTime: number
         totalExpected = totalParsed;
       }
       const pct = Math.min(99, Math.max(1, Math.round((totalParsed / totalExpected) * 100)));
-      statusHud.setLoading(`Teselando ${totalParsed} / ${totalExpected} elementos (${pct}%)...`);
+      statusHud.setLoading(`${batchPrefix}Teselando ${totalParsed} / ${totalExpected} elementos (${pct}%)...`);
     } else {
-      statusHud.setLoading(`Teselando ${totalParsed} elementos...`);
+      statusHud.setLoading(`${batchPrefix}Teselando ${totalParsed} elementos...`);
     }
   };
 
-  return new Promise<void>((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     workerPool.parseFile(buffer, 200, (response) => {
       if (thisIngestId !== currentIngestId) {
-        resolve();
+        resolve({ elementCount: totalParsed, spatialNodes, modelBox });
         return;
       }
 
       if (response.type === 'STAGE_SPATIAL_HIERARCHY') {
+        spatialNodes = response.spatialNodes || [];
         if (response.materials && response.materials.length > 0) {
-          MaterialManager.getInstance().registerMaterials(response.materials);
+          const namespacedMaterials = response.materials.map((m) => ({
+            ...m,
+            id: `${modelId}:${m.id}`,
+          }));
+          MaterialManager.getInstance().registerMaterials(namespacedMaterials);
         }
         statusHud.setLoading(
-          `Estructura espacial (${response.spatialNodes.length} nodos, ${response.materials?.length || 0} materiales)...`
+          `${batchPrefix}Estructura espacial (${spatialNodes.length} nodos, ${response.materials?.length || 0} materiales)...`
         );
       } else if (response.type === 'STAGE_BOUNDS_AABB') {
         const boundsPayload = response as Stage2BoundsPayload;
         totalExpected = boundsPayload.totalModelElements || boundsPayload.totalElements;
         const min = boundsPayload.modelAABB.min;
         const max = boundsPayload.modelAABB.max;
-        const centerX = (min[0] + max[0]) / 2;
-        const centerZ = (min[2] + max[2]) / 2;
-        const minY = min[1];
-        const horizontalDist = Math.hypot(centerX, centerZ);
-        const isGeoreferenced = horizontalDist > 50 || Math.abs(minY) > 50;
 
-        if (isGeoreferenced) {
-          const offsetY = Math.abs(minY) > 5 ? minY : 0;
-          viewer.meshPool.setRenderOffset(new THREE.Vector3(centerX, offsetY, centerZ));
-        } else {
-          viewer.meshPool.setRenderOffset(new THREE.Vector3(0, 0, 0));
+        // Establecer renderOffset global únicamente con el primer modelo de la escena federada
+        if (!hasEstablishedGlobalRenderOffset) {
+          const centerX = (min[0] + max[0]) / 2;
+          const centerZ = (min[2] + max[2]) / 2;
+          const minY = min[1];
+          const horizontalDist = Math.hypot(centerX, centerZ);
+          const isGeoreferenced = horizontalDist > 50 || Math.abs(minY) > 50;
+
+          if (isGeoreferenced) {
+            const offsetY = Math.abs(minY) > 5 ? minY : 0;
+            viewer.meshPool.setRenderOffset(new THREE.Vector3(centerX, offsetY, centerZ));
+          } else {
+            viewer.meshPool.setRenderOffset(new THREE.Vector3(0, 0, 0));
+          }
+          hasEstablishedGlobalRenderOffset = true;
         }
 
         const off = viewer.meshPool.getRenderOffset();
@@ -295,11 +425,32 @@ function parseIfcBuffer(buffer: ArrayBuffer, filename: string, startTime: number
           new THREE.Vector3(min[0] - off.x, min[1] - off.y, min[2] - off.z),
           new THREE.Vector3(max[0] - off.x, max[1] - off.y, max[2] - off.z)
         );
-        combinedSceneBounds.copy(initialBox);
-        viewer.cameraRig.fitBounds(initialBox);
-        statusHud.setLoading(`Cámara encuadrada (${totalExpected} elementos). Cargando mallas...`);
+        modelBox.copy(initialBox);
+        combinedSceneBounds.union(initialBox);
+        viewer.cameraRig.fitBounds(combinedSceneBounds);
+        statusHud.setLoading(`${batchPrefix}Cámara encuadrada (${totalExpected} elementos). Cargando mallas...`);
       } else if (response.type === 'STAGE_GEOMETRY_CHUNK') {
         const chunk = response as Stage3GeometryChunkPayload;
+        for (const el of chunk.elements) {
+          if (el.materialId) {
+            el.materialId = `${modelId}:${el.materialId}`;
+          }
+          const isMasterProto = Boolean(el.matrixId && el.matrixId === el.id);
+          if (isMasterProto) {
+            const protoKey = `${modelId}:${el.id}`;
+            el.id = protoKey;
+            el.matrixId = protoKey;
+          } else {
+            if (el.matrixId) {
+              el.matrixId = `${modelId}:${el.matrixId}`;
+            }
+            el.id = resolveUniqueElementId(el.id);
+            if (el.parentId) {
+              el.parentId = resolveUniqueElementId(el.parentId);
+            }
+          }
+        }
+
         viewer.meshPool.ingestChunk(chunk.elements);
         totalParsed += chunk.elements.length;
         if (chunk.chunkIndex === 0 && !viewer.meshPool.modelBoundingBox.isEmpty()) {
@@ -308,16 +459,24 @@ function parseIfcBuffer(buffer: ArrayBuffer, filename: string, startTime: number
             Math.abs(initialBox.max.x - 0.5) < 0.01
           );
           if (isDummyInitialBox) {
-            combinedSceneBounds.copy(viewer.meshPool.modelBoundingBox);
-            viewer.cameraRig.fitBounds(viewer.meshPool.modelBoundingBox);
+            combinedSceneBounds.union(viewer.meshPool.modelBoundingBox);
+            viewer.cameraRig.fitBounds(combinedSceneBounds);
           }
         }
         updateHudProgress();
       } else if (response.type === 'STAGE_INSTANCE_BATCH') {
-        viewer.meshPool.ingestInstanceBatch(response.prototypeId, response.instances);
+        const namespacedProtoId = `${modelId}:${response.prototypeId}`;
+        for (const inst of response.instances) {
+          inst.id = resolveUniqueElementId(inst.id);
+          if (inst.parentId) {
+            inst.parentId = resolveUniqueElementId(inst.parentId);
+          }
+        }
+        viewer.meshPool.ingestInstanceBatch(namespacedProtoId, response.instances);
         totalParsed += response.instances.length;
         updateHudProgress();
       } else if (response.type === 'STAGE_COMPLETE') {
+        searchEngine.markDirty();
         searchEngine.rebuildIndex();
         const elapsed = (performance.now() - startTime).toFixed(0);
         if (!viewer.meshPool.modelBoundingBox.isEmpty()) {
@@ -327,12 +486,14 @@ function parseIfcBuffer(buffer: ArrayBuffer, filename: string, startTime: number
         const threadsInfo = workerPool.isMultiThreadedSupported()
           ? `${workerPool.getPoolSize()} workers`
           : '1 worker';
+        const activeCount = modelManager.loadedModels.size + 1;
+        const modelLabel = activeCount > 1 ? ` (${activeCount} modelos federados)` : '';
         statusHud.setReady(
-          `Modelo cargado: ${response.totalElements} elementos en ${elapsed} ms [${threadsInfo}]. Viewport 120 FPS.`
+          `Modelo cargado: ${response.totalElements} elementos en ${elapsed} ms [${threadsInfo}]${modelLabel}. Viewport 120 FPS.`
         );
-        resolve();
+        resolve({ elementCount: response.totalElements, spatialNodes, modelBox });
       } else if (response.type === 'STAGE_ERROR') {
-        statusHud.setError(`Error cargando modelo: ${response.error}`);
+        statusHud.setError(`${batchPrefix}Error cargando modelo: ${response.error}`);
         reject(new Error(response.error));
       }
     }, true);
@@ -346,6 +507,9 @@ window.cargarModeloIFC = async function (url: string, archivo: string): Promise<
 
   restoreIsolation();
   viewer.meshPool.clear();
+  modelManager.clear();
+  hasEstablishedGlobalRenderOffset = false;
+  combinedSceneBounds.makeEmpty();
   propertiesCard.hide();
   searchFlyout.clear();
   searchEngine.markDirty();
@@ -360,7 +524,16 @@ window.cargarModeloIFC = async function (url: string, archivo: string): Promise<
     const buffer = await response.arrayBuffer();
 
     croqueraBridge.setFile(buffer, archivo);
-    await parseIfcBuffer(buffer, archivo, startTime);
+    const modelId = modelManager.generateUniqueId(archivo);
+    const parsed = await parseIfcBufferFederated(buffer, archivo, modelId, startTime);
+    modelManager.loadedModels.set(modelId, {
+      modelId,
+      name: archivo,
+      elementCount: parsed.elementCount,
+      spatialTree: parsed.spatialNodes,
+      bounds: parsed.modelBox,
+      loadedAt: Date.now(),
+    });
   } catch (err: any) {
     statusHud.setError(`Falla al cargar modelo: ${err?.message || err}`);
     throw err;
@@ -727,7 +900,7 @@ async function cargarModeloIFCContexto(url: string, nombre: string, myId: number
 
       if (response.type === 'STAGE_BOUNDS_AABB') {
         // Si no se había definido el renderOffset global (primer modelo), definirlo
-        if (viewer.meshPool.getRenderOffset().lengthSq() === 0) {
+        if (!hasEstablishedGlobalRenderOffset && viewer.meshPool.getRenderOffset().lengthSq() === 0) {
           const boundsPayload = response as Stage2BoundsPayload;
           const min = boundsPayload.modelAABB.min;
           const max = boundsPayload.modelAABB.max;
@@ -737,6 +910,7 @@ async function cargarModeloIFCContexto(url: string, nombre: string, myId: number
           if (Math.hypot(centerX, centerZ) > 50 || Math.abs(minY) > 50) {
             viewer.meshPool.setRenderOffset(new THREE.Vector3(centerX, Math.abs(minY) > 5 ? minY : 0, centerZ));
           }
+          hasEstablishedGlobalRenderOffset = true;
           contextPool.setRenderOffset(viewer.meshPool.getRenderOffset());
         }
       } else if (response.type === 'STAGE_GEOMETRY_CHUNK') {
@@ -835,6 +1009,8 @@ window.limpiarEscenaCompleta = function (): void {
   restoreIsolation();
   viewer.meshPool.clear();
   viewer.clearSelection();
+  modelManager.clear();
+  hasEstablishedGlobalRenderOffset = false;
 
   if (mainDwgGroup) {
     viewer.scene.remove(mainDwgGroup);

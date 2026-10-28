@@ -12,7 +12,7 @@ export default defineConfig({
   server: {
     port: 3001,
     headers: {
-      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Opener-Policy': 'same-origin-allow-popups',
       'Cross-Origin-Embedder-Policy': 'require-corp',
     },
   },

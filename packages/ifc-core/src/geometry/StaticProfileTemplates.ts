@@ -8,7 +8,6 @@
  * - Single-pass SIMD-friendly scalar loops with V8 mechanical sympathy.
  */
 
-import * as THREE from 'three';
 import { GeometryTolerance } from '../math/GeometryTolerance';
 import type { DirectMeshBuffers } from './DirectCylinderGenerator';
 
@@ -58,6 +57,8 @@ export class StaticProfileTemplates {
     const ex = dx * depth;
     const ey = dy * depth;
     const ez = dz * depth;
+    const isNegZ = dz < 0;
+    const signZ = isNegZ ? -1 : 1;
 
     // 6 faces * 4 vertices = 24 vertices
     // 6 faces * 2 triangles * 3 = 36 indices
@@ -76,7 +77,8 @@ export class StaticProfileTemplates {
       p1x: number, p1y: number, p1z: number,
       p2x: number, p2y: number, p2z: number,
       p3x: number, p3y: number, p3z: number,
-      nx: number, ny: number, nz: number
+      nx: number, ny: number, nz: number,
+      flipWinding: boolean
     ) => {
       const baseV = vOff / 3;
 
@@ -96,34 +98,54 @@ export class StaticProfileTemplates {
       normals[vOff] = nx;        normals[vOff + 1] = ny;        normals[vOff + 2] = nz;
       vOff += 3;
 
-      // Triangle 1: 0, 1, 2
-      indices[iOff++] = baseV;
-      indices[iOff++] = baseV + 1;
-      indices[iOff++] = baseV + 2;
+      if (!flipWinding) {
+        // CCW Triangle 1: 0, 1, 2
+        indices[iOff++] = baseV;
+        indices[iOff++] = baseV + 1;
+        indices[iOff++] = baseV + 2;
 
-      // Triangle 2: 0, 2, 3
-      indices[iOff++] = baseV;
-      indices[iOff++] = baseV + 2;
-      indices[iOff++] = baseV + 3;
+        // CCW Triangle 2: 0, 2, 3
+        indices[iOff++] = baseV;
+        indices[iOff++] = baseV + 2;
+        indices[iOff++] = baseV + 3;
+      } else {
+        // Flipped Triangle 1: 0, 2, 1
+        indices[iOff++] = baseV;
+        indices[iOff++] = baseV + 2;
+        indices[iOff++] = baseV + 1;
+
+        // Flipped Triangle 2: 0, 3, 2
+        indices[iOff++] = baseV;
+        indices[iOff++] = baseV + 3;
+        indices[iOff++] = baseV + 2;
+      }
     };
 
-    // 1. Bottom Face (z = 0, normal: -dz)
-    addQuad(x0, y0, 0,  x1, y0, 0,  x1, y1, 0,  x0, y1, 0,  -dx, -dy, -dz);
+    const tx0 = x0 + ex;
+    const tx1 = x1 + ex;
+    const ty0 = y0 + ey;
+    const ty1 = y1 + ey;
 
-    // 2. Top Face (z = depth, normal: +dz)
-    addQuad(x0, y1, ez,  x1, y1, ez,  x1, y0, ez,  x0, y0, ez,  dx, dy, dz);
+    // 1. Bottom Face (z = 0, outward normal: (0, 0, -signZ))
+    // (x0,y0,0)->(x0,y1,0)->(x1,y1,0)->(x1,y0,0) has cross product (0, 0, -Area)
+    addQuad(x0, y0, 0,  x0, y1, 0,  x1, y1, 0,  x1, y0, 0,  0, 0, -signZ, isNegZ);
 
-    // 3. Front Face (y = y0, normal: -Y)
-    addQuad(x0, y0, 0,  x0, y0, ez,  x1, y0, ez,  x1, y0, 0,  0, -1, 0);
+    // 2. Top Face (z = ez, outward normal: (0, 0, +signZ))
+    // (tx0,ty0,ez)->(tx1,ty0,ez)->(tx1,ty1,ez)->(tx0,ty1,ez) has cross product (0, 0, +Area)
+    addQuad(tx0, ty0, ez,  tx1, ty0, ez,  tx1, ty1, ez,  tx0, ty1, ez,  0, 0, signZ, isNegZ);
 
-    // 4. Back Face (y = y1, normal: +Y)
-    addQuad(x1, y1, 0,  x1, y1, ez,  x0, y1, ez,  x0, y1, 0,  0, 1, 0);
+    // 3. Front Face (y = y0, outward normal: -Y)
+    // (x0,y0,0)->(x1,y0,0)->(tx1,ty0,ez)->(tx0,ty0,ez) has cross product (0, -dx*ez, ...)
+    addQuad(x0, y0, 0,  x1, y0, 0,  tx1, ty0, ez,  tx0, ty0, ez,  0, -1, 0, isNegZ);
 
-    // 5. Left Face (x = x0, normal: -X)
-    addQuad(x0, y1, 0,  x0, y1, ez,  x0, y0, ez,  x0, y0, 0,  -1, 0, 0);
+    // 4. Back Face (y = y1, outward normal: +Y)
+    addQuad(x1, y1, 0,  x0, y1, 0,  tx0, ty1, ez,  tx1, ty1, ez,  0, 1, 0, isNegZ);
 
-    // 6. Right Face (x = x1, normal: +X)
-    addQuad(x1, y0, 0,  x1, y0, ez,  x1, y1, ez,  x1, y1, 0,  1, 0, 0);
+    // 5. Left Face (x = x0, outward normal: -X)
+    addQuad(x0, y1, 0,  x0, y0, 0,  tx0, ty0, ez,  tx0, ty1, ez,  -1, 0, 0, isNegZ);
+
+    // 6. Right Face (x = x1, outward normal: +X)
+    addQuad(x1, y0, 0,  x1, y1, 0,  tx1, ty1, ez,  tx1, ty0, ez,  1, 0, 0, isNegZ);
 
     // 12 Feature Edges (Architectural Silhouette)
     const addEdge = (ax: number, ay: number, az: number, bx: number, by: number, bz: number) => {
@@ -138,16 +160,16 @@ export class StaticProfileTemplates {
     addEdge(x0, y1, 0,  x0, y0, 0);
 
     // Top loop
-    addEdge(x0, y0, ez,  x1, y0, ez);
-    addEdge(x1, y0, ez,  x1, y1, ez);
-    addEdge(x1, y1, ez,  x0, y1, ez);
-    addEdge(x0, y1, ez,  x0, y0, ez);
+    addEdge(tx0, ty0, ez,  tx1, ty0, ez);
+    addEdge(tx1, ty0, ez,  tx1, ty1, ez);
+    addEdge(tx1, ty1, ez,  tx0, ty1, ez);
+    addEdge(tx0, ty1, ez,  tx0, ty0, ez);
 
     // 4 Vertical pillars
-    addEdge(x0, y0, 0,  x0, y0, ez);
-    addEdge(x1, y0, 0,  x1, y0, ez);
-    addEdge(x1, y1, 0,  x1, y1, ez);
-    addEdge(x0, y1, 0,  x0, y1, ez);
+    addEdge(x0, y0, 0,  tx0, ty0, ez);
+    addEdge(x1, y0, 0,  tx1, ty0, ez);
+    addEdge(x1, y1, 0,  tx1, ty1, ez);
+    addEdge(x0, y1, 0,  tx0, ty1, ez);
 
     return { positions, normals, indices, edgesBuffer };
   }
@@ -191,6 +213,8 @@ export class StaticProfileTemplates {
     const ex = dx * depth;
     const ey = dy * depth;
     const ez = dz * depth;
+    const isNegZ = dz < 0;
+    const signZ = isNegZ ? -1 : 1;
 
     // Memory sizing:
     // Bottom cap: N vertices, numCapTris * 3 indices
@@ -212,47 +236,60 @@ export class StaticProfileTemplates {
     let iOff = 0;
     let eOff = 0;
 
-    // --- 1. Bottom Cap (z = 0, normal = [-dx, -dy, -dz]) ---
+    // --- 1. Bottom Cap (z = 0, outward normal = [0, 0, -signZ]) ---
     const botBaseVertex = vOff / 3;
-    const nBotX = -dx, nBotY = -dy, nBotZ = -dz;
+    const nBotZ = -signZ;
     for (let k = 0; k < N; k++) {
       const px = loop2D[k][0] + ox;
       const py = loop2D[k][1] + oy;
       positions[vOff]     = px;
       positions[vOff + 1] = py;
       positions[vOff + 2] = 0;
-      normals[vOff]       = nBotX;
-      normals[vOff + 1]   = nBotY;
+      normals[vOff]       = 0;
+      normals[vOff + 1]   = 0;
       normals[vOff + 2]   = nBotZ;
       vOff += 3;
     }
-    // Bottom cap triangles (reversed winding [i0, i2, i1] for outward -Z normal)
+    // Bottom cap triangles
     for (let t = 0; t < numCapTris; t++) {
       const tri = capTriangles[t];
-      indices[iOff++] = botBaseVertex + tri[0];
-      indices[iOff++] = botBaseVertex + tri[2];
-      indices[iOff++] = botBaseVertex + tri[1];
+      if (!isNegZ) {
+        indices[iOff++] = botBaseVertex + tri[0];
+        indices[iOff++] = botBaseVertex + tri[2];
+        indices[iOff++] = botBaseVertex + tri[1];
+      } else {
+        indices[iOff++] = botBaseVertex + tri[0];
+        indices[iOff++] = botBaseVertex + tri[1];
+        indices[iOff++] = botBaseVertex + tri[2];
+      }
     }
 
-    // --- 2. Top Cap (z = depth, normal = [dx, dy, dz]) ---
+    // --- 2. Top Cap (z = ez, outward normal = [0, 0, +signZ]) ---
     const topBaseVertex = vOff / 3;
+    const nTopZ = signZ;
     for (let k = 0; k < N; k++) {
       const px = loop2D[k][0] + ox + ex;
       const py = loop2D[k][1] + oy + ey;
       positions[vOff]     = px;
       positions[vOff + 1] = py;
       positions[vOff + 2] = ez;
-      normals[vOff]       = dx;
-      normals[vOff + 1]   = dy;
-      normals[vOff + 2]   = dz;
+      normals[vOff]       = 0;
+      normals[vOff + 1]   = 0;
+      normals[vOff + 2]   = nTopZ;
       vOff += 3;
     }
-    // Top cap triangles (direct winding [i0, i1, i2] for outward +Z normal)
+    // Top cap triangles
     for (let t = 0; t < numCapTris; t++) {
       const tri = capTriangles[t];
-      indices[iOff++] = topBaseVertex + tri[0];
-      indices[iOff++] = topBaseVertex + tri[1];
-      indices[iOff++] = topBaseVertex + tri[2];
+      if (!isNegZ) {
+        indices[iOff++] = topBaseVertex + tri[0];
+        indices[iOff++] = topBaseVertex + tri[1];
+        indices[iOff++] = topBaseVertex + tri[2];
+      } else {
+        indices[iOff++] = topBaseVertex + tri[0];
+        indices[iOff++] = topBaseVertex + tri[2];
+        indices[iOff++] = topBaseVertex + tri[1];
+      }
     }
 
     // --- 3. Lateral Faces (Hard normals per planar face) ---
@@ -273,17 +310,14 @@ export class StaticProfileTemplates {
         ny = -dEdgeX / edgeLen;
       }
 
-      // If extrusion has non-Z tilt, cross product (P1 - P0) x (ex, ey, ez)
+      // If extrusion has non-Z tilt, cross product signZ * ((P1 - P0) x (ex, ey, ez))
       let faceNx = nx;
       let faceNy = ny;
       let faceNz = 0;
       if (Math.abs(dx) > 1e-6 || Math.abs(dy) > 1e-6) {
-        // cx = dEdgeY * ez - 0 * ey = dEdgeY * ez
-        // cy = 0 * ex - dEdgeX * ez = -dEdgeX * ez
-        // cz = dEdgeX * ey - dEdgeY * ex
-        const cx = dEdgeY * ez;
-        const cy = -dEdgeX * ez;
-        const cz = dEdgeX * ey - dEdgeY * ex;
+        const cx = dEdgeY * ez * signZ;
+        const cy = -dEdgeX * ez * signZ;
+        const cz = (dEdgeX * ey - dEdgeY * ex) * signZ;
         const cLen = Math.sqrt(cx * cx + cy * cy + cz * cz);
         if (cLen > 1e-12) {
           faceNx = cx / cLen;
@@ -330,15 +364,27 @@ export class StaticProfileTemplates {
       normals[vOff + 2]   = faceNz;
       vOff += 3;
 
-      // Triangle 1: V0, V1, V2
-      indices[iOff++] = baseV;
-      indices[iOff++] = baseV + 1;
-      indices[iOff++] = baseV + 2;
+      if (!isNegZ) {
+        // Triangle 1: V0, V1, V2
+        indices[iOff++] = baseV;
+        indices[iOff++] = baseV + 1;
+        indices[iOff++] = baseV + 2;
 
-      // Triangle 2: V0, V2, V3
-      indices[iOff++] = baseV;
-      indices[iOff++] = baseV + 2;
-      indices[iOff++] = baseV + 3;
+        // Triangle 2: V0, V2, V3
+        indices[iOff++] = baseV;
+        indices[iOff++] = baseV + 2;
+        indices[iOff++] = baseV + 3;
+      } else {
+        // Flipped Triangle 1: V0, V2, V1
+        indices[iOff++] = baseV;
+        indices[iOff++] = baseV + 2;
+        indices[iOff++] = baseV + 1;
+
+        // Flipped Triangle 2: V0, V3, V2
+        indices[iOff++] = baseV;
+        indices[iOff++] = baseV + 3;
+        indices[iOff++] = baseV + 2;
+      }
     }
 
     // --- 4. Architectural Silhouette Feature Edges ---
@@ -362,17 +408,32 @@ export class StaticProfileTemplates {
       edgesBuffer[eOff++] = loop2D[nextK][1] + oy + ey;
       edgesBuffer[eOff++] = ez;
     }
-    // Longitudinal pillar edges
+    // Longitudinal pillar edges (filtered by dihedral crease threshold)
+    const latVertexStart = 2 * N;
     for (let k = 0; k < N; k++) {
-      edgesBuffer[eOff++] = loop2D[k][0] + ox;
-      edgesBuffer[eOff++] = loop2D[k][1] + oy;
-      edgesBuffer[eOff++] = 0;
-      edgesBuffer[eOff++] = loop2D[k][0] + ox + ex;
-      edgesBuffer[eOff++] = loop2D[k][1] + oy + ey;
-      edgesBuffer[eOff++] = ez;
+      const prevK = (k - 1 + N) % N;
+      const nPrevOff = (latVertexStart + prevK * 4) * 3;
+      const nCurrOff = (latVertexStart + k * 4) * 3;
+      const dot =
+        normals[nPrevOff] * normals[nCurrOff] +
+        normals[nPrevOff + 1] * normals[nCurrOff + 1] +
+        normals[nPrevOff + 2] * normals[nCurrOff + 2];
+      if (dot < GeometryTolerance.COS_CREASE_THRESHOLD) {
+        edgesBuffer[eOff++] = loop2D[k][0] + ox;
+        edgesBuffer[eOff++] = loop2D[k][1] + oy;
+        edgesBuffer[eOff++] = 0;
+        edgesBuffer[eOff++] = loop2D[k][0] + ox + ex;
+        edgesBuffer[eOff++] = loop2D[k][1] + oy + ey;
+        edgesBuffer[eOff++] = ez;
+      }
     }
 
-    return { positions, normals, indices, edgesBuffer };
+    return {
+      positions,
+      normals,
+      indices,
+      edgesBuffer: eOff === edgesBuffer.length ? edgesBuffer : edgesBuffer.subarray(0, eOff),
+    };
   }
 
   /**

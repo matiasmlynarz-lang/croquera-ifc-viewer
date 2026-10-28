@@ -21,3 +21,5 @@ Thumbs.db
 # Test & coverage
 coverage/
 *.log
+scratch/
+

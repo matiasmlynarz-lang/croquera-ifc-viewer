@@ -3,7 +3,8 @@
  */
 
 export interface DropOverlayCallbacks {
-  onFileDropped: (file: File) => void;
+  onFileDropped?: (file: File) => void;
+  onFilesDropped?: (files: File[]) => void;
 }
 
 export class DropOverlay {
@@ -19,7 +20,7 @@ export class DropOverlay {
     this.container.className = 'drop-overlay';
     this.container.innerHTML = `
       <div class="drop-box">
-        Drop IFC model here to stream & visualize
+        Drop IFC model(s) here to stream & visualize
       </div>
     `;
 
@@ -55,9 +56,22 @@ export class DropOverlay {
       this.container.classList.remove('active');
 
       if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-        const file = e.dataTransfer.files[0];
-        if (file.name.toLowerCase().endsWith('.ifc') || file.name.toLowerCase().endsWith('.step')) {
-          this.callbacks.onFileDropped(file);
+        const validFiles: File[] = [];
+        for (let i = 0; i < e.dataTransfer.files.length; i++) {
+          const f = e.dataTransfer.files[i];
+          const lower = f.name.toLowerCase();
+          if (lower.endsWith('.ifc') || lower.endsWith('.step') || lower.endsWith('.stp')) {
+            validFiles.push(f);
+          }
+        }
+        if (validFiles.length > 0) {
+          if (this.callbacks.onFilesDropped) {
+            this.callbacks.onFilesDropped(validFiles);
+          } else if (this.callbacks.onFileDropped) {
+            for (const f of validFiles) {
+              this.callbacks.onFileDropped(f);
+            }
+          }
         }
       }
     });

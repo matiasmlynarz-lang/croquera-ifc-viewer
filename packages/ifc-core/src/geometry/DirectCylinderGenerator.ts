@@ -485,6 +485,88 @@ export class DirectCylinderGenerator {
   }
 
   /**
+   * Transforms raw mesh buffers in-place within IFC Z-up space (without Z-up to Y-up canonical swap).
+   * Used when pre-baking local solid/origin matrices into reusable IfcRepresentationMap templates.
+   */
+  public static applyIfcTransformInPlace(buffers: DirectMeshBuffers, matrix: THREE.Matrix4): void {
+    const el = matrix.elements;
+    const isIdentity =
+      Math.abs(el[0] - 1) < 1e-9 && Math.abs(el[5] - 1) < 1e-9 && Math.abs(el[10] - 1) < 1e-9 &&
+      Math.abs(el[12]) < 1e-9 && Math.abs(el[13]) < 1e-9 && Math.abs(el[14]) < 1e-9 &&
+      Math.abs(el[1]) < 1e-9 && Math.abs(el[2]) < 1e-9 &&
+      Math.abs(el[4]) < 1e-9 && Math.abs(el[6]) < 1e-9 &&
+      Math.abs(el[8]) < 1e-9 && Math.abs(el[9]) < 1e-9;
+    if (isIdentity) return;
+
+    const det = matrix.determinant();
+    const isFlipped = det < 0;
+
+    const positions = buffers.positions;
+    const normals = buffers.normals;
+    const indices = buffers.indices;
+    const edges = buffers.edgesBuffer;
+    const numVerts = positions.length / 3;
+
+    for (let i = 0; i < numVerts; i++) {
+      const idx = i * 3;
+      const x = positions[idx];
+      const y = positions[idx + 1];
+      const z = positions[idx + 2];
+
+      positions[idx]     = el[0] * x + el[4] * y + el[8] * z + el[12];
+      positions[idx + 1] = el[1] * x + el[5] * y + el[9] * z + el[13];
+      positions[idx + 2] = el[2] * x + el[6] * y + el[10] * z + el[14];
+    }
+
+    for (let i = 0; i < numVerts; i++) {
+      const idx = i * 3;
+      const nx = normals[idx];
+      const ny = normals[idx + 1];
+      const nz = normals[idx + 2];
+
+      let pnx = el[0] * nx + el[4] * ny + el[8] * nz;
+      let pny = el[1] * nx + el[5] * ny + el[9] * nz;
+      let pnz = el[2] * nx + el[6] * ny + el[10] * nz;
+
+      const lenSq = pnx * pnx + pny * pny + pnz * pnz;
+      if (lenSq > 1e-12) {
+        const invLen = 1.0 / Math.sqrt(lenSq);
+        pnx *= invLen;
+        pny *= invLen;
+        pnz *= invLen;
+      }
+
+      normals[idx]     = pnx;
+      normals[idx + 1] = pny;
+      normals[idx + 2] = pnz;
+    }
+
+    if (isFlipped) {
+      const numTris = indices.length / 3;
+      for (let t = 0; t < numTris; t++) {
+        const tIdx = t * 3;
+        const tmp = indices[tIdx + 1];
+        indices[tIdx + 1] = indices[tIdx + 2];
+        indices[tIdx + 2] = tmp;
+      }
+    }
+
+    if (edges && edges.length > 0) {
+      const numEdgePts = edges.length / 3;
+      for (let i = 0; i < numEdgePts; i++) {
+        const idx = i * 3;
+        const ex = edges[idx];
+        const ey = edges[idx + 1];
+        const ez = edges[idx + 2];
+
+        edges[idx]     = el[0] * ex + el[4] * ey + el[8] * ez + el[12];
+        edges[idx + 1] = el[1] * ex + el[5] * ey + el[9] * ez + el[13];
+        edges[idx + 2] = el[2] * ex + el[6] * ey + el[10] * ez + el[14];
+      }
+    }
+  }
+
+  /**
    * Merges multiple DirectMeshBuffers into a single contiguous DirectMeshBuffers structure.
    * Eliminates fragment explosion and draw call overhead.
    */

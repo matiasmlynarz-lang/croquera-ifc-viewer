@@ -8,7 +8,6 @@
  * - Single-pass SIMD-friendly scalar loops with zero intermediate PolyMesh/CSG allocations.
  */
 
-import * as THREE from 'three';
 import { GeometryTolerance } from '../math/GeometryTolerance';
 import type { DirectMeshBuffers } from './DirectCylinderGenerator';
 

@@ -30,6 +30,7 @@ export class OpeningVoidSolver {
       positions: Vec3[];
       normal: Vec3;
       planeOrigin: Vec3;
+      centroid: Vec3;
     }
 
     const transformedOpFaces: TransformedFace[] = [];
@@ -45,7 +46,14 @@ export class OpeningVoidSolver {
         norm = new Vec3(vn.x, vn.y, vn.z).normalize();
       }
       const planeOrigin = pos[0] || Vec3.ZERO;
-      transformedOpFaces.push({ positions: pos, normal: norm, planeOrigin });
+      let cx = 0, cy = 0, cz = 0;
+      const nPos = pos.length;
+      for (let i = 0; i < nPos; i++) {
+        cx += pos[i].x; cy += pos[i].y; cz += pos[i].z;
+      }
+      const invN = 1 / Math.max(1, nPos);
+      const centroid = new Vec3(cx * invN, cy * invN, cz * invN);
+      transformedOpFaces.push({ positions: pos, normal: norm, planeOrigin, centroid });
     }
 
     for (const hostFace of hostMesh.faces.values()) {
@@ -55,11 +63,7 @@ export class OpeningVoidSolver {
 
       for (const opFace of transformedOpFaces) {
         if (hostNormal.dot(opFace.normal) < -0.99) {
-          const opCentroid = opFace.positions
-            .reduce((acc, p) => acc.add(p), Vec3.ZERO)
-            .scale(1 / Math.max(1, opFace.positions.length));
-
-          if (hostCentroid.distanceTo(opCentroid) < 1e-3) {
+          if (hostCentroid.distanceTo(opFace.centroid) < 1e-3) {
             hostFace.openingId = openingGroupId;
             taggedCount++;
             break;
@@ -83,18 +87,15 @@ export class OpeningVoidSolver {
     requireThrough: boolean = false,
     deferRebuildTopology: boolean = false
   ): boolean {
-    // Early exit if the opening void is already fully carved into the host solid topology
-    const alreadyTagged = this.tagExistingJambas(hostMesh, openingMesh, openingGroupId, matrix, isIdentity);
-    if (alreadyTagged >= 2) {
-      return true;
-    }
-
     interface OpFaceData {
       positions: Vec3[];
       normal: Vec3;
+      centroid: Vec3;
     }
 
     const transformedOpFaces: OpFaceData[] = [];
+    let minBx = Infinity, maxBx = -Infinity, minBy = Infinity, maxBy = -Infinity, minBz = Infinity, maxBz = -Infinity;
+
     for (const f of openingMesh.faces.values()) {
       let pos = f.getPositions();
       let norm = f.normal;
@@ -106,14 +107,27 @@ export class OpeningVoidSolver {
         const vn = new THREE.Vector3(norm.x, norm.y, norm.z).transformDirection(matrix);
         norm = new Vec3(vn.x, vn.y, vn.z).normalize();
       }
-      transformedOpFaces.push({ positions: pos, normal: norm });
+      let cx = 0, cy = 0, cz = 0;
+      const nPos = pos.length;
+      for (let i = 0; i < nPos; i++) {
+        const p = pos[i];
+        cx += p.x; cy += p.y; cz += p.z;
+        if (p.x < minBx) minBx = p.x; if (p.x > maxBx) maxBx = p.x;
+        if (p.y < minBy) minBy = p.y; if (p.y > maxBy) maxBy = p.y;
+        if (p.z < minBz) minBz = p.z; if (p.z > maxBz) maxBz = p.z;
+      }
+      const invN = 1 / Math.max(1, nPos);
+      transformedOpFaces.push({
+        positions: pos,
+        normal: norm,
+        centroid: new Vec3(cx * invN, cy * invN, cz * invN),
+      });
     }
 
     if (transformedOpFaces.length === 0) return false;
 
-    // Strict 3D Bounding Box (AABB) intersection check:
+    // Strict 3D Bounding Box (AABB) intersection check first:
     // A void volume can only cut the host solid if they overlap in 3D space with non-zero volume.
-    // If the opening is vertically or horizontally disjoint from host, it cannot carve any valid cavity.
     let minAx = Infinity, maxAx = -Infinity, minAy = Infinity, maxAy = -Infinity, minAz = Infinity, maxAz = -Infinity;
     for (const v of hostMesh.vertices.values()) {
       const p = v.position;
@@ -122,31 +136,37 @@ export class OpeningVoidSolver {
       if (p.z < minAz) minAz = p.z; if (p.z > maxAz) maxAz = p.z;
     }
 
-    let minBx = Infinity, maxBx = -Infinity, minBy = Infinity, maxBy = -Infinity, minBz = Infinity, maxBz = -Infinity;
-    for (const of of transformedOpFaces) {
-      for (const p of of.positions) {
-        if (p.x < minBx) minBx = p.x; if (p.x > maxBx) maxBx = p.x;
-        if (p.y < minBy) minBy = p.y; if (p.y > maxBy) maxBy = p.y;
-        if (p.z < minBz) minBz = p.z; if (p.z > maxBz) maxBz = p.z;
-      }
-    }
-
     const minTol = GeometryTolerance.COINCIDENT_VERTEX;
     const overlapX = Math.min(maxAx, maxBx) - Math.max(minAx, minBx);
     const overlapY = Math.min(maxAy, maxBy) - Math.max(minAy, minBy);
     const overlapZ = Math.min(maxAz, maxBz) - Math.max(minAz, minBz);
 
-    // Vertical elevation check: an opening can only cut a host element if it physically
-    // penetrates the host's vertical elevation range (overlapY > minTol).
-    // An opening entirely below or above the host cannot carve it (prevents lintels from extruding downwards).
     if (overlapY <= minTol) {
       return false;
     }
-
-    // Planar proximity check: the opening must overlap with the host in at least one horizontal direction (X or Z).
-    // (The other direction may represent multi-layer wall thickness penetrated along the face normal).
     if (overlapX < -minTol && overlapZ < -minTol) {
       return false;
+    }
+
+    // Early exit if the opening void is already fully carved into the host solid topology
+    let alreadyTagged = 0;
+    for (const hostFace of hostMesh.faces.values()) {
+      if (hostFace.openingId && hostFace.openingId === openingGroupId) continue;
+      const hostNormal = hostFace.normal;
+      const hostCentroid = hostFace.centroid;
+
+      for (const opFace of transformedOpFaces) {
+        if (hostNormal.dot(opFace.normal) < -0.99) {
+          if (hostCentroid.distanceTo(opFace.centroid) < 1e-3) {
+            hostFace.openingId = openingGroupId;
+            alreadyTagged++;
+            break;
+          }
+        }
+      }
+    }
+    if (alreadyTagged >= 2) {
+      return true;
     }
 
     // Boundary roof trim & top cut detection on walls:

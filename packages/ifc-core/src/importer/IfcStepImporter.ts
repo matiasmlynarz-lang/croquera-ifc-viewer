@@ -494,8 +494,15 @@ export class IfcStepImporter {
   private openingMeshCache: Map<number, { polyMesh: PolyMesh; id: string } | null> = new Map();
   private placementMatrixCache: Map<number, THREE.Matrix4> = new Map();
   private axis2PlacementCache: Map<number, THREE.Matrix4> = new Map();
-  private mepFacetedPrototypeCache: Map<number, DirectMeshBuffers | null> = new Map();
+  private mepFacetedPrototypeCache: Map<
+    number,
+    Array<{ buffers: DirectMeshBuffers; intrinsicStyleId?: string }> | null
+  > = new Map();
   private mepExtrudedPrototypeCache: Map<number, DirectMeshBuffers | null> = new Map();
+  private mappedRepDirectCache: Map<
+    number,
+    Array<{ buffers: DirectMeshBuffers; intrinsicStyleId?: string }> | null
+  > = new Map();
 
   private getInheritedStoreyGuid(stepId: number): string | null {
     let currStepId: number | undefined = stepId;
@@ -3009,22 +3016,10 @@ export class IfcStepImporter {
     defaultParentId: string | null,
     _psets?: Record<string, Record<string, any>>,
     itemToStyleMap?: Map<number, string>,
-    _faceToStyleMap?: Map<number, string>,
+    faceToStyleMap?: Map<number, string>,
     elementMaterialMap?: Map<number, string>
   ): { rootEntity: EvaluatedProductEntity; children: EvaluatedProductEntity[] } | null {
-    if (this.hostToOpeningsStepMap.has(rec.id)) {
-      return null;
-    }
-
-    if (
-      rec.type === 'IFCSITE' ||
-      rec.type === 'IFCWALL' ||
-      rec.type === 'IFCWALLSTANDARDCASE' ||
-      rec.type === 'IFCROOF' ||
-      rec.type === 'IFCWINDOW' ||
-      rec.type === 'IFCDOOR' ||
-      rec.type === 'IFCOPENINGELEMENT'
-    ) {
+    if (this.hostToOpeningsStepMap.has(rec.id) || rec.type === 'IFCOPENINGELEMENT') {
       return null;
     }
 
@@ -3050,12 +3045,7 @@ export class IfcStepImporter {
       mProduct = this.resolveLocalPlacementMatrix(placementParam.ref);
     }
 
-    interface MepItem {
-      geomRec: StepRecord;
-      mLocal: THREE.Matrix4;
-      styleId?: string;
-    }
-    const mepCandidates: MepItem[] = [];
+    const extractedParts: Array<{ buffers: DirectMeshBuffers; styleId?: string }> = [];
     let hasOtherGeometry = false;
 
     for (const item of repsList) {
@@ -3084,32 +3074,105 @@ export class IfcStepImporter {
             hasOtherGeometry = true;
             break;
           }
-          const mappedRepRef = mapRec.params[1];
-          if (!mappedRepRef || typeof mappedRepRef !== 'object' || !('ref' in mappedRepRef)) {
-            hasOtherGeometry = true;
-            break;
-          }
-          const shapeRepRec = this.records.get(mappedRepRef.ref);
-          if (!shapeRepRec) {
-            hasOtherGeometry = true;
-            break;
+
+          let cachedMapParts = this.mappedRepDirectCache.get(mapRec.id);
+          if (cachedMapParts === undefined) {
+            cachedMapParts = null;
+            const mappedRepRef = mapRec.params[1];
+            const shapeRepRec =
+              mappedRepRef && typeof mappedRepRef === 'object' && 'ref' in mappedRepRef
+                ? this.records.get(mappedRepRef.ref)
+                : undefined;
+
+            if (shapeRepRec && Array.isArray(shapeRepRec.params[3])) {
+              let mMapOrigin = new THREE.Matrix4();
+              const mapOriginParam = mapRec.params[0];
+              if (typeof mapOriginParam === 'string' && mapOriginParam.startsWith('#')) {
+                const originId = parseInt(mapOriginParam.slice(1), 10);
+                const originRec = this.records.get(originId);
+                if (originRec && originRec.type === 'IFCAXIS2PLACEMENT3D') {
+                  mMapOrigin = this.resolveAxis2Placement3D(originRec);
+                }
+              } else if (mapOriginParam && typeof mapOriginParam === 'object' && 'ref' in mapOriginParam) {
+                const originRec = this.records.get(mapOriginParam.ref);
+                if (originRec && originRec.type === 'IFCAXIS2PLACEMENT3D') {
+                  mMapOrigin = this.resolveAxis2Placement3D(originRec);
+                }
+              }
+              const mMapOriginInv = new THREE.Matrix4().copy(mMapOrigin).invert();
+              const mapRepStyleId = itemToStyleMap?.get(shapeRepRec.id);
+              const innerGeomItems = shapeRepRec.params[3];
+
+              const rawMapParts: Array<{ buffers: DirectMeshBuffers; intrinsicStyleId?: string }> = [];
+              let mapValid = true;
+              const identityMat = new THREE.Matrix4();
+
+              for (const innerItem of innerGeomItems) {
+                if (!innerItem || typeof innerItem !== 'object' || !('ref' in innerItem)) continue;
+                const innerRec = this.records.get(innerItem.ref);
+                if (!innerRec || innerRec.type === 'IFCBOUNDINGBOX') continue;
+                if (!this.isMepGeometryRecord(innerRec)) {
+                  mapValid = false;
+                  break;
+                }
+                const innerPartitions = this.extractMepItemPartitions(
+                  innerRec,
+                  mMapOriginInv,
+                  identityMat,
+                  itemToStyleMap,
+                  faceToStyleMap,
+                  false
+                );
+                if (!innerPartitions || innerPartitions.length === 0) {
+                  mapValid = false;
+                  break;
+                }
+                const innerItemStyle = itemToStyleMap?.get(innerRec.id) || mapRepStyleId;
+                for (const p of innerPartitions) {
+                  rawMapParts.push({
+                    buffers: p.buffers,
+                    intrinsicStyleId: p.intrinsicStyleId || innerItemStyle,
+                  });
+                }
+              }
+
+              if (mapValid && rawMapParts.length > 0) {
+                if (rawMapParts.length <= 16) {
+                  cachedMapParts = rawMapParts;
+                } else {
+                  const byStyle = new Map<string, DirectMeshBuffers[]>();
+                  for (const rp of rawMapParts) {
+                    const key = rp.intrinsicStyleId || '__inherited__';
+                    let grp = byStyle.get(key);
+                    if (!grp) {
+                      grp = [];
+                      byStyle.set(key, grp);
+                    }
+                    grp.push(rp.buffers);
+                  }
+                  const consolidatedMapParts: Array<{ buffers: DirectMeshBuffers; intrinsicStyleId?: string }> = [];
+                  for (const [key, list] of byStyle.entries()) {
+                    const merged = DirectCylinderGenerator.mergeDirectBuffers(list);
+                    if (merged && merged.indices.length > 0) {
+                      consolidatedMapParts.push({
+                        buffers: merged,
+                        intrinsicStyleId: key === '__inherited__' ? undefined : key,
+                      });
+                    }
+                  }
+                  if (consolidatedMapParts.length > 0) {
+                    cachedMapParts = consolidatedMapParts;
+                  }
+                }
+              }
+            }
+            this.mappedRepDirectCache.set(mapRec.id, cachedMapParts);
           }
 
-          let mMapOrigin = new THREE.Matrix4();
-          const mapOriginParam = mapRec.params[0];
-          if (typeof mapOriginParam === 'string' && mapOriginParam.startsWith('#')) {
-            const originId = parseInt(mapOriginParam.slice(1), 10);
-            const originRec = this.records.get(originId);
-            if (originRec && originRec.type === 'IFCAXIS2PLACEMENT3D') {
-              mMapOrigin = this.resolveAxis2Placement3D(originRec);
-            }
-          } else if (mapOriginParam && typeof mapOriginParam === 'object' && 'ref' in mapOriginParam) {
-            const originRec = this.records.get(mapOriginParam.ref);
-            if (originRec && originRec.type === 'IFCAXIS2PLACEMENT3D') {
-              mMapOrigin = this.resolveAxis2Placement3D(originRec);
-            }
+          if (!cachedMapParts || cachedMapParts.length === 0) {
+            hasOtherGeometry = true;
+            break;
           }
-          const mMapOriginInv = new THREE.Matrix4().copy(mMapOrigin).invert();
 
           let mOperator = new THREE.Matrix4();
           if (targetRef && typeof targetRef === 'object' && 'ref' in targetRef) {
@@ -3118,35 +3181,42 @@ export class IfcStepImporter {
               mOperator = this.resolveCartesianTransformationOperator(opRec);
             }
           }
-          const mLocal = new THREE.Matrix4().multiplyMatrices(mOperator, mMapOriginInv);
+          const mInstance = new THREE.Matrix4().multiplyMatrices(mProduct, mOperator);
           const mappedStyle = itemToStyleMap?.get(gRec.id) || repStyleId;
 
-          const innerGeomItems = shapeRepRec.params[3];
-          if (!Array.isArray(innerGeomItems)) {
+          for (const part of cachedMapParts) {
+            const cloned: DirectMeshBuffers = {
+              positions: new Float32Array(part.buffers.positions),
+              normals: new Float32Array(part.buffers.normals),
+              indices: new Uint32Array(part.buffers.indices),
+              edgesBuffer: part.buffers.edgesBuffer ? new Float32Array(part.buffers.edgesBuffer) : undefined,
+            };
+            DirectCylinderGenerator.applyTransformAndCanonicalSwap(cloned, mInstance);
+            extractedParts.push({
+              buffers: cloned,
+              styleId: part.intrinsicStyleId || mappedStyle,
+            });
+          }
+        } else if (this.isMepGeometryRecord(gRec)) {
+          const itemPartitions = this.extractMepItemPartitions(
+            gRec,
+            new THREE.Matrix4(),
+            mProduct,
+            itemToStyleMap,
+            faceToStyleMap,
+            true
+          );
+          if (!itemPartitions || itemPartitions.length === 0) {
             hasOtherGeometry = true;
             break;
           }
-          for (const innerItem of innerGeomItems) {
-            if (!innerItem || typeof innerItem !== 'object' || !('ref' in innerItem)) continue;
-            const innerRec = this.records.get(innerItem.ref);
-            if (!innerRec) continue;
-            if (this.isMepGeometryRecord(innerRec)) {
-              mepCandidates.push({
-                geomRec: innerRec,
-                mLocal,
-                styleId: itemToStyleMap?.get(innerRec.id) || mappedStyle,
-              });
-            } else {
-              hasOtherGeometry = true;
-              break;
-            }
+          const itemStyle = itemToStyleMap?.get(gRec.id) || repStyleId;
+          for (const p of itemPartitions) {
+            extractedParts.push({
+              buffers: p.buffers,
+              styleId: p.intrinsicStyleId || itemStyle,
+            });
           }
-        } else if (this.isMepGeometryRecord(gRec)) {
-          mepCandidates.push({
-            geomRec: gRec,
-            mLocal: new THREE.Matrix4(),
-            styleId: itemToStyleMap?.get(gRec.id) || repStyleId,
-          });
         } else {
           hasOtherGeometry = true;
           break;
@@ -3155,7 +3225,7 @@ export class IfcStepImporter {
       if (hasOtherGeometry) break;
     }
 
-    if (hasOtherGeometry || mepCandidates.length === 0) {
+    if (hasOtherGeometry || extractedParts.length === 0) {
       return null;
     }
 
@@ -3166,47 +3236,70 @@ export class IfcStepImporter {
     const productLevelMatId = elementMaterialMap?.get(rec.id) || itemToStyleMap?.get(rec.id);
     const isSpace = rec.type === 'IFCSPACE';
 
-    const buffersByMaterial = new Map<string, DirectMeshBuffers[]>();
-
-    for (const cand of mepCandidates) {
-      const buffers = this.extractMepItemBuffers(cand.geomRec, cand.mLocal, mProduct);
-      if (!buffers || buffers.indices.length === 0) {
-        return null;
-      }
-      const matKey = cand.styleId || productLevelMatId || '__default__';
-      let group = buffersByMaterial.get(matKey);
-      if (!group) {
-        group = [];
-        buffersByMaterial.set(matKey, group);
-      }
-      group.push(buffers);
-    }
-
     const children: EvaluatedProductEntity[] = [];
-    let childIdx = 0;
 
-    for (const [matKey, list] of buffersByMaterial.entries()) {
-      const merged = DirectCylinderGenerator.mergeDirectBuffers(list);
-      if (!merged || merged.indices.length === 0) continue;
+    if (extractedParts.length <= 16) {
+      for (let idx = 0; idx < extractedParts.length; idx++) {
+        const ep = extractedParts[idx];
+        if (ep.buffers.indices.length === 0) continue;
+        const childId = GuidUtils.createIfcGuid();
+        const matId = ep.styleId || productLevelMatId;
+        const childName =
+          extractedParts.length === 1
+            ? name
+            : `${name} [${matId || 'Parte ' + (idx + 1)}]`;
 
-      const childId = GuidUtils.createIfcGuid();
-      const matId = matKey === '__default__' ? undefined : matKey;
-      const childName = buffersByMaterial.size === 1
-        ? name
-        : `${name} [${matId || 'Parte ' + (++childIdx)}]`;
+        children.push({
+          id: childId,
+          type: 'GEOMETRY_ENTITY',
+          name: childName,
+          parentId: id,
+          rawGeometry: ep.buffers,
+          materialId: matId,
+          hidden: isSpace ? true : undefined,
+          faces: [],
+          vertices: [],
+          edges: [],
+        });
+      }
+    } else {
+      const buffersByMaterial = new Map<string, DirectMeshBuffers[]>();
+      for (const ep of extractedParts) {
+        if (ep.buffers.indices.length === 0) continue;
+        const matKey = ep.styleId || productLevelMatId || '__default__';
+        let group = buffersByMaterial.get(matKey);
+        if (!group) {
+          group = [];
+          buffersByMaterial.set(matKey, group);
+        }
+        group.push(ep.buffers);
+      }
 
-      children.push({
-        id: childId,
-        type: 'GEOMETRY_ENTITY',
-        name: childName,
-        parentId: id,
-        rawGeometry: merged,
-        materialId: matId,
-        hidden: isSpace ? true : undefined,
-        faces: [],
-        vertices: [],
-        edges: [],
-      });
+      let childIdx = 0;
+      for (const [matKey, list] of buffersByMaterial.entries()) {
+        const merged = DirectCylinderGenerator.mergeDirectBuffers(list);
+        if (!merged || merged.indices.length === 0) continue;
+
+        const childId = GuidUtils.createIfcGuid();
+        const matId = matKey === '__default__' ? undefined : matKey;
+        const childName =
+          buffersByMaterial.size === 1
+            ? name
+            : `${name} [${matId || 'Parte ' + (++childIdx)}]`;
+
+        children.push({
+          id: childId,
+          type: 'GEOMETRY_ENTITY',
+          name: childName,
+          parentId: id,
+          rawGeometry: merged,
+          materialId: matId,
+          hidden: isSpace ? true : undefined,
+          faces: [],
+          vertices: [],
+          edges: [],
+        });
+      }
     }
 
     if (children.length === 0) return null;
@@ -3263,21 +3356,37 @@ export class IfcStepImporter {
       rec.type === 'IFCSWEPTDISKSOLIDPOLYGONAL' ||
       rec.type === 'IFCREVOLVEDAREASOLID' ||
       rec.type === 'IFCSHELLBASEDSURFACEMODEL' ||
+      rec.type === 'IFCFACEBASEDSURFACEMODEL' ||
       rec.type === 'IFCFACETEDBREP' ||
+      rec.type === 'IFCFACETEDBREPWITHVOIDS' ||
       rec.type === 'IFCCLOSEDSHELL' ||
       rec.type === 'IFCOPENSHELL' ||
-      rec.type === 'IFCCONNECTEDFACESET'
+      rec.type === 'IFCCONNECTEDFACESET' ||
+      rec.type === 'IFCPOLYGONALFACESET' ||
+      rec.type === 'IFCTRIANGULATEDFACESET' ||
+      rec.type === 'IFCTRIANGULATEDIRREGULARNETWORK'
     ) {
       return true;
     }
     return false;
   }
 
-  private extractMepItemBuffers(
+  private extractMepItemPartitions(
     geomRec: StepRecord,
     mLocal: THREE.Matrix4,
-    mProduct: THREE.Matrix4
-  ): DirectMeshBuffers | null {
+    mProduct: THREE.Matrix4,
+    itemToStyleMap?: Map<number, string>,
+    faceToStyleMap?: Map<number, string>,
+    applyCanonicalSwap: boolean = true
+  ): Array<{ buffers: DirectMeshBuffers; intrinsicStyleId?: string }> | null {
+    const applyTransform = (buffers: DirectMeshBuffers, mTotal: THREE.Matrix4) => {
+      if (applyCanonicalSwap) {
+        DirectCylinderGenerator.applyTransformAndCanonicalSwap(buffers, mTotal);
+      } else {
+        DirectCylinderGenerator.applyIfcTransformInPlace(buffers, mTotal);
+      }
+    };
+
     if (geomRec.type === 'IFCEXTRUDEDAREASOLID') {
       const sweptAreaParam = geomRec.params[0];
       const positionParam = geomRec.params[1];
@@ -3455,8 +3564,8 @@ export class IfcStepImporter {
         };
 
         const mTotal = new THREE.Matrix4().copy(mProduct).multiply(mLocal).multiply(mSolid).multiply(m2D);
-        DirectCylinderGenerator.applyTransformAndCanonicalSwap(buffers, mTotal);
-        return buffers;
+        applyTransform(buffers, mTotal);
+        return [{ buffers, intrinsicStyleId: itemToStyleMap?.get(geomRec.id) }];
       }
 
       let radius = 0;
@@ -3534,8 +3643,8 @@ export class IfcStepImporter {
       };
 
       const mTotal = new THREE.Matrix4().copy(mProduct).multiply(mLocal).multiply(mSolid);
-      DirectCylinderGenerator.applyTransformAndCanonicalSwap(buffers, mTotal);
-      return buffers;
+      applyTransform(buffers, mTotal);
+      return [{ buffers, intrinsicStyleId: itemToStyleMap?.get(geomRec.id) }];
     }
 
     if (geomRec.type === 'IFCSWEPTDISKSOLID' || geomRec.type === 'IFCSWEPTDISKSOLIDPOLYGONAL') {
@@ -3600,8 +3709,8 @@ export class IfcStepImporter {
       };
 
       const mTotal = new THREE.Matrix4().copy(mProduct).multiply(mLocal);
-      DirectCylinderGenerator.applyTransformAndCanonicalSwap(buffers, mTotal);
-      return buffers;
+      applyTransform(buffers, mTotal);
+      return [{ buffers, intrinsicStyleId: itemToStyleMap?.get(geomRec.id) }];
     }
 
     if (geomRec.type === 'IFCREVOLVEDAREASOLID') {
@@ -3668,153 +3777,426 @@ export class IfcStepImporter {
       };
 
       const mTotal = new THREE.Matrix4().copy(mProduct).multiply(mLocal).multiply(mSolid);
-      DirectCylinderGenerator.applyTransformAndCanonicalSwap(buffers, mTotal);
-      return buffers;
+      applyTransform(buffers, mTotal);
+      return [{ buffers, intrinsicStyleId: itemToStyleMap?.get(geomRec.id) }];
     }
 
     if (
       geomRec.type === 'IFCSHELLBASEDSURFACEMODEL' ||
+      geomRec.type === 'IFCFACEBASEDSURFACEMODEL' ||
       geomRec.type === 'IFCFACETEDBREP' ||
+      geomRec.type === 'IFCFACETEDBREPWITHVOIDS' ||
       geomRec.type === 'IFCCLOSEDSHELL' ||
       geomRec.type === 'IFCOPENSHELL' ||
-      geomRec.type === 'IFCCONNECTEDFACESET'
+      geomRec.type === 'IFCCONNECTEDFACESET' ||
+      geomRec.type === 'IFCPOLYGONALFACESET' ||
+      geomRec.type === 'IFCTRIANGULATEDFACESET' ||
+      geomRec.type === 'IFCTRIANGULATEDIRREGULARNETWORK'
     ) {
-      return this.extractDirectFacetedBuffers(geomRec, mLocal, mProduct);
+      return this.extractDirectFacetedPartitions(
+        geomRec,
+        mLocal,
+        mProduct,
+        itemToStyleMap,
+        faceToStyleMap,
+        applyCanonicalSwap
+      );
     }
 
     return null;
   }
 
   /**
-   * Fast-path extractor for discrete faceted boundary shells without boolean openings.
-   * Produces direct TypedArrays for quads/triangles with zero PolyMesh allocations.
-   * Caches the prototype geometry in local coordinates for instant reuse across mapped instances.
+   * Fast-path extractor for discrete faceted / polygonal boundary shells without boolean openings.
+   * Produces material-partitioned direct TypedArrays with dihedral crease edge filtering
+   * and zero PolyMesh allocations.
    */
-  private extractDirectFacetedBuffers(
+  private extractDirectFacetedPartitions(
     geomRec: StepRecord,
     mLocal: THREE.Matrix4,
-    mProduct: THREE.Matrix4
-  ): DirectMeshBuffers | null {
-    let protoBuffers = this.mepFacetedPrototypeCache.get(geomRec.id);
-    if (protoBuffers === undefined) {
-      protoBuffers = this.buildDirectFacetedPrototype(geomRec);
-      this.mepFacetedPrototypeCache.set(geomRec.id, protoBuffers);
+    mProduct: THREE.Matrix4,
+    itemToStyleMap?: Map<number, string>,
+    faceToStyleMap?: Map<number, string>,
+    applyCanonicalSwap: boolean = true
+  ): Array<{ buffers: DirectMeshBuffers; intrinsicStyleId?: string }> | null {
+    let protoPartitions = this.mepFacetedPrototypeCache.get(geomRec.id);
+    if (protoPartitions === undefined) {
+      protoPartitions = this.buildDirectFacetedPartitions(geomRec, itemToStyleMap, faceToStyleMap);
+      this.mepFacetedPrototypeCache.set(geomRec.id, protoPartitions);
     }
-    if (!protoBuffers) return null;
-
-    const buffers: DirectMeshBuffers = {
-      positions: new Float32Array(protoBuffers.positions),
-      normals: new Float32Array(protoBuffers.normals),
-      indices: new Uint32Array(protoBuffers.indices),
-      edgesBuffer: protoBuffers.edgesBuffer ? new Float32Array(protoBuffers.edgesBuffer) : undefined,
-    };
+    if (!protoPartitions || protoPartitions.length === 0) return null;
 
     const mTotal = new THREE.Matrix4().copy(mProduct).multiply(mLocal);
-    DirectCylinderGenerator.applyTransformAndCanonicalSwap(buffers, mTotal);
-    return buffers;
-  }
+    const result: Array<{ buffers: DirectMeshBuffers; intrinsicStyleId?: string }> = [];
 
-  private buildDirectFacetedPrototype(geomRec: StepRecord): DirectMeshBuffers | null {
-    const shells: StepRecord[] = [];
-    if (geomRec.type === 'IFCSHELLBASEDSURFACEMODEL') {
-      const shellsParam = geomRec.params[0];
-      const sRefs = Array.isArray(shellsParam) ? shellsParam : [shellsParam];
-      for (const sRef of sRefs) {
-        if (sRef && typeof sRef === 'object' && 'ref' in sRef) {
-          const sRec = this.records.get(sRef.ref);
-          if (sRec) shells.push(sRec);
-        }
+    for (const part of protoPartitions) {
+      const buffers: DirectMeshBuffers = {
+        positions: new Float32Array(part.buffers.positions),
+        normals: new Float32Array(part.buffers.normals),
+        indices: new Uint32Array(part.buffers.indices),
+        edgesBuffer: part.buffers.edgesBuffer ? new Float32Array(part.buffers.edgesBuffer) : undefined,
+      };
+      if (applyCanonicalSwap) {
+        DirectCylinderGenerator.applyTransformAndCanonicalSwap(buffers, mTotal);
+      } else {
+        DirectCylinderGenerator.applyIfcTransformInPlace(buffers, mTotal);
       }
-    } else if (geomRec.type === 'IFCFACETEDBREP') {
-      const outerParam = geomRec.params[0];
-      if (outerParam && typeof outerParam === 'object' && 'ref' in outerParam) {
-        const sRec = this.records.get(outerParam.ref);
-        if (sRec) shells.push(sRec);
-      }
-    } else if (
-      geomRec.type === 'IFCCLOSEDSHELL' ||
-      geomRec.type === 'IFCOPENSHELL' ||
-      geomRec.type === 'IFCCONNECTEDFACESET'
-    ) {
-      shells.push(geomRec);
+      result.push({ buffers, intrinsicStyleId: part.intrinsicStyleId });
     }
 
-    if (shells.length === 0) return null;
+    return result;
+  }
 
-    const posList: number[] = [];
-    const normList: number[] = [];
-    const indList: number[] = [];
-    const edgeList: number[] = [];
-    let vertIndexBase = 0;
+  private buildDirectFacetedPartitions(
+    geomRec: StepRecord,
+    itemToStyleMap?: Map<number, string>,
+    faceToStyleMap?: Map<number, string>
+  ): Array<{ buffers: DirectMeshBuffers; intrinsicStyleId?: string }> | null {
+    const defaultItemStyle = itemToStyleMap?.get(geomRec.id);
 
-    for (const shellRec of shells) {
-      const faceRefs = shellRec.params[0];
-      if (!Array.isArray(faceRefs)) continue;
+    // Case A: IFCTRIANGULATEDFACESET / IFCTRIANGULATEDIRREGULARNETWORK in local IFC coordinates
+    if (geomRec.type === 'IFCTRIANGULATEDFACESET' || geomRec.type === 'IFCTRIANGULATEDIRREGULARNETWORK') {
+      const pointListRef = geomRec.params[0];
+      if (!pointListRef || typeof pointListRef !== 'object' || !('ref' in pointListRef)) return null;
+      const pointListRec = this.records.get(pointListRef.ref);
+      if (!pointListRec || !Array.isArray(pointListRec.params[0])) return null;
 
-      for (const fRef of faceRefs) {
-        if (!fRef || typeof fRef !== 'object' || !('ref' in fRef)) continue;
-        const faceRec = this.records.get(fRef.ref);
-        if (!faceRec) continue;
+      const rawCoords = pointListRec.params[0];
+      const numPts = rawCoords.length;
+      if (numPts === 0) return null;
 
-        const boundRefs = Array.isArray(faceRec.params[0]) ? faceRec.params[0] : [faceRec.params[0]];
-        // If face has multiple bounds (holes), fallback to standard PolyMesh/CSG
-        if (boundRefs.length !== 1) return null;
-
-        const bRef = boundRefs[0];
-        if (!bRef || typeof bRef !== 'object' || !('ref' in bRef)) continue;
-        const bRec = this.records.get(bRef.ref);
-        if (!bRec) continue;
-
-        const loopRef = bRec.params[0];
-        if (!loopRef || typeof loopRef !== 'object' || !('ref' in loopRef)) continue;
-        const loopRec = this.records.get(loopRef.ref);
-        if (!loopRec || loopRec.type !== 'IFCPOLYLOOP') continue;
-
-        const ptRefs = loopRec.params[0];
-        if (!Array.isArray(ptRefs) || ptRefs.length < 3) continue;
-
-        const nPts = ptRefs.length;
-        const faceStartV = vertIndexBase;
-        const facePts: [number, number, number][] = [];
-
-        for (let i = 0; i < nPts; i++) {
-          const ptRef = ptRefs[i];
-          if (!ptRef || typeof ptRef !== 'object' || !('ref' in ptRef)) return null;
-          const ptRec = this.records.get(ptRef.ref);
-          if (!ptRec || ptRec.type !== 'IFCCARTESIANPOINT' || !Array.isArray(ptRec.params[0])) return null;
-          const p = ptRec.params[0];
-          const x = (typeof p[0] === 'number' ? p[0] : parseFloat(String(p[0])) || 0) * this.lengthUnitScale;
-          const y = (typeof p[1] === 'number' ? p[1] : parseFloat(String(p[1])) || 0) * this.lengthUnitScale;
-          const z = (typeof p[2] === 'number' ? p[2] : parseFloat(String(p[2])) || 0) * this.lengthUnitScale;
-          facePts.push([x, y, z]);
-          posList.push(x, y, z);
+      let coordIndex: any = null;
+      let pnIndexRaw: any = null;
+      const candidate3 = geomRec.params[3];
+      const candidate4 = geomRec.params[4];
+      if (Array.isArray(candidate3) && candidate3.length > 0 && Array.isArray(candidate3[0])) {
+        coordIndex = candidate3;
+        if (Array.isArray(candidate4) && candidate4.length > 0 && !Array.isArray(candidate4[0])) {
+          pnIndexRaw = candidate4;
         }
-
-        // Newell's method for exact polygon normal
-        let nx = 0, ny = 0, nz = 0;
-        for (let i = 0; i < nPts; i++) {
-          const cur = facePts[i];
-          const next = facePts[(i + 1) % nPts];
-          nx += (cur[1] - next[1]) * (cur[2] + next[2]);
-          ny += (cur[2] - next[2]) * (cur[0] + next[0]);
-          nz += (cur[0] - next[0]) * (cur[1] + next[1]);
+      } else if (Array.isArray(candidate4) && candidate4.length > 0 && Array.isArray(candidate4[0])) {
+        coordIndex = candidate4;
+        const candidate5 = geomRec.params[5];
+        if (Array.isArray(candidate5) && candidate5.length > 0 && !Array.isArray(candidate5[0])) {
+          pnIndexRaw = candidate5;
+        } else if (Array.isArray(candidate3) && candidate3.length > 0 && !Array.isArray(candidate3[0])) {
+          pnIndexRaw = candidate3;
         }
+      }
+      if (!coordIndex || !Array.isArray(coordIndex)) return null;
+
+      const scale = this.lengthUnitScale;
+      const positions = new Float32Array(numPts * 3);
+      for (let i = 0; i < numPts; i++) {
+        const pt = rawCoords[i];
+        if (!Array.isArray(pt) || pt.length < 3) continue;
+        positions[i * 3]     = (typeof pt[0] === 'number' ? pt[0] : parseFloat(String(pt[0])) || 0) * scale;
+        positions[i * 3 + 1] = (typeof pt[1] === 'number' ? pt[1] : parseFloat(String(pt[1])) || 0) * scale;
+        positions[i * 3 + 2] = (typeof pt[2] === 'number' ? pt[2] : parseFloat(String(pt[2])) || 0) * scale;
+      }
+
+      let maxCoordIndex = 0;
+      for (const tri of coordIndex) {
+        if (Array.isArray(tri)) {
+          for (const idx of tri) {
+            const num = typeof idx === 'number' ? idx : parseInt(String(idx), 10);
+            if (num > maxCoordIndex) maxCoordIndex = num;
+          }
+        }
+      }
+      const isPointPnIndex = Array.isArray(pnIndexRaw) && pnIndexRaw.length >= maxCoordIndex;
+
+      const numTris = coordIndex.length;
+      const indices = new Uint32Array(numTris * 3);
+      let writeIdx = 0;
+      for (let t = 0; t < numTris; t++) {
+        const tri = coordIndex[t];
+        if (!Array.isArray(tri) || tri.length < 3) continue;
+        let idx0 = typeof tri[0] === 'number' ? tri[0] : parseInt(String(tri[0]), 10);
+        let idx1 = typeof tri[1] === 'number' ? tri[1] : parseInt(String(tri[1]), 10);
+        let idx2 = typeof tri[2] === 'number' ? tri[2] : parseInt(String(tri[2]), 10);
+        if (isNaN(idx0) || isNaN(idx1) || isNaN(idx2) || idx0 < 1 || idx1 < 1 || idx2 < 1) continue;
+        if (idx0 === idx1 || idx1 === idx2 || idx2 === idx0) continue;
+        if (isPointPnIndex) {
+          idx0 = typeof pnIndexRaw[idx0 - 1] === 'number' ? pnIndexRaw[idx0 - 1] : parseInt(String(pnIndexRaw[idx0 - 1]), 10);
+          idx1 = typeof pnIndexRaw[idx1 - 1] === 'number' ? pnIndexRaw[idx1 - 1] : parseInt(String(pnIndexRaw[idx1 - 1]), 10);
+          idx2 = typeof pnIndexRaw[idx2 - 1] === 'number' ? pnIndexRaw[idx2 - 1] : parseInt(String(pnIndexRaw[idx2 - 1]), 10);
+        }
+        const u0 = idx0 - 1, u1 = idx1 - 1, u2 = idx2 - 1;
+        if (u0 >= numPts || u1 >= numPts || u2 >= numPts) continue;
+        indices[writeIdx++] = u0;
+        indices[writeIdx++] = u1;
+        indices[writeIdx++] = u2;
+      }
+      if (writeIdx === 0) return null;
+      const finalIndices = writeIdx === indices.length ? indices : indices.subarray(0, writeIdx);
+      const validTris = writeIdx / 3;
+      const normals = new Float32Array(numPts * 3);
+      const triNormals = new Float32Array(validTris * 3);
+
+      for (let t = 0; t < validTris; t++) {
+        const i0 = finalIndices[t * 3], i1 = finalIndices[t * 3 + 1], i2 = finalIndices[t * 3 + 2];
+        const p0x = positions[i0 * 3], p0y = positions[i0 * 3 + 1], p0z = positions[i0 * 3 + 2];
+        const ux = positions[i1 * 3] - p0x, uy = positions[i1 * 3 + 1] - p0y, uz = positions[i1 * 3 + 2] - p0z;
+        const vx = positions[i2 * 3] - p0x, vy = positions[i2 * 3 + 1] - p0y, vz = positions[i2 * 3 + 2] - p0z;
+        const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+        normals[i0 * 3] += nx; normals[i0 * 3 + 1] += ny; normals[i0 * 3 + 2] += nz;
+        normals[i1 * 3] += nx; normals[i1 * 3 + 1] += ny; normals[i1 * 3 + 2] += nz;
+        normals[i2 * 3] += nx; normals[i2 * 3 + 1] += ny; normals[i2 * 3 + 2] += nz;
         const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
-        if (len > 1e-8) {
-          nx /= len; ny /= len; nz /= len;
-        } else {
-          nx = 0; ny = 1; nz = 0;
+        if (len > 1e-12) {
+          triNormals[t * 3] = nx / len; triNormals[t * 3 + 1] = ny / len; triNormals[t * 3 + 2] = nz / len;
         }
+      }
+      for (let i = 0; i < numPts; i++) {
+        const nx = normals[i * 3], ny = normals[i * 3 + 1], nz = normals[i * 3 + 2];
+        const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+        if (len > 1e-12) {
+          normals[i * 3] = nx / len; normals[i * 3 + 1] = ny / len; normals[i * 3 + 2] = nz / len;
+        } else {
+          normals[i * 3 + 1] = 1.0;
+        }
+      }
 
+      const edgeFloats: number[] = [];
+      if (validTris <= 15000) {
+        const edgeMap = new Map<number, number>();
+        const cosThreshold = GeometryTolerance.COS_CREASE_THRESHOLD;
+        for (let t = 0; t < validTris; t++) {
+          const base = t * 3;
+          for (let e = 0; e < 3; e++) {
+            const vA = finalIndices[base + e];
+            const vB = finalIndices[base + ((e + 1) % 3)];
+            const minV = vA < vB ? vA : vB;
+            const maxV = vA < vB ? vB : vA;
+            const key = minV * 67108864 + maxV;
+            const prevT = edgeMap.get(key);
+            if (prevT === undefined) {
+              edgeMap.set(key, t);
+            } else if (prevT >= 0) {
+              const dot =
+                triNormals[prevT * 3] * triNormals[t * 3] +
+                triNormals[prevT * 3 + 1] * triNormals[t * 3 + 1] +
+                triNormals[prevT * 3 + 2] * triNormals[t * 3 + 2];
+              if (dot < cosThreshold) {
+                edgeFloats.push(
+                  positions[minV * 3], positions[minV * 3 + 1], positions[minV * 3 + 2],
+                  positions[maxV * 3], positions[maxV * 3 + 1], positions[maxV * 3 + 2]
+                );
+              }
+              edgeMap.set(key, -1);
+            }
+          }
+        }
+        for (const [key, tIdx] of edgeMap.entries()) {
+          if (tIdx >= 0) {
+            const minV = Math.floor(key / 67108864);
+            const maxV = key % 67108864;
+            edgeFloats.push(
+              positions[minV * 3], positions[minV * 3 + 1], positions[minV * 3 + 2],
+              positions[maxV * 3], positions[maxV * 3 + 1], positions[maxV * 3 + 2]
+            );
+          }
+        }
+      }
+
+      return [{
+        buffers: {
+          positions,
+          normals,
+          indices: finalIndices,
+          edgesBuffer: new Float32Array(edgeFloats),
+        },
+        intrinsicStyleId: defaultItemStyle,
+      }];
+    }
+
+    interface EdgeRecord {
+      ax: number; ay: number; az: number;
+      bx: number; by: number; bz: number;
+      nx: number; ny: number; nz: number;
+      faceIdx: number;
+      count: number;
+      isCrease: boolean;
+    }
+
+    interface PartitionBuilder {
+      styleId?: string;
+      posList: number[];
+      normList: number[];
+      indList: number[];
+      holeEdgeList: number[];
+      edgeMap: Map<number, EdgeRecord>;
+      vertIndexBase: number;
+      faceCounter: number;
+    }
+
+    const partitions = new Map<string, PartitionBuilder>();
+    const getPartition = (styleId?: string): PartitionBuilder => {
+      const key = styleId || '__default__';
+      let p = partitions.get(key);
+      if (!p) {
+        p = {
+          styleId,
+          posList: [],
+          normList: [],
+          indList: [],
+          holeEdgeList: [],
+          edgeMap: new Map(),
+          vertIndexBase: 0,
+          faceCounter: 0,
+        };
+        partitions.set(key, p);
+      }
+      return p;
+    };
+
+    const ptStepIdToWeldedId = new Map<number, number>();
+    const spatialToWeldedId = new Map<string, number>();
+    let nextWeldedId = 1;
+
+    const getWeldedVertexId = (ptId: number, x: number, y: number, z: number): number => {
+      if (ptId > 0) {
+        const existing = ptStepIdToWeldedId.get(ptId);
+        if (existing !== undefined) return existing;
+      }
+      const qx = Math.round(x * 10000);
+      const qy = Math.round(y * 10000);
+      const qz = Math.round(z * 10000);
+      const sKey = `${qx}_${qy}_${qz}`;
+      let wId = spatialToWeldedId.get(sKey);
+      if (wId === undefined) {
+        wId = nextWeldedId++;
+        spatialToWeldedId.set(sKey, wId);
+      }
+      if (ptId > 0) {
+        ptStepIdToWeldedId.set(ptId, wId);
+      }
+      return wId;
+    };
+
+    const registerPolygonEdge = (
+      part: PartitionBuilder,
+      wA: number,
+      ax: number, ay: number, az: number,
+      wB: number,
+      bx: number, by: number, bz: number,
+      nx: number, ny: number, nz: number,
+      faceIdx: number
+    ) => {
+      if (wA === wB) return;
+      const minW = wA < wB ? wA : wB;
+      const maxW = wA < wB ? wB : wA;
+      const edgeKey = minW * 67108864 + maxW;
+      const existing = part.edgeMap.get(edgeKey);
+      if (!existing) {
+        part.edgeMap.set(edgeKey, {
+          ax, ay, az,
+          bx, by, bz,
+          nx, ny, nz,
+          faceIdx,
+          count: 1,
+          isCrease: false,
+        });
+      } else if (existing.faceIdx !== faceIdx) {
+        existing.count++;
+        if (!existing.isCrease) {
+          const dot = existing.nx * nx + existing.ny * ny + existing.nz * nz;
+          if (dot < GeometryTolerance.COS_CREASE_THRESHOLD) {
+            existing.isCrease = true;
+          }
+        }
+      }
+    };
+
+    const cleanLoopPointsWithIds = (
+      rawPts: [number, number, number][],
+      rawWIds: number[]
+    ): { pts: [number, number, number][]; wIds: number[] } => {
+      if (rawPts.length === 0) return { pts: [], wIds: [] };
+      const tolSq = GeometryTolerance.COINCIDENT_POINT * GeometryTolerance.COINCIDENT_POINT;
+      const pts: [number, number, number][] = [rawPts[0]];
+      const wIds: number[] = [rawWIds[0]];
+      for (let i = 1; i < rawPts.length; i++) {
+        const prev = pts[pts.length - 1];
+        const cur = rawPts[i];
+        const dx = cur[0] - prev[0], dy = cur[1] - prev[1], dz = cur[2] - prev[2];
+        if (dx * dx + dy * dy + dz * dz >= tolSq) {
+          pts.push(cur);
+          wIds.push(rawWIds[i]);
+        }
+      }
+      if (pts.length > 1) {
+        const first = pts[0];
+        const last = pts[pts.length - 1];
+        const dx = last[0] - first[0], dy = last[1] - first[1], dz = last[2] - first[2];
+        if (dx * dx + dy * dy + dz * dz < tolSq) {
+          pts.pop();
+          wIds.pop();
+        }
+      }
+      return { pts, wIds };
+    };
+
+    const appendFaceToPartition = (
+      part: PartitionBuilder,
+      outerPts: [number, number, number][],
+      outerWIds: number[],
+      innerHoles: [number, number, number][][]
+    ) => {
+      const nPts = outerPts.length;
+      if (nPts < 3) return;
+
+      let nx = 0, ny = 0, nz = 0;
+      for (let i = 0; i < nPts; i++) {
+        const cur = outerPts[i];
+        const next = outerPts[(i + 1) % nPts];
+        nx += (cur[1] - next[1]) * (cur[2] + next[2]);
+        ny += (cur[2] - next[2]) * (cur[0] + next[0]);
+        nz += (cur[0] - next[0]) * (cur[1] + next[1]);
+      }
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      if (len <= GeometryTolerance.MIN_FACE_AREA) return;
+      nx /= len; ny /= len; nz /= len;
+
+      const faceIdx = part.faceCounter++;
+
+      if (innerHoles.length > 0) {
+        const outerV3 = outerPts.map((p) => new Vec3(p[0], p[1], p[2]));
+        const holesV3 = innerHoles.map((h) => h.map((p) => new Vec3(p[0], p[1], p[2])));
+        const normV3 = new Vec3(nx, ny, nz);
+        const tris = PolygonClipping.triangulateWithHoles(outerV3, holesV3, normV3);
+        if (tris.length < 3) return;
+
+        const baseV = part.vertIndexBase;
+        for (let i = 0; i < tris.length; i++) {
+          const tp = tris[i];
+          part.posList.push(tp.x, tp.y, tp.z);
+          part.normList.push(nx, ny, nz);
+          part.indList.push(baseV + i);
+        }
+        part.vertIndexBase += tris.length;
+
+        for (const hole of innerHoles) {
+          const m = hole.length;
+          for (let i = 0; i < m; i++) {
+            const pA = hole[i];
+            const pB = hole[(i + 1) % m];
+            part.holeEdgeList.push(pA[0], pA[1], pA[2], pB[0], pB[1], pB[2]);
+          }
+        }
+      } else {
+        const faceStartV = part.vertIndexBase;
         for (let i = 0; i < nPts; i++) {
-          normList.push(nx, ny, nz);
+          const p = outerPts[i];
+          part.posList.push(p[0], p[1], p[2]);
+          part.normList.push(nx, ny, nz);
         }
 
-        // Robust polygon triangulation (supports concave faces)
         if (nPts === 3) {
-          indList.push(faceStartV, faceStartV + 1, faceStartV + 2);
+          part.indList.push(faceStartV, faceStartV + 1, faceStartV + 2);
         } else {
-          const v3 = facePts.map((p) => new Vec3(p[0], p[1], p[2]));
+          const v3 = outerPts.map((p) => new Vec3(p[0], p[1], p[2]));
           const norm = new Vec3(nx, ny, nz);
           const basis = PolygonClipping.getLocalBasis(v3[0], norm);
           const poly2D = v3.map((v) => PolygonClipping.projectTo2D(v, basis));
@@ -3833,38 +4215,312 @@ export class IfcStepImporter {
               const p2 = v3[orig2];
               const triN = p1.sub(p0).cross(p2.sub(p0));
               if (triN.dot(norm) >= 0) {
-                indList.push(faceStartV + orig0, faceStartV + orig1, faceStartV + orig2);
+                part.indList.push(faceStartV + orig0, faceStartV + orig1, faceStartV + orig2);
               } else {
-                indList.push(faceStartV + orig0, faceStartV + orig2, faceStartV + orig1);
+                part.indList.push(faceStartV + orig0, faceStartV + orig2, faceStartV + orig1);
               }
             }
           } else {
-            // Fallback to fan if triangulation fails for degenerate points
             for (let i = 1; i < nPts - 1; i++) {
-              indList.push(faceStartV, faceStartV + i, faceStartV + i + 1);
+              part.indList.push(faceStartV, faceStartV + i, faceStartV + i + 1);
             }
           }
         }
+        part.vertIndexBase += nPts;
+      }
 
-        // Feature edge outlines along polygon perimeter
-        for (let i = 0; i < nPts; i++) {
-          const pA = facePts[i];
-          const pB = facePts[(i + 1) % nPts];
-          edgeList.push(pA[0], pA[1], pA[2], pB[0], pB[1], pB[2]);
+      for (let i = 0; i < nPts; i++) {
+        const next = (i + 1) % nPts;
+        const pA = outerPts[i];
+        const pB = outerPts[next];
+        registerPolygonEdge(
+          part,
+          outerWIds[i], pA[0], pA[1], pA[2],
+          outerWIds[next], pB[0], pB[1], pB[2],
+          nx, ny, nz,
+          faceIdx
+        );
+      }
+    };
+
+    // Case B: IFCPOLYGONALFACESET
+    if (geomRec.type === 'IFCPOLYGONALFACESET') {
+      const pointListRef = geomRec.params[IFC_GEOM_ATTRS.POLYGONAL_COORDINATES];
+      if (!pointListRef || typeof pointListRef !== 'object' || !('ref' in pointListRef)) return null;
+      const pointListRec = this.records.get(pointListRef.ref);
+      if (!pointListRec || !Array.isArray(pointListRec.params[0])) return null;
+
+      const rawCoords = pointListRec.params[0];
+      const scale = this.lengthUnitScale;
+      const pts: [number, number, number][] = [];
+      const ptWIds: number[] = [];
+      for (let i = 0; i < rawCoords.length; i++) {
+        const pt = rawCoords[i];
+        if (Array.isArray(pt) && pt.length >= 3) {
+          const x = (typeof pt[0] === 'number' ? pt[0] : parseFloat(String(pt[0])) || 0) * scale;
+          const y = (typeof pt[1] === 'number' ? pt[1] : parseFloat(String(pt[1])) || 0) * scale;
+          const z = (typeof pt[2] === 'number' ? pt[2] : parseFloat(String(pt[2])) || 0) * scale;
+          pts.push([x, y, z]);
+          ptWIds.push(getWeldedVertexId(-(i + 1), x, y, z));
+        } else {
+          pts.push([0, 0, 0]);
+          ptWIds.push(0);
         }
+      }
+      if (pts.length === 0) return null;
 
-        vertIndexBase += nPts;
+      const faceRefs = geomRec.params[IFC_GEOM_ATTRS.POLYGONAL_FACES];
+      if (!Array.isArray(faceRefs)) return null;
+
+      const rawParam3 = geomRec.params[IFC_GEOM_ATTRS.POLYGONAL_PN_INDEX];
+      const pnIndexRaw: StepParam[] | null = Array.isArray(rawParam3) ? rawParam3 : null;
+
+      const resolveIdx = (oneBasedIdx: number): number => {
+        let mappedIdx = oneBasedIdx;
+        if (pnIndexRaw && oneBasedIdx >= 1 && oneBasedIdx <= pnIndexRaw.length) {
+          const entry = pnIndexRaw[oneBasedIdx - 1];
+          mappedIdx = typeof entry === 'number' ? entry : parseInt(String(entry), 10);
+        }
+        return mappedIdx - 1;
+      };
+
+      for (const fRef of faceRefs) {
+        if (!fRef || typeof fRef !== 'object' || !('ref' in fRef)) continue;
+        const faceRec = this.records.get(fRef.ref);
+        if (!faceRec) continue;
+
+        const faceStyle =
+          faceToStyleMap?.get(faceRec.id) ||
+          itemToStyleMap?.get(faceRec.id) ||
+          defaultItemStyle;
+        const part = getPartition(faceStyle);
+
+        if (faceRec.type === 'IFCINDEXEDPOLYGONALFACE') {
+          const indices = faceRec.params[0];
+          if (Array.isArray(indices)) {
+            const rawPts: [number, number, number][] = [];
+            const rawWIds: number[] = [];
+            for (const idx of indices) {
+              const zeroIdx = resolveIdx(typeof idx === 'number' ? idx : parseInt(String(idx), 10));
+              if (zeroIdx >= 0 && zeroIdx < pts.length) {
+                rawPts.push(pts[zeroIdx]);
+                rawWIds.push(ptWIds[zeroIdx]);
+              }
+            }
+            const cleaned = cleanLoopPointsWithIds(rawPts, rawWIds);
+            if (cleaned.pts.length >= 3) {
+              appendFaceToPartition(part, cleaned.pts, cleaned.wIds, []);
+            }
+          }
+        } else if (faceRec.type === 'IFCINDEXEDPOLYGONALFACEWITHVOIDS') {
+          const outerIndices = faceRec.params[0];
+          const innerIndicesList = faceRec.params[1];
+          if (Array.isArray(outerIndices)) {
+            const rawPts: [number, number, number][] = [];
+            const rawWIds: number[] = [];
+            for (const idx of outerIndices) {
+              const zeroIdx = resolveIdx(typeof idx === 'number' ? idx : parseInt(String(idx), 10));
+              if (zeroIdx >= 0 && zeroIdx < pts.length) {
+                rawPts.push(pts[zeroIdx]);
+                rawWIds.push(ptWIds[zeroIdx]);
+              }
+            }
+            const cleanedOuter = cleanLoopPointsWithIds(rawPts, rawWIds);
+            const holes: [number, number, number][][] = [];
+            if (Array.isArray(innerIndicesList)) {
+              for (const holeIdxList of innerIndicesList) {
+                if (Array.isArray(holeIdxList)) {
+                  const hRawPts: [number, number, number][] = [];
+                  const hRawWIds: number[] = [];
+                  for (const idx of holeIdxList) {
+                    const zeroIdx = resolveIdx(typeof idx === 'number' ? idx : parseInt(String(idx), 10));
+                    if (zeroIdx >= 0 && zeroIdx < pts.length) {
+                      hRawPts.push(pts[zeroIdx]);
+                      hRawWIds.push(ptWIds[zeroIdx]);
+                    }
+                  }
+                  const cleanedHole = cleanLoopPointsWithIds(hRawPts, hRawWIds);
+                  if (cleanedHole.pts.length >= 3) {
+                    holes.push(cleanedHole.pts);
+                  }
+                }
+              }
+            }
+            if (cleanedOuter.pts.length >= 3) {
+              appendFaceToPartition(part, cleanedOuter.pts, cleanedOuter.wIds, holes);
+            }
+          }
+        }
+      }
+    } else {
+      // Case C: IFCFACETEDBREP / IFCFACETEDBREPWITHVOIDS / IFCFACEBASEDSURFACEMODEL / IFCSHELLBASEDSURFACEMODEL / Shells
+      const shells: StepRecord[] = [];
+      if (geomRec.type === 'IFCSHELLBASEDSURFACEMODEL' || geomRec.type === 'IFCFACEBASEDSURFACEMODEL') {
+        const shellsParam = geomRec.params[0];
+        const sRefs = Array.isArray(shellsParam) ? shellsParam : [shellsParam];
+        for (const sRef of sRefs) {
+          if (sRef && typeof sRef === 'object' && 'ref' in sRef) {
+            const sRec = this.records.get(sRef.ref);
+            if (sRec) shells.push(sRec);
+          }
+        }
+      } else if (geomRec.type === 'IFCFACETEDBREP' || geomRec.type === 'IFCFACETEDBREPWITHVOIDS') {
+        const outerParam = geomRec.params[0];
+        if (outerParam && typeof outerParam === 'object' && 'ref' in outerParam) {
+          const sRec = this.records.get(outerParam.ref);
+          if (sRec) shells.push(sRec);
+        }
+        if (geomRec.type === 'IFCFACETEDBREPWITHVOIDS') {
+          const voidsParam = geomRec.params[1];
+          if (Array.isArray(voidsParam)) {
+            for (const vRef of voidsParam) {
+              if (vRef && typeof vRef === 'object' && 'ref' in vRef) {
+                const vRec = this.records.get(vRef.ref);
+                if (vRec) shells.push(vRec);
+              }
+            }
+          }
+        }
+      } else if (
+        geomRec.type === 'IFCCLOSEDSHELL' ||
+        geomRec.type === 'IFCOPENSHELL' ||
+        geomRec.type === 'IFCCONNECTEDFACESET'
+      ) {
+        shells.push(geomRec);
+      }
+
+      if (shells.length === 0) return null;
+
+      for (const shellRec of shells) {
+        const shellStyle = itemToStyleMap?.get(shellRec.id) || defaultItemStyle;
+        const faceRefsParam = shellRec.params[0];
+        const faceRefs = Array.isArray(faceRefsParam)
+          ? faceRefsParam
+          : (faceRefsParam && typeof faceRefsParam === 'object' && 'ref' in faceRefsParam ? [faceRefsParam] : []);
+
+        for (const fRef of faceRefs) {
+          if (!fRef || typeof fRef !== 'object' || !('ref' in fRef)) continue;
+          const faceRec = this.records.get(fRef.ref);
+          if (!faceRec) continue;
+
+          const faceStyle =
+            faceToStyleMap?.get(faceRec.id) ||
+            itemToStyleMap?.get(faceRec.id) ||
+            shellStyle;
+          const part = getPartition(faceStyle);
+
+          const boundRefsParam = faceRec.params[0];
+          const boundRefs = Array.isArray(boundRefsParam)
+            ? boundRefsParam
+            : (boundRefsParam ? [boundRefsParam] : []);
+          if (boundRefs.length === 0) continue;
+
+          const hasOuterBound = boundRefs.some((r: any) => {
+            if (!r || typeof r !== 'object' || !('ref' in r)) return false;
+            const b = this.records.get(r.ref);
+            return b?.type === 'IFCFACEOUTERBOUND';
+          });
+
+          let outerPts: [number, number, number][] | null = null;
+          let outerWIds: number[] | null = null;
+          const innerHoles: [number, number, number][][] = [];
+
+          for (const bRef of boundRefs) {
+            if (!bRef || typeof bRef !== 'object' || !('ref' in bRef)) continue;
+            const bRec = this.records.get(bRef.ref);
+            if (!bRec) continue;
+
+            const loopRef = bRec.params[0];
+            if (!loopRef || typeof loopRef !== 'object' || !('ref' in loopRef)) continue;
+            const loopRec = this.records.get(loopRef.ref);
+            if (!loopRec || loopRec.type !== 'IFCPOLYLOOP') continue;
+
+            const ptRefs = loopRec.params[0];
+            if (!Array.isArray(ptRefs) || ptRefs.length < 3) continue;
+
+            const rawPts: [number, number, number][] = [];
+            const rawWIds: number[] = [];
+            for (let i = 0; i < ptRefs.length; i++) {
+              const ptRef = ptRefs[i];
+              if (!ptRef || typeof ptRef !== 'object' || !('ref' in ptRef)) continue;
+              const ptRec = this.records.get(ptRef.ref);
+              if (!ptRec || ptRec.type !== 'IFCCARTESIANPOINT' || !Array.isArray(ptRec.params[0])) continue;
+              const p = ptRec.params[0];
+              const x = (typeof p[0] === 'number' ? p[0] : parseFloat(String(p[0])) || 0) * this.lengthUnitScale;
+              const y = (typeof p[1] === 'number' ? p[1] : parseFloat(String(p[1])) || 0) * this.lengthUnitScale;
+              const z = (typeof p[2] === 'number' ? p[2] : parseFloat(String(p[2])) || 0) * this.lengthUnitScale;
+              rawPts.push([x, y, z]);
+              rawWIds.push(getWeldedVertexId(ptRec.id, x, y, z));
+            }
+
+            const cleaned = cleanLoopPointsWithIds(rawPts, rawWIds);
+            if (cleaned.pts.length < 3) continue;
+
+            const orientationParam = bRec.params[1];
+            let orientation = true;
+            if (orientationParam === false) {
+              orientation = false;
+            } else if (
+              typeof orientationParam === 'object' &&
+              orientationParam !== null &&
+              'enum' in orientationParam &&
+              (orientationParam.enum === 'F' || orientationParam.enum === 'FALSE')
+            ) {
+              orientation = false;
+            } else if (typeof orientationParam === 'string') {
+              const s = orientationParam.toUpperCase();
+              if (s === '.F.' || s === 'F' || s === 'FALSE' || s === '.FALSE.') {
+                orientation = false;
+              }
+            }
+
+            if (!orientation) {
+              cleaned.pts.reverse();
+              cleaned.wIds.reverse();
+            }
+
+            const isOuter = bRec.type === 'IFCFACEOUTERBOUND';
+            if (isOuter && !outerPts) {
+              outerPts = cleaned.pts;
+              outerWIds = cleaned.wIds;
+            } else if (!hasOuterBound && !outerPts) {
+              outerPts = cleaned.pts;
+              outerWIds = cleaned.wIds;
+            } else {
+              innerHoles.push(cleaned.pts);
+            }
+          }
+
+          if (outerPts && outerWIds && outerPts.length >= 3) {
+            appendFaceToPartition(part, outerPts, outerWIds, innerHoles);
+          }
+        }
       }
     }
 
-    if (indList.length === 0) return null;
+    const result: Array<{ buffers: DirectMeshBuffers; intrinsicStyleId?: string }> = [];
+    for (const part of partitions.values()) {
+      if (part.indList.length === 0) continue;
 
-    return {
-      positions: new Float32Array(posList),
-      normals: new Float32Array(normList),
-      indices: new Uint32Array(indList),
-      edgesBuffer: edgeList.length > 0 ? new Float32Array(edgeList) : undefined,
-    };
+      const edgeList = [...part.holeEdgeList];
+      for (const e of part.edgeMap.values()) {
+        if (e.count === 1 || e.isCrease) {
+          edgeList.push(e.ax, e.ay, e.az, e.bx, e.by, e.bz);
+        }
+      }
+
+      result.push({
+        intrinsicStyleId: part.styleId,
+        buffers: {
+          positions: new Float32Array(part.posList),
+          normals: new Float32Array(part.normList),
+          indices: new Uint32Array(part.indList),
+          edgesBuffer: edgeList.length > 0 ? new Float32Array(edgeList) : undefined,
+        },
+      });
+    }
+
+    return result.length > 0 ? result : null;
   }
 
   /**
@@ -4055,7 +4711,15 @@ export class IfcStepImporter {
     defaultParentId: string | null,
     psets?: Record<string, Record<string, any>>
   ): EvaluatedProductEntity | null {
-    const res = this.rebuildProductEntities(rec, defaultParentId, psets);
+    const res = this.rebuildProductEntities(
+      rec,
+      defaultParentId,
+      psets,
+      this.itemToStyleMap,
+      this.faceToStyleMap,
+      this.elementMaterialMap,
+      true
+    );
     if (!res) return null;
     if (res.rootEntity.type === 'GROUP' && res.children.length > 0) {
       if (res.children.length === 1 && res.children[0].polyMesh) {
