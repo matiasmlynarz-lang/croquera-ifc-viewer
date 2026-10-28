@@ -15,6 +15,7 @@ import { GeometryPrototypeDetector } from '../detector/GeometryPrototypeDetector
 import type {
   IfcWorkerRequest,
   IfcWorkerResponse,
+  HydratedBrepDTO,
 } from '../types/IfcWorkerProtocol';
 
 export const LARGE_FILE_THRESHOLD_BYTES = 5 * 1024 * 1024; // 5 MB (aligned with Croquera THRESHOLD_SIZE_TIER_1_BYTES)
@@ -58,6 +59,94 @@ export class IfcImportWorkerCore {
       return;
     }
 
+    if (request.type === 'RUN_EDITOR_POSTPROCESS') {
+      try {
+        if (!this.currentImporter) {
+          throw new Error('No active importer initialized for RUN_EDITOR_POSTPROCESS');
+        }
+        const importer = this.currentImporter;
+        const psetsByStepId: Record<number, Record<string, Record<string, any>>> = {};
+        const productStepIds = importer.getProductStepIds();
+        for (const sId of productStepIds) {
+          psetsByStepId[sId] = importer.resolveElementProperties(sId);
+        }
+
+        const grids = importer.extractGrids();
+        const openings = importer.extractCachedOpenings();
+
+        const openingToHostStepMapObj: Record<number, number> = {};
+        for (const [oId, hId] of importer.getOpeningToHostStepMap().entries()) {
+          openingToHostStepMapObj[oId] = hId;
+        }
+
+        const fillToOpeningStepMapObj: Record<number, number> = {};
+        for (const [fId, oId] of importer.getFillToOpeningStepMap().entries()) {
+          fillToOpeningStepMapObj[fId] = oId;
+        }
+
+        onEmit({
+          type: 'STAGE_EDITOR_POSTPROCESS_BATCH',
+          psetsByStepId,
+          grids,
+          openings,
+          openingToHostStepMap: openingToHostStepMapObj,
+          fillToOpeningStepMap: fillToOpeningStepMapObj,
+        });
+      } catch (err: any) {
+        onEmit({
+          type: 'STAGE_ERROR',
+          error: `RUN_EDITOR_POSTPROCESS failed: ${err?.message || err}`,
+          stack: err?.stack,
+        });
+      }
+      return;
+    }
+
+    if (request.type === 'HYDRATE_BREP') {
+      try {
+        if (!this.currentImporter) {
+          throw new Error('No active importer initialized for HYDRATE_BREP');
+        }
+        const importer = this.currentImporter;
+        const coalesceFaces = request.coalesceFaces ?? true;
+        const elements: HydratedBrepDTO[] = [];
+        const transferables: Transferable[] = [];
+
+        for (const stepId of request.stepIds) {
+          const hydrated = importer.hydrateBrepMesh(stepId, coalesceFaces);
+          if (hydrated && hydrated.polyMesh) {
+            const ir = hydrated.polyMesh.toGeometryIR();
+            if (ir.positions) transferables.push(ir.positions.buffer);
+            if (ir.triPositions) transferables.push(ir.triPositions.buffer);
+            if (ir.triNormals) transferables.push(ir.triNormals.buffer);
+            if (ir.triIndices) transferables.push(ir.triIndices.buffer);
+            if (ir.featureEdges) transferables.push(ir.featureEdges.buffer);
+
+            elements.push({
+              stepId,
+              id: hydrated.id,
+              geometryIR: ir,
+            });
+          }
+        }
+
+        onEmit(
+          {
+            type: 'STAGE_HYDRATE_BREP',
+            elements,
+          },
+          transferables
+        );
+      } catch (err: any) {
+        onEmit({
+          type: 'STAGE_ERROR',
+          error: `HYDRATE_BREP failed: ${err?.message || err}`,
+          stack: err?.stack,
+        });
+      }
+      return;
+    }
+
     if (request.type === 'INIT_COORDINATOR') {
       try {
         const scanner = new ChunkedStreamScanner(request.stepBuffer);
@@ -79,7 +168,7 @@ export class IfcImportWorkerCore {
         const stage1 = importer.extractSpatialHierarchy();
         onEmit(stage1);
 
-        const stage2 = importer.extractProductBounds();
+        const stage2 = importer.extractProductBounds(Boolean(request.lightweightBounds));
         const productStepIds = importer.getProductStepIds();
 
         const activeDeferredTypes: string[] = [];
@@ -266,7 +355,7 @@ export class IfcImportWorkerCore {
       onEmit(stage1);
 
       // Stage 2: Product AABB and model bounding box (< 500 ms)
-      const stage2 = importer.extractProductBounds();
+      const stage2 = importer.extractProductBounds(Boolean(request.lightweightBounds));
       let totalDeferredElements = 0;
       if (shouldUsePhases) {
         const parser = importer.getParser() as any;

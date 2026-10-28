@@ -13,6 +13,8 @@ import type {
   StageCoordinatorReadyPayload,
   StageBatchCompletePayload,
   IfcWorkerTessellateBatchRequest,
+  StageEditorPostprocessBatchPayload,
+  HydratedBrepDTO,
 } from '../types/IfcWorkerProtocol';
 
 export class IfcWorkerClient {
@@ -44,7 +46,8 @@ export class IfcWorkerClient {
   public async initCoordinator(
     stepBuffer: SharedArrayBuffer,
     onProgress: (resp: IfcWorkerResponse) => void,
-    forcePhases?: boolean
+    forcePhases?: boolean,
+    lightweightBounds?: boolean
   ): Promise<StageCoordinatorReadyPayload> {
     if (this.worker) {
       const activeWorker = this.worker;
@@ -76,6 +79,7 @@ export class IfcWorkerClient {
           type: 'INIT_COORDINATOR',
           stepBuffer,
           forcePhases,
+          lightweightBounds,
         };
         activeWorker.postMessage(req);
       });
@@ -85,6 +89,7 @@ export class IfcWorkerClient {
           type: 'INIT_COORDINATOR',
           stepBuffer,
           forcePhases,
+          lightweightBounds,
         };
         let readyPayload: StageCoordinatorReadyPayload | null = null;
         this.fallbackCore!.process(req, (resp) => {
@@ -223,7 +228,8 @@ export class IfcWorkerClient {
   public async parseFile(
     stepBuffer: ArrayBuffer,
     chunkSize: number = 200,
-    onMessage: (response: IfcWorkerResponse) => void
+    onMessage: (response: IfcWorkerResponse) => void,
+    lightweightBounds?: boolean
   ): Promise<void> {
     if (this.worker) {
       const activeWorker = this.worker;
@@ -255,6 +261,7 @@ export class IfcWorkerClient {
           type: 'PARSE_IFC',
           stepBuffer,
           chunkSize,
+          lightweightBounds,
         };
 
         // Zero-copy transfer of input stepBuffer to worker thread
@@ -265,6 +272,7 @@ export class IfcWorkerClient {
         type: 'PARSE_IFC',
         stepBuffer,
         chunkSize,
+        lightweightBounds,
       };
       await this.fallbackCore.process(req, (resp) => {
         onMessage(resp);
@@ -317,6 +325,122 @@ export class IfcWorkerClient {
       });
     }
     return {};
+  }
+
+  /**
+   * Executes deep editor post-processing on the background worker (Phase 6 - Bloque 3.5).
+   * Extracts Property Sets, IfcGrid definitions, and opening volumetric meshes.
+   */
+  public async runEditorPostprocess(batchSize?: number): Promise<StageEditorPostprocessBatchPayload> {
+    if (this.worker) {
+      const activeWorker = this.worker;
+      return new Promise<StageEditorPostprocessBatchPayload>((resolve, reject) => {
+        const handleMessage = (e: MessageEvent<IfcWorkerResponse>) => {
+          const resp = e.data;
+          if (resp.type === 'STAGE_EDITOR_POSTPROCESS_BATCH') {
+            activeWorker.removeEventListener('message', handleMessage);
+            activeWorker.removeEventListener('error', handleError);
+            resolve(resp);
+          } else if (resp.type === 'STAGE_ERROR') {
+            activeWorker.removeEventListener('message', handleMessage);
+            activeWorker.removeEventListener('error', handleError);
+            reject(new Error(resp.error));
+          }
+        };
+
+        const handleError = (err: ErrorEvent) => {
+          activeWorker.removeEventListener('message', handleMessage);
+          activeWorker.removeEventListener('error', handleError);
+          reject(err);
+        };
+
+        activeWorker.addEventListener('message', handleMessage);
+        activeWorker.addEventListener('error', handleError);
+
+        const req: IfcWorkerRequest = {
+          type: 'RUN_EDITOR_POSTPROCESS',
+          batchSize,
+        };
+        activeWorker.postMessage(req);
+      });
+    } else if (this.fallbackCore) {
+      return new Promise<StageEditorPostprocessBatchPayload>((resolve, reject) => {
+        const req: IfcWorkerRequest = {
+          type: 'RUN_EDITOR_POSTPROCESS',
+          batchSize,
+        };
+        let result: StageEditorPostprocessBatchPayload | null = null;
+        this.fallbackCore!.process(req, (resp) => {
+          if (resp.type === 'STAGE_EDITOR_POSTPROCESS_BATCH') {
+            result = resp;
+          } else if (resp.type === 'STAGE_ERROR') {
+            reject(new Error(resp.error));
+          }
+        }).then(() => {
+          if (result) resolve(result);
+          else reject(new Error('RUN_EDITOR_POSTPROCESS produced no batch result'));
+        }).catch(reject);
+      });
+    }
+    throw new Error('Worker and fallbackCore are both unavailable');
+  }
+
+  /**
+   * Hydrates editable 2-manifold B-Rep PolyMesh with coalesced coplanar faces on-demand (JIT).
+   */
+  public async hydrateBrep(stepIds: number[], coalesceFaces: boolean = true): Promise<HydratedBrepDTO[]> {
+    if (this.worker) {
+      const activeWorker = this.worker;
+      return new Promise<HydratedBrepDTO[]>((resolve, reject) => {
+        const handleMessage = (e: MessageEvent<IfcWorkerResponse>) => {
+          const resp = e.data;
+          if (resp.type === 'STAGE_HYDRATE_BREP') {
+            activeWorker.removeEventListener('message', handleMessage);
+            activeWorker.removeEventListener('error', handleError);
+            resolve(resp.elements);
+          } else if (resp.type === 'STAGE_ERROR') {
+            activeWorker.removeEventListener('message', handleMessage);
+            activeWorker.removeEventListener('error', handleError);
+            reject(new Error(resp.error));
+          }
+        };
+
+        const handleError = (err: ErrorEvent) => {
+          activeWorker.removeEventListener('message', handleMessage);
+          activeWorker.removeEventListener('error', handleError);
+          reject(err);
+        };
+
+        activeWorker.addEventListener('message', handleMessage);
+        activeWorker.addEventListener('error', handleError);
+
+        const req: IfcWorkerRequest = {
+          type: 'HYDRATE_BREP',
+          stepIds,
+          coalesceFaces,
+        };
+        activeWorker.postMessage(req);
+      });
+    } else if (this.fallbackCore) {
+      return new Promise<HydratedBrepDTO[]>((resolve, reject) => {
+        const req: IfcWorkerRequest = {
+          type: 'HYDRATE_BREP',
+          stepIds,
+          coalesceFaces,
+        };
+        let elements: HydratedBrepDTO[] = [];
+        this.fallbackCore!.process(req, (resp) => {
+          if (resp.type === 'STAGE_HYDRATE_BREP') {
+            elements = resp.elements;
+          } else if (resp.type === 'STAGE_ERROR') {
+            reject(new Error(resp.error));
+          }
+        }).then(() => {
+          resolve(elements);
+        }).catch(reject);
+      });
+    }
+    throw new Error('Worker and fallbackCore are both unavailable');
   }
 
   public terminate(): void {

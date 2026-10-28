@@ -37,6 +37,11 @@ export * from './parser/IfcStreamingParser';
 export * from './parser/ChunkedStreamScanner';
 export * from './parser/IfcTypeDictionary';
 
+// Geometry Generators
+export * from './geometry/DirectCylinderGenerator';
+export * from './geometry/StaticProfileTemplates';
+export * from './geometry/ToroidTemplateCache';
+
 // Detector & Importer
 export * from './detector/GeometryPrototypeDetector';
 export * from './detector/ParametricSolidHasher';

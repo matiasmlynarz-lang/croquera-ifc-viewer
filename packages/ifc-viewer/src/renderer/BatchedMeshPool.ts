@@ -176,6 +176,9 @@ export class BatchedMeshPool {
 
     // Pass 1: Ingest and register 'GROUP' ontological container metadata (Rule 15)
     for (const el of elements) {
+      if (el.ifcType === 'IfcOpeningElement') {
+        continue;
+      }
       if (el.type === 'GROUP') {
         let groupRec = this.groupMap.get(el.id);
         if (!groupRec) {
@@ -484,26 +487,43 @@ export class BatchedMeshPool {
       const instBox = new THREE.Box3().copy(protoGeo.boundingBox!).applyMatrix4(tempMatrix);
       this.modelBoundingBox.union(instBox);
 
+      const groupRec = inst.parentId ? this.groupMap.get(inst.parentId) : undefined;
+      const isPrimary = groupRec ? groupRec.childrenIds.length === 0 : true;
+
+      if (groupRec) {
+        groupRec.childrenIds.push(inst.id);
+        groupRec.box.union(instBox);
+        this.childToGroupMap.set(inst.id, groupRec.id);
+        if (!this.groupAliasMap.has(groupRec.id)) {
+          this.groupAliasMap.set(groupRec.id, inst.id);
+        }
+      }
+
+      const effectivePsets =
+        inst.psets && Object.keys(inst.psets).length > 0
+          ? inst.psets
+          : groupRec?.psets || {};
+
       const record: RenderedElementRecord = {
         id: inst.id,
-        stepId: inst.stepId || 0,
+        stepId: inst.stepId || groupRec?.stepId || 0,
         name: inst.name,
         ifcType: inst.ifcType,
         parentId: inst.parentId,
         storeyId: inst.storeyId,
         matrixId: prototypeId,
-        psets: inst.psets,
+        psets: effectivePsets,
         mesh: instancedMesh,
         batchId: i,
         materialId: this.prototypeMaterials.has(prototypeId) ? prototypeId : null,
         box: instBox,
-        groupId: inst.parentId || inst.id,
-        groupName: inst.name,
-        isPrimaryChild: true,
+        groupId: groupRec ? groupRec.id : inst.parentId || inst.id,
+        groupName: groupRec ? groupRec.name : inst.name,
+        isPrimaryChild: isPrimary,
       };
 
       this.elementMap.set(inst.id, record);
-      if (inst.stepId && inst.stepId > 0) {
+      if (inst.stepId && inst.stepId > 0 && !groupRec) {
         this.stepIdMap.set(inst.stepId, inst.id);
       }
       instMap.set(i, inst.id);

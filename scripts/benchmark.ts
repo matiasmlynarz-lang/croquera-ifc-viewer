@@ -6,117 +6,287 @@ import { IfcStepImporter } from '../packages/ifc-core/src/importer/IfcStepImport
 
 const require = createRequire(import.meta.url);
 
-async function runBenchmarkForFile(filePath: string) {
-  if (!fs.existsSync(filePath)) {
-    console.error(`[ERROR] File not found: ${filePath}`);
-    process.exit(1);
-  }
+interface BenchmarkMetric {
+  fileName: string;
+  sizeMB: number;
+  entities: number;
+  readDiskMs: number;
+  croq: {
+    scanMs: number;
+    boundsMs: number;
+    geomMs: number;
+    totalMs: number;
+    products: number;
+    triangles: number;
+    heapMB: number;
+    error?: string;
+  };
+  lite: {
+    parseMs: number;
+    geomMs: number;
+    totalMs: number;
+    meshes: number;
+    triangles: number;
+    heapMB: number;
+    error?: string;
+  } | null;
+}
 
+// Carga segura de IFCLite
+let ifcLiteAvailable = false;
+let parseModel: any;
+let GeometryProcessor: any;
+
+try {
+  const ifcLitePkgPath = 'C:/Users/CyD/.gemini/antigravity-ide/brain/04534258-fe68-41ce-bd0a-7bedd4311976/scratch/benchmark-test/node_modules';
+  parseModel = require(path.join(ifcLitePkgPath, '@ifc-lite/parser')).parseModel;
+  GeometryProcessor = require(path.join(ifcLitePkgPath, '@ifc-lite/geometry')).GeometryProcessor;
+  ifcLiteAvailable = true;
+} catch {
+  try {
+    parseModel = require('@ifc-lite/parser').parseModel;
+    GeometryProcessor = require('@ifc-lite/geometry').GeometryProcessor;
+    ifcLiteAvailable = true;
+  } catch {
+    ifcLiteAvailable = false;
+  }
+}
+
+async function runBenchmarkForFile(filePath: string): Promise<BenchmarkMetric> {
   const stat = fs.statSync(filePath);
-  const sizeMB = (stat.size / (1024 * 1024)).toFixed(2);
+  const sizeMB = parseFloat((stat.size / (1024 * 1024)).toFixed(2));
   const fileName = path.basename(filePath);
 
   console.log(`\n========================================================================`);
   console.log(` IFC BENCHMARK: ${fileName} (${sizeMB} MB)`);
   console.log(`========================================================================\n`);
 
+  if (global.gc) {
+    global.gc();
+  }
+
   const tRead0 = performance.now();
   const buf = fs.readFileSync(filePath);
   const tRead1 = performance.now();
-  console.log(`I/O Disk Read: ${(tRead1 - tRead0).toFixed(1)} ms | Initial Heap: ${(process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(1)} MB\n`);
+  const readDiskMs = parseFloat((tRead1 - tRead0).toFixed(1));
+  console.log(`I/O Disk Read: ${readDiskMs} ms | Initial Heap: ${(process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(1)} MB\n`);
+
+  const metric: BenchmarkMetric = {
+    fileName,
+    sizeMB,
+    entities: 0,
+    readDiskMs,
+    croq: {
+      scanMs: 0,
+      boundsMs: 0,
+      geomMs: 0,
+      totalMs: 0,
+      products: 0,
+      triangles: 0,
+      heapMB: 0,
+    },
+    lite: null,
+  };
 
   // --- 1. CROQUERA IFC CORE ---
   console.log(`[1/2] Running Croquera IFC Core...`);
-  const arrayBuf = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
-
-  const cT0 = performance.now();
-  const scanner = new ChunkedStreamScanner(arrayBuf);
-  scanner.parseHeader();
-  scanner.scanDataSection();
-  const cTScan = performance.now();
-
-  const importer = IfcStepImporter.fromStreamingParser(scanner);
-  const spatial = importer.extractSpatialHierarchy();
-  const bounds = importer.extractProductBounds();
-  const cTBounds = performance.now();
-
-  const chunks = Array.from(importer.extractGeometryChunks(100));
-  const cTGeom = performance.now();
-  const croqProducts = chunks.reduce((acc, c) => acc + c.elements.length, 0);
-
-  const croqScanMs = Math.round(cTScan - cT0);
-  const croqBoundsMs = Math.round(cTBounds - cTScan);
-  const croqGeomMs = Math.round(cTGeom - cTBounds);
-  const croqTotalMs = Math.round(cTGeom - cT0);
-
-  console.log(`  - STEP Ingestion & Indexing:  ${croqScanMs} ms (${scanner.totalEntities.toLocaleString()} entities)`);
-  console.log(`  - Spatial & Bounds (AABB):    ${croqBoundsMs} ms (Camera ready in ${croqScanMs + croqBoundsMs} ms)`);
-  console.log(`  - Geometry Tessellation:     ${croqGeomMs} ms`);
-  console.log(`  - Total End-to-End:          ${croqTotalMs} ms`);
-  console.log(`  - Output:                    ${croqProducts} consolidated products (IfcProduct)`);
-  console.log(`  - Heap Usage:                ${(process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(1)} MB\n`);
-
-  // --- 2. IFCLITE (if installed) ---
-  let ifcLiteAvailable = false;
-  let parseModel: any;
-  let GeometryProcessor: any;
-
   try {
-    const ifcLitePkgPath = 'C:/Users/CyD/.gemini/antigravity-ide/brain/04534258-fe68-41ce-bd0a-7bedd4311976/scratch/benchmark-test/node_modules';
-    parseModel = require(path.join(ifcLitePkgPath, '@ifc-lite/parser')).parseModel;
-    GeometryProcessor = require(path.join(ifcLitePkgPath, '@ifc-lite/geometry')).GeometryProcessor;
-    ifcLiteAvailable = true;
-  } catch {
-    try {
-      parseModel = require('@ifc-lite/parser').parseModel;
-      GeometryProcessor = require('@ifc-lite/geometry').GeometryProcessor;
-      ifcLiteAvailable = true;
-    } catch {
-      // IFCLite optional
-    }
-  }
+    const arrayBuf = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
 
-  if (ifcLiteAvailable) {
-    console.log(`[2/2] Running IFCLite (Rust/WASM)...`);
-    const u8 = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+    const cT0 = performance.now();
+    const scanner = new ChunkedStreamScanner(arrayBuf);
+    scanner.parseHeader();
+    scanner.scanDataSection();
+    const cTScan = performance.now();
 
-    const proc = new GeometryProcessor();
-    await proc.init();
+    metric.entities = scanner.totalEntities;
 
-    const lT0 = performance.now();
-    const parsed = await parseModel(u8);
-    const lTParse = performance.now();
+    const importer = IfcStepImporter.fromStreamingParser(scanner);
+    const spatial = importer.extractSpatialHierarchy();
+    const bounds = importer.extractProductBounds();
+    const cTBounds = performance.now();
 
-    let liteMeshes = 0;
-    for await (const ev of proc.processStreaming(u8)) {
-      if (ev.type === 'batch') {
-        liteMeshes += ev.meshes ? ev.meshes.length : 0;
+    let totalTris = 0;
+    let totalProds = 0;
+    for (const chunk of importer.extractGeometryChunks(100)) {
+      totalProds += chunk.elements.length;
+      for (const el of chunk.elements) {
+        if (el.indices) {
+          totalTris += Math.floor(el.indices.length / 3);
+        }
       }
     }
-    const lTGeom = performance.now();
-    proc.dispose();
+    const cTGeom = performance.now();
 
-    const liteParseMs = Math.round(lTParse - lT0);
-    const liteGeomMs = Math.round(lTGeom - lTParse);
-    const liteTotalMs = Math.round(lTGeom - lT0);
+    metric.croq.scanMs = Math.round(cTScan - cT0);
+    metric.croq.boundsMs = Math.round(cTBounds - cTScan);
+    metric.croq.geomMs = Math.round(cTGeom - cTBounds);
+    metric.croq.totalMs = Math.round(cTGeom - cT0);
+    metric.croq.products = totalProds;
+    metric.croq.triangles = totalTris;
+    metric.croq.heapMB = parseFloat((process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(1));
 
-    console.log(`  - STEP Parsing:              ${liteParseMs} ms`);
-    console.log(`  - Geometry Streaming:        ${liteGeomMs} ms`);
-    console.log(`  - Total End-to-End:          ${liteTotalMs} ms`);
-    console.log(`  - Output:                    ${liteMeshes} mesh primitive fragments (MeshData)`);
-    console.log(`  - Heap Usage:                ${(process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(1)} MB\n`);
-
-    console.log(`------------------------------------------------------------------------`);
-    console.log(` COMPARISON SUMMARY:`);
-    console.log(`  - STEP Ingestion:            Croquera is ${(liteParseMs / (croqScanMs || 1)).toFixed(1)}x faster`);
-    console.log(`  - Time-to-First-Frame:       Croquera frames camera ${Math.round(liteParseMs - (croqScanMs + croqBoundsMs))} ms earlier`);
-    console.log(`  - Pure Tessellation:         IFCLite is ${(croqGeomMs / (liteGeomMs || 1)).toFixed(1)}x faster`);
-    console.log(`  - Total End-to-End:          Croquera: ${croqTotalMs} ms vs IFCLite: ${liteTotalMs} ms`);
-    console.log(`------------------------------------------------------------------------\n`);
-  } else {
-    console.log(`[2/2] IFCLite not found in dependencies (Skipping comparison).`);
+    console.log(`  - STEP Ingestion & Indexing:  ${metric.croq.scanMs} ms (${scanner.totalEntities.toLocaleString()} entities)`);
+    console.log(`  - Spatial & Bounds (AABB):    ${metric.croq.boundsMs} ms (Camera ready in ${metric.croq.scanMs + metric.croq.boundsMs} ms)`);
+    console.log(`  - Geometry Tessellation:     ${metric.croq.geomMs} ms`);
+    console.log(`  - Total End-to-End:          ${metric.croq.totalMs} ms`);
+    console.log(`  - Output:                    ${metric.croq.products} consolidated products (${totalTris.toLocaleString()} triangles)`);
+    console.log(`  - Heap Usage:                ${metric.croq.heapMB} MB\n`);
+  } catch (err: any) {
+    metric.croq.error = err.message || String(err);
+    console.error(`  [ERROR Croquera]:`, metric.croq.error);
   }
+
+  // --- 2. IFCLITE (Rust/WASM) ---
+  if (ifcLiteAvailable) {
+    console.log(`[2/2] Running IFCLite (Rust/WASM)...`);
+    metric.lite = {
+      parseMs: 0,
+      geomMs: 0,
+      totalMs: 0,
+      meshes: 0,
+      triangles: 0,
+      heapMB: 0,
+    };
+
+    try {
+      if (global.gc) {
+        global.gc();
+      }
+
+      const u8 = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+
+      const proc = new GeometryProcessor();
+      await proc.init();
+
+      const lT0 = performance.now();
+      const parsed = await parseModel(u8);
+      const lTParse = performance.now();
+
+      let liteMeshes = 0;
+      let liteTris = 0;
+      for await (const ev of proc.processStreaming(u8)) {
+        if (ev.type === 'batch' && ev.meshes) {
+          liteMeshes += ev.meshes.length;
+          for (const m of ev.meshes) {
+            if (m.indices) {
+              liteTris += Math.floor(m.indices.length / 3);
+            }
+          }
+        }
+      }
+      const lTGeom = performance.now();
+      proc.dispose();
+
+      metric.lite.parseMs = Math.round(lTParse - lT0);
+      metric.lite.geomMs = Math.round(lTGeom - lTParse);
+      metric.lite.totalMs = Math.round(lTGeom - lT0);
+      metric.lite.meshes = liteMeshes;
+      metric.lite.triangles = liteTris;
+      metric.lite.heapMB = parseFloat((process.memoryUsage().heapUsed / (1024 * 1024)).toFixed(1));
+
+      console.log(`  - STEP Parsing:              ${metric.lite.parseMs} ms`);
+      console.log(`  - Geometry Streaming:        ${metric.lite.geomMs} ms`);
+      console.log(`  - Total End-to-End:          ${metric.lite.totalMs} ms`);
+      console.log(`  - Output:                    ${metric.lite.meshes} mesh fragments (${liteTris.toLocaleString()} triangles)`);
+      console.log(`  - Heap Usage:                ${metric.lite.heapMB} MB\n`);
+
+      console.log(`------------------------------------------------------------------------`);
+      console.log(` COMPARISON SUMMARY:`);
+      const scanSpeed = (metric.lite.parseMs / (metric.croq.scanMs || 1)).toFixed(1);
+      console.log(`  - STEP Ingestion:            Croquera is ${scanSpeed}x faster`);
+      console.log(`  - Time-to-First-Frame:       Croquera frames camera ${Math.round(metric.lite.parseMs - (metric.croq.scanMs + metric.croq.boundsMs))} ms earlier`);
+      const geomWinner = metric.lite.geomMs < metric.croq.geomMs
+        ? `IFCLite is ${(metric.croq.geomMs / (metric.lite.geomMs || 1)).toFixed(1)}x faster`
+        : `Croquera is ${(metric.lite.geomMs / (metric.croq.geomMs || 1)).toFixed(1)}x faster`;
+      console.log(`  - Pure Tessellation:         ${geomWinner}`);
+      const totalWinner = metric.croq.totalMs < metric.lite.totalMs
+        ? `Croquera won (by ${metric.lite.totalMs - metric.croq.totalMs} ms)`
+        : `IFCLite won (by ${metric.croq.totalMs - metric.lite.totalMs} ms)`;
+      console.log(`  - Total End-to-End:          ${totalWinner} (Croquera: ${metric.croq.totalMs} ms vs IFCLite: ${metric.lite.totalMs} ms)`);
+      console.log(`------------------------------------------------------------------------\n`);
+    } catch (err: any) {
+      metric.lite.error = err.message || String(err);
+      console.error(`  [ERROR IFCLite]:`, metric.lite.error);
+    }
+  }
+
+  return metric;
 }
 
-const target = process.argv[2] || 'C:/AI/10 CROQUERA/ModelosDePrueba/EmergenciaNorte_Base.ifc';
-runBenchmarkForFile(target).catch(console.error);
+function printConsolidatedReport(results: BenchmarkMetric[]) {
+  console.log(`\n================================================================================================`);
+  console.log(` CONSOLIDATED BENCHMARK REPORT: CROQUERA IFC CORE vs IFC-LITE`);
+  console.log(`================================================================================================\n`);
+
+  console.log(`| Modelo IFC | Tamaño | Entidades | Croq STEP | Lite STEP | Croq Geom | Lite Geom | Croq Total | Lite Total | Ganador Total | Factor |`);
+  console.log(`| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |`);
+
+  for (const r of results) {
+    if (r.croq.error || (r.lite && r.lite.error)) {
+      const errNote = r.croq.error ? `Croq Err` : `Lite Err`;
+      console.log(`| ${r.fileName} | ${r.sizeMB} MB | ${r.entities.toLocaleString()} | - | - | - | - | - | - | ${errNote} | - |`);
+      continue;
+    }
+
+    const croqStep = `${r.croq.scanMs} ms`;
+    const liteStep = r.lite ? `${r.lite.parseMs} ms` : 'N/A';
+    const croqGeom = `${r.croq.geomMs} ms`;
+    const liteGeom = r.lite ? `${r.lite.geomMs} ms` : 'N/A';
+    const croqTot = `${r.croq.totalMs} ms`;
+    const liteTot = r.lite ? `${r.lite.totalMs} ms` : 'N/A';
+
+    let winner = 'Croquera';
+    let factor = '1.0x';
+    if (r.lite) {
+      if (r.croq.totalMs <= r.lite.totalMs) {
+        winner = 'Croquera';
+        factor = `${(r.lite.totalMs / (r.croq.totalMs || 1)).toFixed(2)}x`;
+      } else {
+        winner = 'IFC-Lite';
+        factor = `${(r.croq.totalMs / (r.lite.totalMs || 1)).toFixed(2)}x`;
+      }
+    }
+
+    console.log(`| ${r.fileName} | ${r.sizeMB} MB | ${r.entities.toLocaleString()} | ${croqStep} | ${liteStep} | ${croqGeom} | ${liteGeom} | ${croqTot} | ${liteTot} | **${winner}** | ${factor} |`);
+  }
+
+  console.log(`\n================================================================================================\n`);
+}
+
+async function main() {
+  const targetPath = process.argv[2] || 'C:/AI/10 CROQUERA/ModelosBenchmark';
+
+  if (!fs.existsSync(targetPath)) {
+    console.error(`[ERROR] Target path does not exist: ${targetPath}`);
+    process.exit(1);
+  }
+
+  const stat = fs.statSync(targetPath);
+  let filesToTest: string[] = [];
+
+  if (stat.isDirectory()) {
+    const allFiles = fs.readdirSync(targetPath);
+    filesToTest = allFiles
+      .filter((f) => f.toLowerCase().endsWith('.ifc'))
+      .map((f) => path.join(targetPath, f))
+      .sort((a, b) => fs.statSync(a).size - fs.statSync(b).size);
+    console.log(`[INFO] Found ${filesToTest.length} IFC benchmark files in ${targetPath}`);
+  } else {
+    filesToTest = [targetPath];
+  }
+
+  const results: BenchmarkMetric[] = [];
+  for (const file of filesToTest) {
+    try {
+      const metric = await runBenchmarkForFile(file);
+      results.push(metric);
+    } catch (e: any) {
+      console.error(`[CRITICAL ERROR] on file ${file}:`, e);
+    }
+  }
+
+  printConsolidatedReport(results);
+}
+
+main().catch(console.error);

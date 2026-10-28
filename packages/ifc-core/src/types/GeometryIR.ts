@@ -10,6 +10,12 @@ export interface GeometryIR {
   positions?: Float64Array;
   faceLoopOffsets?: Uint32Array;
   faceLoopCounts?: Uint32Array;
+  holeCounts?: Uint32Array;
+  holeLoopOffsets?: Uint32Array;
+  holeLoopCounts?: Uint32Array;
+  holeOwners?: (string | null)[];
+  faceMaterials?: (string | null)[];
+  faceOpeningIds?: (string | null)[];
 
   // Direct GPU Buffers (consumed immediately by Three.js BatchedMesh / InstancedMesh)
   triPositions: Float32Array;     // [x, y, z, ...] relative to model centroid

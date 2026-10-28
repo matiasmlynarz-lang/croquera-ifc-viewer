@@ -2,7 +2,7 @@ import { defineConfig } from 'vite';
 import path from 'path';
 
 export default defineConfig({
-  base: process.env.NODE_ENV === 'production' ? '/croquera/viewer/' : '/',
+  base: process.env.VITE_BASE || './',
   resolve: {
     alias: {
       '@croquera/ifc-core': path.resolve(__dirname, '../../packages/ifc-core/src'),

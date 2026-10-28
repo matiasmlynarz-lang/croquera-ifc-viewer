@@ -597,17 +597,6 @@ export class ChunkedStreamScanner implements IIfcStreamingParser {
     this.capacity = newCapacity;
   }
 
-  private extractAsciiUpper(start: number, length: number): string {
-    let str = '';
-    const buf = this.uint8;
-    for (let i = 0; i < length; i++) {
-      let c = buf[start + i];
-      if (c >= 97 && c <= 122) c -= 32; // a-z -> A-Z
-      str += String.fromCharCode(c);
-    }
-    return str;
-  }
-
   /**
    * Checks whether an entity exists in the offset index in O(1).
    */
@@ -836,45 +825,6 @@ export class ChunkedStreamScanner implements IIfcStreamingParser {
       }
       default:
         return lexer.stringValue;
-    }
-  }
-
-  private parseSingleRecord(stepId: number, rawLine: string): StepRecord | undefined {
-    try {
-      const lexer = new IfcStepLexer(rawLine);
-      const refToken = lexer.nextToken();
-      if (refToken.type !== StepTokenType.REF) return undefined;
-
-      const eqToken = lexer.nextToken();
-      if (eqToken.type !== StepTokenType.EQUALS) return undefined;
-
-      const typeToken = lexer.nextToken();
-      if (typeToken.type !== StepTokenType.WORD) return undefined;
-
-      const lp = lexer.nextToken();
-      if (lp.type !== StepTokenType.LPAREN) return undefined;
-
-      const typeName = typeToken.value.toUpperCase();
-      const params = this.parseParamList(lexer);
-
-      const semi = lexer.nextToken();
-      if (semi.type !== StepTokenType.SEMICOLON) {
-        throw new Error(`Invalid syntax: STEP entity does not end with ';' (found ${semi.type})`);
-      }
-
-      return {
-        id: stepId,
-        type: typeName,
-        params,
-        rawLine,
-      };
-    } catch (err: any) {
-      const warnMsg = `[ChunkedStreamScanner] Failed to parse entity #${stepId}: ${err?.message || err}`;
-      console.warn(warnMsg);
-      if (this.options.onError) {
-        this.options.onError(err instanceof Error ? err : new Error(String(err)), stepId, rawLine);
-      }
-      return undefined;
     }
   }
 

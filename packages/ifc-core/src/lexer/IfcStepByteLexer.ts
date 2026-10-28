@@ -67,7 +67,6 @@ export function decodeAscii(buf: Uint8Array, start: number, len: number): string
 
 export class IfcStepByteLexer {
   private buf: Uint8Array;
-  private length: number;
   public pos: number;
   private end: number;
 
@@ -83,13 +82,11 @@ export class IfcStepByteLexer {
     this.buf = buf;
     this.pos = start;
     this.end = length !== undefined ? start + length : buf.length;
-    this.length = this.end;
   }
 
   public reset(start: number, end: number): void {
     this.pos = start;
     this.end = end;
-    this.length = end;
     this.tokenType = StepTokenType.EOF;
   }
 

@@ -184,7 +184,6 @@ export class ParametricSolidHasher {
   ): ParametricSolidSignature | null {
     const sweptAreaParam = solidRec.params[0];
     const posParam = solidRec.params[1];
-    const axisParam = solidRec.params[2];
     const angleParam = solidRec.params[3];
 
     if (!sweptAreaParam || typeof sweptAreaParam !== 'object' || !('ref' in sweptAreaParam)) {

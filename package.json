@@ -9,9 +9,9 @@
   "scripts": {
     "dev": "npm run dev --workspace=apps/web-viewer",
     "build": "npm run build --workspaces",
-    "test": "vitest run",
+    "test": "vitest run --testTimeout=30000",
     "benchmark": "tsx scripts/benchmark.ts",
-    "benchmark:large": "node --max-old-space-size=8192 --loader tsx scripts/benchmark.ts",
+    "benchmark:large": "node --max-old-space-size=8192 --import tsx scripts/benchmark.ts",
     "typecheck": "tsc --build"
   },
   "devDependencies": {

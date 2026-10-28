@@ -2,12 +2,13 @@
  * main.ts — Application entry point for croquera-ifc-viewer.
  *
  * Connects the 3-stage progressive ingestion worker with buffer-first Three.js rendering,
- * GUID search, distance measurement, and the zero-copy bridge to croquera.com.
+ * GUID search, distance measurement, zero-copy bridge to croquera.com,
+ * and the bidirectional QWebChannel IPC bridge for AIF_BIM_02 (supporting multiple models).
  */
 
 import './styles/viewer.css';
 import * as THREE from 'three';
-import { Viewer3D, MaterialManager } from '@croquera/ifc-viewer';
+import { Viewer3D, MaterialManager, BatchedMeshPool } from '@croquera/ifc-viewer';
 import { GuidSearchEngine } from '@croquera/ifc-viewer';
 import { MeasureTool, type MeasurementResult } from '@croquera/ifc-viewer';
 import { CroqueraBridge } from '@croquera/ifc-viewer';
@@ -16,6 +17,7 @@ import type {
   Stage2BoundsPayload,
   Stage3GeometryChunkPayload,
 } from '@croquera/ifc-core';
+import type { RenderedElementRecord } from '@croquera/ifc-viewer';
 
 import { TopHud } from './ui/TopHud';
 import { SearchFlyout } from './ui/SearchFlyout';
@@ -23,7 +25,26 @@ import { PropertiesCard } from './ui/PropertiesCard';
 import { StatusHud } from './ui/StatusHud';
 import { DropOverlay } from './ui/DropOverlay';
 
-// ─── DOM Root Scaffold ──────────────────────────────────────────
+// ── QWebChannel Type Declarations ──────────────────────────────────────────────
+declare global {
+  interface Window {
+    QWebChannel?: any;
+    qt?: any;
+    backend?: any;
+    cargarModeloIFC: (url: string, archivo: string) => Promise<void>;
+    cargarModeloDWG: (url: string, archivo: string) => Promise<void>;
+    cargarModeloContexto: (url: string, nombre: string) => void;
+    retirarModeloContexto: (nombre: string) => void;
+    limpiarContextos: () => void;
+    limpiarEscenaCompleta: () => void;
+    recibirSemantica: (semantica: Record<string, any>) => void;
+    resaltarElementoPorID: (id: string, expressIDs?: number[]) => Promise<void>;
+    aislarPorExpressIDs: (expressIDs: number[]) => Promise<void>;
+    setProgress: (msg: string) => void;
+  }
+}
+
+// ── DOM Root Scaffold ─────────────────────────────────────────────────────────
 const app = document.getElementById('app')!;
 app.innerHTML = `
   <div class="viewer-layout">
@@ -41,12 +62,44 @@ const measureBadge = layout.querySelector('#measurement-badge') as HTMLElement;
 const measureDistance = layout.querySelector('#measurement-distance') as HTMLElement;
 const measureDeltas = layout.querySelector('#measurement-deltas') as HTMLElement;
 
-// ─── Adaptive Worker Pool Initialization ────────────────────────
+// ── Adaptive Worker Pool Initialization ────────────────────────────────────────
 const workerPool = new IfcAdaptiveWorkerPool({
   workerFactory: () => new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' }),
 });
 
-// ─── Core Viewport & Engines ────────────────────────────────────
+// ── Semantic Map & Inverse Index ───────────────────────────────────────────────
+const condIdToStepIdsMap = new Map<string, number[]>();
+const stepIdToCondIdMap = new Map<number, string>();
+const guidToCondIdMap = new Map<string, string>();
+
+window.recibirSemantica = function (semantica: Record<string, { expressID?: number[] }>) {
+  console.log(`[CroqueraViewer] Semántica inyectada desde Python: ${Object.keys(semantica).length} IDs`);
+  condIdToStepIdsMap.clear();
+  stepIdToCondIdMap.clear();
+
+  for (const condId in semantica) {
+    const data = semantica[condId];
+    if (data && Array.isArray(data.expressID)) {
+      condIdToStepIdsMap.set(condId, data.expressID);
+      for (const stepId of data.expressID) {
+        stepIdToCondIdMap.set(stepId, condId);
+      }
+    }
+  }
+};
+
+// ── QWebChannel IPC Initialization ─────────────────────────────────────────────
+function initQWebChannel() {
+  if (typeof window.QWebChannel !== 'undefined' && window.qt && window.qt.webChannelTransport) {
+    new window.QWebChannel(window.qt.webChannelTransport, (channel: any) => {
+      window.backend = channel.objects.backend;
+      console.log('[CroqueraViewer] Conectado al backend de Qt');
+    });
+  }
+}
+initQWebChannel();
+
+// ── Core Viewport & Engines ────────────────────────────────────────────────────
 const propertiesCard = new PropertiesCard({
   onClose: () => {
     viewer.clearSelection();
@@ -71,14 +124,34 @@ layout.appendChild(propertiesCard.container);
 const viewer = new Viewer3D({
   container: viewportContainer,
   onElementSelected: (element) => {
-    propertiesCard.show(element);
+    if (element) {
+      propertiesCard.show(element);
+
+      let foundCondId: string | null = null;
+      if (element.stepId && stepIdToCondIdMap.has(element.stepId)) {
+        foundCondId = stepIdToCondIdMap.get(element.stepId)!;
+      } else if (element.id && guidToCondIdMap.has(element.id)) {
+        foundCondId = guidToCondIdMap.get(element.id)!;
+      }
+
+      if (window.backend) {
+        if (foundCondId) {
+          console.log(`[CroqueraViewer] Clic en elemento con CONDICION.ID: ${foundCondId}`);
+          window.backend.recibirElementoSeleccionado(foundCondId);
+        } else {
+          window.backend.recibirElementoSeleccionado(element.id || String(element.stepId));
+        }
+      }
+    } else {
+      propertiesCard.hide();
+    }
   },
 });
 
 const searchEngine = new GuidSearchEngine(viewer.meshPool);
 const croqueraBridge = new CroqueraBridge();
 
-// ─── Measure Tool ───────────────────────────────────────────────
+// ── Measure Tool ───────────────────────────────────────────────────────────────
 const measureTool = new MeasureTool(viewer, (result: MeasurementResult | null) => {
   if (result) {
     measureBadge.classList.add('visible');
@@ -89,7 +162,7 @@ const measureTool = new MeasureTool(viewer, (result: MeasurementResult | null) =
   }
 });
 
-// ─── UI HUD & Navigation ────────────────────────────────────────
+// ── UI HUD & Navigation ────────────────────────────────────────────────────────
 const statusHud = new StatusHud();
 layout.appendChild(statusHud.container);
 
@@ -118,10 +191,10 @@ const topHud = new TopHud({
   onToggleMeasure: (active: boolean) => {
     if (active) {
       measureTool.activate();
-      statusHud.setReady('Measure tool active. Click two points on the model.');
+      statusHud.setReady('Herramienta de medición activa. Clic en dos puntos para medir.');
     } else {
       measureTool.deactivate();
-      statusHud.setReady('Measurement finished.');
+      statusHud.setReady('Medición finalizada.');
     }
   },
   onEditInCroquera: () => {
@@ -138,8 +211,10 @@ const dropOverlay = new DropOverlay({
 });
 layout.appendChild(dropOverlay.container);
 
+// ── Bounding Box Global de la Escena (Modelo Principal + Contextos) ─────────────
+const combinedSceneBounds = new THREE.Box3();
 
-// ─── Progressive IFC Streaming Ingestion ────────────────────────
+// ── Progressive IFC Streaming Ingestion (File / Local) ──────────────────────────
 async function loadIfcFile(file: File): Promise<void> {
   statusHud.setLoading(`Streaming ${file.name} (${(file.size / (1024 * 1024)).toFixed(1)} MB)...`);
 
@@ -154,30 +229,48 @@ async function loadIfcFile(file: File): Promise<void> {
   try {
     croqueraBridge.setFile(file);
     const buffer = await file.arrayBuffer();
+    await parseIfcBuffer(buffer, file.name, startTime);
+  } catch (err: any) {
+    statusHud.setError(`Failed to process model: ${err?.message || err}`);
+  }
+}
 
-    let totalParsed = 0;
-    let totalExpected = 0;
-    let initialBox: THREE.Box3 | null = null;
+// ── Core Buffer Ingestion Engine (Modelo Principal) ────────────────────────────
+let currentIngestId = 0;
 
-    const updateHudProgress = () => {
-      if (totalExpected > 0) {
-        if (totalParsed > totalExpected) {
-          totalExpected = totalParsed;
-        }
-        const pct = Math.min(99, Math.max(1, Math.round((totalParsed / totalExpected) * 100)));
-        statusHud.setLoading(`Tessellating ${totalParsed} / ${totalExpected} elements (${pct}%)...`);
-      } else {
-        statusHud.setLoading(`Tessellating ${totalParsed} elements...`);
+function parseIfcBuffer(buffer: ArrayBuffer, filename: string, startTime: number): Promise<void> {
+  currentIngestId++;
+  const thisIngestId = currentIngestId;
+
+  let totalParsed = 0;
+  let totalExpected = 0;
+  let initialBox: THREE.Box3 | null = null;
+
+  const updateHudProgress = () => {
+    if (totalExpected > 0) {
+      if (totalParsed > totalExpected) {
+        totalExpected = totalParsed;
       }
-    };
+      const pct = Math.min(99, Math.max(1, Math.round((totalParsed / totalExpected) * 100)));
+      statusHud.setLoading(`Teselando ${totalParsed} / ${totalExpected} elementos (${pct}%)...`);
+    } else {
+      statusHud.setLoading(`Teselando ${totalParsed} elementos...`);
+    }
+  };
 
-    await workerPool.parseFile(buffer, 200, (response) => {
+  return new Promise<void>((resolve, reject) => {
+    workerPool.parseFile(buffer, 200, (response) => {
+      if (thisIngestId !== currentIngestId) {
+        resolve();
+        return;
+      }
+
       if (response.type === 'STAGE_SPATIAL_HIERARCHY') {
         if (response.materials && response.materials.length > 0) {
           MaterialManager.getInstance().registerMaterials(response.materials);
         }
         statusHud.setLoading(
-          `Spatial hierarchy loaded (${response.spatialNodes.length} nodes, ${response.materials?.length || 0} materials).`
+          `Estructura espacial (${response.spatialNodes.length} nodos, ${response.materials?.length || 0} materiales)...`
         );
       } else if (response.type === 'STAGE_BOUNDS_AABB') {
         const boundsPayload = response as Stage2BoundsPayload;
@@ -202,8 +295,9 @@ async function loadIfcFile(file: File): Promise<void> {
           new THREE.Vector3(min[0] - off.x, min[1] - off.y, min[2] - off.z),
           new THREE.Vector3(max[0] - off.x, max[1] - off.y, max[2] - off.z)
         );
+        combinedSceneBounds.copy(initialBox);
         viewer.cameraRig.fitBounds(initialBox);
-        statusHud.setLoading(`Camera framed on ${totalExpected} elements. Tessellating...`);
+        statusHud.setLoading(`Cámara encuadrada (${totalExpected} elementos). Cargando mallas...`);
       } else if (response.type === 'STAGE_GEOMETRY_CHUNK') {
         const chunk = response as Stage3GeometryChunkPayload;
         viewer.meshPool.ingestChunk(chunk.elements);
@@ -214,6 +308,7 @@ async function loadIfcFile(file: File): Promise<void> {
             Math.abs(initialBox.max.x - 0.5) < 0.01
           );
           if (isDummyInitialBox) {
+            combinedSceneBounds.copy(viewer.meshPool.modelBoundingBox);
             viewer.cameraRig.fitBounds(viewer.meshPool.modelBoundingBox);
           }
         }
@@ -223,23 +318,557 @@ async function loadIfcFile(file: File): Promise<void> {
         totalParsed += response.instances.length;
         updateHudProgress();
       } else if (response.type === 'STAGE_COMPLETE') {
-        statusHud.setLoading(`Finalizing ${response.totalElements} elements (100%)...`);
         searchEngine.rebuildIndex();
         const elapsed = (performance.now() - startTime).toFixed(0);
         if (!viewer.meshPool.modelBoundingBox.isEmpty()) {
+          combinedSceneBounds.union(viewer.meshPool.modelBoundingBox);
           viewer.fitModel();
         }
         const threadsInfo = workerPool.isMultiThreadedSupported()
-          ? `${workerPool.getPoolSize()} workers (parallel)`
+          ? `${workerPool.getPoolSize()} workers`
           : '1 worker';
         statusHud.setReady(
-          `Loaded ${response.totalElements} elements in ${elapsed} ms [${threadsInfo}]. Viewport active at 120 FPS.`
+          `Modelo cargado: ${response.totalElements} elementos en ${elapsed} ms [${threadsInfo}]. Viewport 120 FPS.`
         );
+        resolve();
       } else if (response.type === 'STAGE_ERROR') {
-        statusHud.setError(`Error loading model: ${response.error}`);
+        statusHud.setError(`Error cargando modelo: ${response.error}`);
+        reject(new Error(response.error));
       }
-    });
+    }, true);
+  });
+}
+
+// ── AIF IPC API: Carga de Modelo IFC por URL (Principal) ────────────────────────
+window.cargarModeloIFC = async function (url: string, archivo: string): Promise<void> {
+  statusHud.setLoading(`Descargando geometría IFC: ${archivo}...`);
+  const startTime = performance.now();
+
+  restoreIsolation();
+  viewer.meshPool.clear();
+  propertiesCard.hide();
+  searchFlyout.clear();
+  searchEngine.markDirty();
+  topHud.setMeasureActive(false);
+  measureTool.deactivate();
+
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+    const buffer = await response.arrayBuffer();
+
+    croqueraBridge.setFile(buffer, archivo);
+    await parseIfcBuffer(buffer, archivo, startTime);
   } catch (err: any) {
-    statusHud.setError(`Failed to process model: ${err?.message || err}`);
+    statusHud.setError(`Falla al cargar modelo: ${err?.message || err}`);
+    throw err;
+  }
+};
+
+// ── AIF IPC API: Resaltar Elemento por ID / ExpressIDs ──────────────────────────
+window.resaltarElementoPorID = async function (id: string, expressIDs?: number[]): Promise<void> {
+  restoreIsolation();
+
+  let stepIds = expressIDs;
+  if ((!stepIds || stepIds.length === 0) && condIdToStepIdsMap.has(id)) {
+    stepIds = condIdToStepIdsMap.get(id);
+  }
+
+  if (stepIds && stepIds.length > 0) {
+    let firstSelected: RenderedElementRecord | null = null;
+    const combinedBox = new THREE.Box3();
+
+    for (const stepId of stepIds) {
+      const el = viewer.meshPool.getElementByStepId(stepId);
+      if (el) {
+        if (!firstSelected) {
+          firstSelected = viewer.selectElement(el.id, false);
+        }
+        if (!el.box.isEmpty()) {
+          combinedBox.union(el.box);
+        }
+      }
+    }
+
+    if (firstSelected) {
+      if (!combinedBox.isEmpty()) {
+        viewer.cameraRig.fitBounds(combinedBox, 1.5);
+      }
+      propertiesCard.show(firstSelected);
+      return;
+    }
+  }
+
+  // Fallback: búsqueda por GUID/ID directo
+  const el = viewer.selectElement(id, true);
+  if (el) {
+    propertiesCard.show(el);
+  } else {
+    console.warn(`[CroqueraViewer] Elemento ${id} no encontrado en visualizador.`);
+  }
+};
+
+// ── AIF IPC API: Aislar Elementos por ExpressIDs ─────────────────────────────────
+let isIsolated = false;
+
+function restoreIsolation() {
+  if (!isIsolated) return;
+  const elements = viewer.meshPool.getAllElements();
+  for (const el of elements) {
+    if ((el.mesh as any).isBatchedMesh && el.batchId !== undefined) {
+      (el.mesh as THREE.BatchedMesh).setVisibleAt(el.batchId, true);
+    } else if (el.mesh instanceof THREE.Mesh) {
+      el.mesh.visible = true;
+    }
+  }
+  isIsolated = false;
+}
+
+window.aislarPorExpressIDs = async function (expressIDs: number[]): Promise<void> {
+  if (!expressIDs || expressIDs.length === 0) {
+    restoreIsolation();
+    viewer.fitModel();
+    return;
+  }
+
+  const targetSet = new Set(expressIDs);
+  const elements = viewer.meshPool.getAllElements();
+  const isolatedBox = new THREE.Box3();
+
+  for (const el of elements) {
+    const visible = targetSet.has(el.stepId);
+    if ((el.mesh as any).isBatchedMesh && el.batchId !== undefined) {
+      (el.mesh as THREE.BatchedMesh).setVisibleAt(el.batchId, visible);
+    } else if (el.mesh instanceof THREE.Mesh) {
+      el.mesh.visible = visible;
+    }
+    if (visible && !el.box.isEmpty()) {
+      isolatedBox.union(el.box);
+    }
+  }
+
+  isIsolated = true;
+
+  if (!isolatedBox.isEmpty()) {
+    viewer.cameraRig.fitBounds(isolatedBox, 1.5);
+  }
+};
+
+// ── AIF IPC API: Carga de Geometría DWG Principal ──────────────────────────────
+let mainDwgGroup: THREE.Group | null = null;
+
+function createTextMesh(text: string, colorHex: string, height: number, align?: string): THREE.Mesh {
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d')!;
+  const fontSize = 64;
+  ctx.font = `bold ${fontSize}px monospace`;
+  const textWidth = ctx.measureText(text).width;
+  canvas.width = Math.ceil(textWidth + 24);
+  canvas.height = Math.ceil(fontSize + 24);
+  ctx.font = `bold ${fontSize}px monospace`;
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center';
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = colorHex;
+  ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.minFilter = THREE.LinearFilter;
+  const material = new THREE.MeshBasicMaterial({
+    map: texture,
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+
+  const aspect = canvas.width / canvas.height;
+  const textHeight = height || 1.5;
+  const textWidthMesh = textHeight * aspect;
+  const geometry = new THREE.PlaneGeometry(textWidthMesh, textHeight);
+  geometry.scale(-1, 1, 1);
+  const halfWidth = textWidthMesh / 2;
+  if (align === 'left') geometry.translate(-halfWidth, 0, 0);
+  else if (align === 'right') geometry.translate(halfWidth, 0, 0);
+  geometry.rotateX(Math.PI / 2);
+
+  return new THREE.Mesh(geometry, material);
+}
+
+window.cargarModeloDWG = async function (url: string, archivo: string): Promise<void> {
+  statusHud.setLoading(`Renderizando geometría DWG: ${archivo}...`);
+
+  try {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    const data = await response.json();
+
+    if (mainDwgGroup) {
+      viewer.scene.remove(mainDwgGroup);
+      mainDwgGroup = null;
+    }
+
+    mainDwgGroup = new THREE.Group();
+    mainDwgGroup.name = archivo;
+
+    if (data.lines) {
+      const groups: Record<string, Record<string, number[][]>> = {};
+      data.lines.forEach((line: any) => {
+        const layer = line.layer || 'Defecto';
+        const color = line.color || '#ffffff';
+        if (!groups[layer]) groups[layer] = {};
+        if (!groups[layer][color]) groups[layer][color] = [];
+
+        const pts = line.points;
+        for (let i = 0; i < pts.length - 1; i++) {
+          groups[layer][color].push(
+            [pts[i][0], pts[i][2], -pts[i][1]],
+            [pts[i + 1][0], pts[i + 1][2], -pts[i + 1][1]]
+          );
+        }
+      });
+
+      Object.keys(groups).forEach((layerName) => {
+        Object.keys(groups[layerName]).forEach((colorHex) => {
+          const coords = groups[layerName][colorHex];
+          if (coords.length === 0) return;
+
+          const positions = new Float32Array(coords.length * 3);
+          for (let i = 0; i < coords.length; i++) {
+            positions[i * 3] = coords[i][0];
+            positions[i * 3 + 1] = coords[i][1];
+            positions[i * 3 + 2] = coords[i][2];
+          }
+
+          const geometry = new THREE.BufferGeometry();
+          geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+          const material = new THREE.LineBasicMaterial({ color: new THREE.Color(colorHex) });
+          const segments = new THREE.LineSegments(geometry, material);
+          mainDwgGroup!.add(segments);
+        });
+      });
+    }
+
+    if (data.texts) {
+      const maxTexts = Math.min(data.texts.length, 3000);
+      for (let i = 0; i < maxTexts; i++) {
+        const item = data.texts[i];
+        const color = item.color || '#ffffff';
+        const textMesh = createTextMesh(item.text, color, item.height, item.align);
+        textMesh.position.set(item.point[0], item.point[2], -item.point[1]);
+        textMesh.rotation.y = -((item.rotation || 0) * Math.PI) / 180;
+        mainDwgGroup.add(textMesh);
+      }
+    }
+
+    viewer.scene.add(mainDwgGroup);
+    const box = new THREE.Box3().setFromObject(mainDwgGroup);
+    combinedSceneBounds.union(box);
+    viewer.cameraRig.fitBounds(box, 1.5);
+    statusHud.setReady(`DWG ${archivo} renderizado.`);
+  } catch (err: any) {
+    statusHud.setError(`Error al cargar DWG: ${err?.message || err}`);
+  }
+};
+
+// ── AIF IPC API: Carga Secuencial de Modelos de Contexto (IFC y DWG) ────────────
+interface ContextQueueItem {
+  url: string;
+  nombre: string;
+}
+
+const colaDeCarga: ContextQueueItem[] = [];
+let procesandoCola = false;
+let totalEnColaHist = 0;
+let procesadosContextos = 0;
+let idPeticionGlobal = 0;
+
+// Context Pools para modelos IFC (un BatchedMeshPool por modelo para gestión limpia)
+const contextIfcPools = new Map<string, BatchedMeshPool>();
+// Context Groups para modelos DWG
+const contextDwgGroups = new Map<string, THREE.Group>();
+
+const contextGhostMaterial = new THREE.MeshPhysicalMaterial({
+  color: 0x94a3b8, // Slate gray arquitectónico
+  transparent: true,
+  opacity: 0.35,
+  depthWrite: false,
+  side: THREE.DoubleSide,
+  roughness: 0.6,
+  metalness: 0.1,
+});
+
+const contextEdgeMaterial = new THREE.LineBasicMaterial({
+  color: 0x64748b,
+  transparent: true,
+  opacity: 0.25,
+});
+
+async function procesarColaContextos(): Promise<void> {
+  procesandoCola = true;
+
+  while (colaDeCarga.length > 0) {
+    const item = colaDeCarga.shift()!;
+    procesadosContextos++;
+    const myId = idPeticionGlobal;
+
+    console.log(`[CroqueraViewer] Ingestando contexto: ${item.nombre} (${colaDeCarga.length} restantes)`);
+    statusHud.setLoading(`Cargando contexto (${procesadosContextos}/${totalEnColaHist}): ${item.nombre}...`);
+
+    if (window.backend) {
+      try {
+        window.backend.emitirProgresoContextos(procesadosContextos, totalEnColaHist, item.nombre);
+      } catch (e) {
+        console.warn('Error emitiendo progreso:', e);
+      }
+    }
+
+    try {
+      await new Promise((r) => setTimeout(r, 60));
+
+      if (item.url.toLowerCase().endsWith('.json')) {
+        // Carga de Contexto DWG (JSON)
+        await cargarModeloDWGContexto(item.url, item.nombre);
+      } else {
+        // Carga de Contexto IFC
+        await cargarModeloIFCContexto(item.url, item.nombre, myId);
+      }
+    } catch (e: any) {
+      console.error(`Falla al cargar contexto ${item.nombre}:`, e);
+    }
+  }
+
+  statusHud.setReady(`Contextos cargados (${procesadosContextos} modelos en escena).`);
+  procesandoCola = false;
+
+  // Ajustar cámara para encuadrar todo el corredor del proyecto
+  if (!combinedSceneBounds.isEmpty()) {
+    viewer.cameraRig.fitBounds(combinedSceneBounds, 1.3);
   }
 }
+
+async function cargarModeloDWGContexto(url: string, nombre: string): Promise<void> {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const data = await resp.json();
+  const group = new THREE.Group();
+  group.name = nombre;
+
+  if (data.lines) {
+    const groups: Record<string, Record<string, number[][]>> = {};
+    data.lines.forEach((line: any) => {
+      const layer = line.layer || 'Defecto';
+      const color = line.color || '#888888';
+      if (!groups[layer]) groups[layer] = {};
+      if (!groups[layer][color]) groups[layer][color] = [];
+      const pts = line.points;
+      for (let i = 0; i < pts.length - 1; i++) {
+        groups[layer][color].push(
+          [pts[i][0], pts[i][2], -pts[i][1]],
+          [pts[i + 1][0], pts[i + 1][2], -pts[i + 1][1]]
+        );
+      }
+    });
+    Object.keys(groups).forEach((layerName) => {
+      Object.keys(groups[layerName]).forEach((colorHex) => {
+        const coords = groups[layerName][colorHex];
+        if (coords.length === 0) return;
+        const positions = new Float32Array(coords.length * 3);
+        for (let i = 0; i < coords.length; i++) {
+          positions[i * 3] = coords[i][0];
+          positions[i * 3 + 1] = coords[i][1];
+          positions[i * 3 + 2] = coords[i][2];
+        }
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const material = new THREE.LineBasicMaterial({
+          color: new THREE.Color(colorHex),
+          transparent: true,
+          opacity: 0.5,
+        });
+        group.add(new THREE.LineSegments(geometry, material));
+      });
+    });
+  }
+
+  viewer.scene.add(group);
+  contextDwgGroups.set(nombre, group);
+
+  const box = new THREE.Box3().setFromObject(group);
+  if (!box.isEmpty()) combinedSceneBounds.union(box);
+}
+
+async function cargarModeloIFCContexto(url: string, nombre: string, myId: number): Promise<void> {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+  const buffer = await resp.arrayBuffer();
+
+  if (myId !== idPeticionGlobal) return;
+
+  // Si ya existía un contexto con el mismo nombre, disponerlo limpiamente
+  if (contextIfcPools.has(nombre)) {
+    contextIfcPools.get(nombre)!.dispose();
+    contextIfcPools.delete(nombre);
+  }
+
+  const contextPool = new BatchedMeshPool(viewer.scene);
+  contextPool.rootGroup.name = `Context_${nombre}`;
+  contextPool.edgesGroup.name = `ContextEdges_${nombre}`;
+  contextPool.setRenderOffset(viewer.meshPool.getRenderOffset());
+
+  await new Promise<void>((resolve, reject) => {
+    workerPool.parseFile(buffer, 200, (response) => {
+      if (myId !== idPeticionGlobal) {
+        contextPool.dispose();
+        resolve();
+        return;
+      }
+
+      if (response.type === 'STAGE_BOUNDS_AABB') {
+        // Si no se había definido el renderOffset global (primer modelo), definirlo
+        if (viewer.meshPool.getRenderOffset().lengthSq() === 0) {
+          const boundsPayload = response as Stage2BoundsPayload;
+          const min = boundsPayload.modelAABB.min;
+          const max = boundsPayload.modelAABB.max;
+          const centerX = (min[0] + max[0]) / 2;
+          const centerZ = (min[2] + max[2]) / 2;
+          const minY = min[1];
+          if (Math.hypot(centerX, centerZ) > 50 || Math.abs(minY) > 50) {
+            viewer.meshPool.setRenderOffset(new THREE.Vector3(centerX, Math.abs(minY) > 5 ? minY : 0, centerZ));
+          }
+          contextPool.setRenderOffset(viewer.meshPool.getRenderOffset());
+        }
+      } else if (response.type === 'STAGE_GEOMETRY_CHUNK') {
+        const chunk = response as Stage3GeometryChunkPayload;
+        contextPool.ingestChunk(chunk.elements);
+      } else if (response.type === 'STAGE_INSTANCE_BATCH') {
+        const batch = response as any;
+        contextPool.ingestInstanceBatch(batch.prototypeId, batch.instances);
+      } else if (response.type === 'STAGE_COMPLETE') {
+        // Estilizar todas las mallas del contexto como geometría fantasma arquitectónica
+        contextPool.rootGroup.traverse((obj) => {
+          if ((obj as any).isBatchedMesh || (obj as any).isInstancedMesh || (obj as any).isMesh) {
+            (obj as any).castShadow = false;
+            (obj as any).receiveShadow = false;
+            (obj as any).material = contextGhostMaterial;
+          }
+        });
+        // Estilizar aristas sutiles para el contexto
+        contextPool.edgesGroup.traverse((obj) => {
+          if ((obj as any).isLineSegments) {
+            (obj as any).material = contextEdgeMaterial;
+          }
+        });
+
+        contextIfcPools.set(nombre, contextPool);
+
+        if (!contextPool.modelBoundingBox.isEmpty()) {
+          combinedSceneBounds.union(contextPool.modelBoundingBox);
+        }
+        resolve();
+      } else if (response.type === 'STAGE_ERROR') {
+        contextPool.dispose();
+        reject(new Error(response.error));
+      }
+    });
+  });
+}
+
+window.cargarModeloContexto = function (url: string, nombre: string): void {
+  colaDeCarga.push({ url, nombre });
+  totalEnColaHist++;
+  if (!procesandoCola) {
+    totalEnColaHist = colaDeCarga.length;
+    procesadosContextos = 0;
+    procesarColaContextos();
+  }
+};
+
+window.retirarModeloContexto = function (nombre: string): void {
+  const pool = contextIfcPools.get(nombre);
+  if (pool) {
+    pool.dispose();
+    contextIfcPools.delete(nombre);
+  }
+
+  const group = contextDwgGroups.get(nombre);
+  if (group) {
+    viewer.scene.remove(group);
+    group.traverse((c) => {
+      if ((c as THREE.Mesh).geometry) (c as THREE.Mesh).geometry.dispose();
+    });
+    contextDwgGroups.delete(nombre);
+  }
+};
+
+window.limpiarContextos = function (): void {
+  idPeticionGlobal++;
+  colaDeCarga.length = 0;
+  procesandoCola = false;
+  totalEnColaHist = 0;
+  procesadosContextos = 0;
+
+  for (const [, pool] of contextIfcPools) {
+    pool.dispose();
+  }
+  contextIfcPools.clear();
+
+  for (const [, group] of contextDwgGroups) {
+    viewer.scene.remove(group);
+    group.traverse((c) => {
+      if ((c as THREE.Mesh).geometry) (c as THREE.Mesh).geometry.dispose();
+    });
+  }
+  contextDwgGroups.clear();
+};
+
+// ── AIF IPC API: Limpieza Completa de la Escena ────────────────────────────────
+window.limpiarEscenaCompleta = function (): void {
+  currentIngestId++;
+  idPeticionGlobal++;
+  colaDeCarga.length = 0;
+  procesandoCola = false;
+  totalEnColaHist = 0;
+  procesadosContextos = 0;
+
+  restoreIsolation();
+  viewer.meshPool.clear();
+  viewer.clearSelection();
+
+  if (mainDwgGroup) {
+    viewer.scene.remove(mainDwgGroup);
+    mainDwgGroup = null;
+  }
+
+  for (const [, pool] of contextIfcPools) {
+    pool.dispose();
+  }
+  contextIfcPools.clear();
+
+  for (const [, group] of contextDwgGroups) {
+    viewer.scene.remove(group);
+    group.traverse((c) => {
+      if ((c as THREE.Mesh).geometry) (c as THREE.Mesh).geometry.dispose();
+    });
+  }
+  contextDwgGroups.clear();
+  combinedSceneBounds.makeEmpty();
+
+  propertiesCard.hide();
+  searchFlyout.clear();
+  searchEngine.markDirty();
+  topHud.setMeasureActive(false);
+  measureTool.deactivate();
+  condIdToStepIdsMap.clear();
+  stepIdToCondIdMap.clear();
+  statusHud.setReady('Escena limpia y lista.');
+};
+
+window.setProgress = function (msg: string): void {
+  if (msg) {
+    statusHud.setLoading(msg);
+  } else {
+    statusHud.setReady('Listo.');
+  }
+};

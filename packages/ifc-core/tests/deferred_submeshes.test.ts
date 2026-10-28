@@ -232,4 +232,54 @@ END-ISO-10303-21;
       expect(inst.name).toBe('Baluster Array (Part)');
     }
   });
+
+  it('preserves all sub-meshes of 1U2OcJIA1DzBQam5oqO5Op and 0X7uCi5JnAz9SlhGkXe58J when paired with Box/BoundingBox shape representations (model_3_arc.ifc)', async () => {
+    const fs = await import('fs');
+    const path = await import('path');
+    const modelPath = path.resolve(process.cwd(), 'ModelosBenchmark/model_3_arc.ifc');
+    if (!fs.existsSync(modelPath)) return;
+
+    const ifcContent = fs.readFileSync(modelPath, 'utf8');
+    const importer = new IfcStepImporter(ifcContent);
+    importer.setProductTypesFilter(IFC_PRIORITY_STRUCTURAL_TYPES);
+    importer.prepareImport();
+
+    // 1. Verify hydrateBrepMesh merges all sub-meshes of IfcMappedItem (#129722 and #63870)
+    const hydratedTable = importer.hydrateBrepMesh(129722, false);
+    expect(hydratedTable).not.toBeNull();
+    // #129648 has 45 IFCFACETEDBREP items (~15,000 faces total, far above the 18 faces of subMeshes[0])
+    expect(hydratedTable!.polyMesh.faces.size).toBeGreaterThan(1000);
+
+    const hydratedAwning = importer.hydrateBrepMesh(63870, false);
+    expect(hydratedAwning).not.toBeNull();
+    // #61459 has 13 IFCFACETEDBREP items (~5,500 faces total, far above the 6 faces of subMeshes[0])
+    expect(hydratedAwning!.polyMesh.faces.size).toBeGreaterThan(500);
+
+    // 2. Verify extractDeferredInstances emits all parts and caches shared IfcRepresentationMaps
+    const detector = new GeometryPrototypeDetector();
+    const emittedBatches: any[] = [];
+    const emittedPrototypes: any[] = [];
+
+    importer.extractDeferredInstances(
+      detector,
+      (batch) => emittedBatches.push(batch),
+      (protoChunk) => emittedPrototypes.push(protoChunk),
+      ['IFCFURNISHINGELEMENT', 'IFCBUILDINGELEMENTPROXY']
+    );
+
+    const allPrototypeElements = emittedPrototypes.flatMap((p) => p.elements);
+    const allInstances = emittedBatches.flatMap((b) => b.instances);
+
+    // Check 1U2OcJIA1DzBQam5oqO5Op (Table + 6 chairs)
+    const tableGroup = allPrototypeElements.find((e) => e.id === '1U2OcJIA1DzBQam5oqO5Op' && e.type === 'GROUP');
+    const tableDirectInst = allInstances.find((i) => i.id === '1U2OcJIA1DzBQam5oqO5Op');
+    const tableChildren = allInstances.filter((i) => i.parentId === '1U2OcJIA1DzBQam5oqO5Op');
+    expect(Boolean(tableGroup && tableChildren.length >= 2) || Boolean(tableDirectInst)).toBe(true);
+
+    // Check 0X7uCi5JnAz9SlhGkXe58J (Awning with 13 B-Rep solids)
+    const awningGroup = allPrototypeElements.find((e) => e.id === '0X7uCi5JnAz9SlhGkXe58J' && e.type === 'GROUP');
+    expect(awningGroup).toBeDefined();
+    const awningChildren = allInstances.filter((i) => i.parentId === '0X7uCi5JnAz9SlhGkXe58J');
+    expect(awningChildren.length).toBe(13);
+  }, 60000);
 });

@@ -15,6 +15,7 @@ import { GeometryTolerance } from '../math/GeometryTolerance';
 import { Vertex, Edge, Face, HalfEdge } from './HalfEdge';
 import { PolygonClipping, Vec2D } from './PolygonClipping';
 import { PlanarGraph } from './PlanarGraph';
+import type { GeometryIR } from '../types/GeometryIR';
 
 export interface TopologyValidationOptions {
   checkManifold?: boolean;
@@ -30,6 +31,49 @@ export interface TopologyValidationResult {
   eulerCharacteristic?: number;
   genus?: number;
   isClosed: boolean;
+}
+
+export interface ExtrudeResult {
+  topFace?: Face;
+  sideFaces: Face[];
+}
+
+export interface PolyMeshEdgeData {
+  a: Vec3;
+  b: Vec3;
+  hidden?: boolean;
+}
+
+export interface PolyMeshFaceData {
+  id?: string;
+  faceId?: string;
+  polyMeshId?: string;
+  vertices: Vec3[];
+  holes?: Vec3[][];
+  normal: Vec3;
+  plane: any;
+  edges: PolyMeshEdgeData[];
+  hidden?: boolean;
+  openingId?: string | null;
+  materialId?: string;
+}
+
+export interface PolyMeshSceneData {
+  id: string;
+  type: 'GEOMETRY_ENTITY';
+  name?: string;
+  parentId?: string | null;
+  hostFaceId?: string | null;
+  storeyId?: string | null;
+  matrixId?: string | null;
+  faces: PolyMeshFaceData[];
+  vertices: Vec3[];
+  edges: PolyMeshEdgeData[];
+  polyMesh?: any;
+  threeGroup?: any;
+  renderProxy?: any;
+  inferenceData?: any;
+  hidden?: boolean;
 }
 
 export class PolyMesh {
@@ -896,16 +940,7 @@ export class PolyMesh {
   }
 
   // ─── Polygon Geometry Calculations ──────────────────────────
-  static computePolygonArea(pts: Vec3[]): number {
-    if (pts.length < 3) return 0;
-    const p0 = pts[0];
-    let totalCross = Vec3.ZERO;
-    const n = pts.length;
-    for (let i = 1; i < n - 1; i++) {
-      totalCross = totalCross.add(pts[i].sub(p0).cross(pts[i + 1].sub(p0)));
-    }
-    return totalCross.length() * 0.5;
-  }
+
 
   // ─── Rendering & SceneGraph Conversion ──────────────────────
   toThreeGeometry(renderOffset?: Vec3, singleSided = false): THREE.BufferGeometry {
@@ -1103,6 +1138,291 @@ export class PolyMesh {
 
     geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
     return geo;
+  }
+
+  /**
+   * Directly extracts raw GPU-ready flat TypedArrays (Float32Array / Uint32Array) from PolyMesh
+   * without creating intermediate THREE.BufferGeometry or computing UV coordinates.
+   * Conforms strictly to Rule 7 (hot-path complexity) and central tolerances (Rule 6).
+   */
+  public toRawBuffers(renderOffset?: Vec3, singleSided = true): {
+    positions: Float32Array;
+    normals: Float32Array;
+    indices: Uint32Array;
+    edgesBuffer: Float32Array;
+  } {
+    const ox = renderOffset ? renderOffset.x : 0;
+    const oy = renderOffset ? renderOffset.y : 0;
+    const oz = renderOffset ? renderOffset.z : 0;
+
+    // 1. Gather front-facing (and optionally back-facing) triangles
+    const triList: Vec3[] = [];
+    const normList: Vec3[] = [];
+
+    for (const face of this.faces.values()) {
+      if (face.hidden) continue;
+      const verts = face.getPositions();
+      const n = face.normal;
+      const tris = face.hasHoles()
+        ? PolygonClipping.triangulateWithHoles(verts, face.holes, n)
+        : PolygonClipping.triangulate(verts, n);
+
+      for (let i = 0; i < tris.length; i++) {
+        triList.push(tris[i]);
+        normList.push(n);
+      }
+
+      if (!singleSided) {
+        const numTris = tris.length / 3;
+        const invN = new Vec3(-n.x, -n.y, -n.z);
+        for (let t = 0; t < numTris; t++) {
+          triList.push(tris[t * 3], tris[t * 3 + 2], tris[t * 3 + 1]);
+          normList.push(invN, invN, invN);
+        }
+      }
+    }
+
+    const vertCount = triList.length;
+    const positions = new Float32Array(vertCount * 3);
+    const normals = new Float32Array(vertCount * 3);
+    const indices = new Uint32Array(vertCount);
+
+    for (let i = 0; i < vertCount; i++) {
+      const p = triList[i];
+      const n = normList[i];
+      const idx3 = i * 3;
+      positions[idx3] = p.x - ox;
+      positions[idx3 + 1] = p.y - oy;
+      positions[idx3 + 2] = p.z - oz;
+      normals[idx3] = n.x;
+      normals[idx3 + 1] = n.y;
+      normals[idx3 + 2] = n.z;
+      indices[i] = i;
+    }
+
+    // 2. Feature edges extraction
+    const edgeCoords: number[] = [];
+    const faceNormals = new Map<string, Vec3>();
+    const getNormal = (f: Face): Vec3 => {
+      let n = faceNormals.get(f.id);
+      if (!n) {
+        n = f.normal;
+        faceNormals.set(f.id, n);
+      }
+      return n;
+    };
+
+    for (const edge of this.edges.values()) {
+      if (edge.hidden) continue;
+
+      const f1 = edge.he1.face;
+      const f2 = edge.he2?.face || edge.he1.twin?.face;
+
+      if (f1?.hidden && f2?.hidden) continue;
+
+      if (!f1 || !f2 || f1.hidden || f2.hidden) {
+        const a = edge.vA.position;
+        const b = edge.vB.position;
+        edgeCoords.push(a.x - ox, a.y - oy, a.z - oz, b.x - ox, b.y - oy, b.z - oz);
+        continue;
+      }
+
+      if (f1.materialId !== f2.materialId || f1.openingId !== f2.openingId) {
+        const a = edge.vA.position;
+        const b = edge.vB.position;
+        edgeCoords.push(a.x - ox, a.y - oy, a.z - oz, b.x - ox, b.y - oy, b.z - oz);
+        continue;
+      }
+
+      if (f1.id === f2.id) continue;
+
+      const n1 = getNormal(f1);
+      const n2 = getNormal(f2);
+      if (n1.dot(n2) < GeometryTolerance.COS_CREASE_THRESHOLD) {
+        const a = edge.vA.position;
+        const b = edge.vB.position;
+        edgeCoords.push(a.x - ox, a.y - oy, a.z - oz, b.x - ox, b.y - oy, b.z - oz);
+      }
+    }
+
+    // Hole outlines
+    for (const face of this.faces.values()) {
+      if (face.hidden) continue;
+      for (const hole of face.holes) {
+        const m = hole.length;
+        for (let i = 0; i < m; i++) {
+          const a = hole[i];
+          const b = hole[(i + 1) % m];
+          edgeCoords.push(a.x - ox, a.y - oy, a.z - oz, b.x - ox, b.y - oy, b.z - oz);
+        }
+      }
+    }
+
+    const edgesBuffer = new Float32Array(edgeCoords);
+
+    return {
+      positions,
+      normals,
+      indices,
+      edgesBuffer,
+    };
+  }
+
+  /**
+   * Universal Intermediate Representation (GeometryIR) exporter.
+   * Encodes exact 2-manifold B-Rep polygon loops, holes, and attributes
+   * into zero-copy Transferable TypedArrays for Web Worker IPC and GPU streaming.
+   */
+  public toGeometryIR(renderOffset?: Vec3): GeometryIR {
+    const raw = this.toRawBuffers(renderOffset, false);
+    const ox = renderOffset ? renderOffset.x : 0;
+    const oy = renderOffset ? renderOffset.y : 0;
+    const oz = renderOffset ? renderOffset.z : 0;
+
+    const allPositions: number[] = [];
+    const faceList = Array.from(this.faces.values());
+    const faceCount = faceList.length;
+
+    const faceLoopOffsets = new Uint32Array(faceCount);
+    const faceLoopCounts = new Uint32Array(faceCount);
+    const holeCounts = new Uint32Array(faceCount);
+
+    const holeLoopOffsetsList: number[] = [];
+    const holeLoopCountsList: number[] = [];
+    const holeOwnersList: (string | null)[] = [];
+    const faceMaterialsList: (string | null)[] = [];
+    const faceOpeningIdsList: (string | null)[] = [];
+
+    let currentVertexIndex = 0;
+
+    for (let f = 0; f < faceCount; f++) {
+      const face = faceList[f];
+      const positions = face.getPositions();
+
+      faceLoopOffsets[f] = currentVertexIndex;
+      faceLoopCounts[f] = positions.length;
+
+      for (const p of positions) {
+        allPositions.push(p.x - ox, p.y - oy, p.z - oz);
+        currentVertexIndex++;
+      }
+
+      faceMaterialsList.push(face.materialId ?? null);
+      faceOpeningIdsList.push(face.openingId ?? null);
+
+      const holes = face.holes || [];
+      holeCounts[f] = holes.length;
+
+      for (let h = 0; h < holes.length; h++) {
+        const hole = holes[h];
+        holeLoopOffsetsList.push(currentVertexIndex);
+        holeLoopCountsList.push(hole.length);
+        holeOwnersList.push(face.holeOwners && h < face.holeOwners.length ? face.holeOwners[h] : null);
+
+        for (const hp of hole) {
+          allPositions.push(hp.x - ox, hp.y - oy, hp.z - oz);
+          currentVertexIndex++;
+        }
+      }
+    }
+
+    return {
+      positions: new Float64Array(allPositions),
+      faceLoopOffsets,
+      faceLoopCounts,
+      holeCounts,
+      holeLoopOffsets: new Uint32Array(holeLoopOffsetsList),
+      holeLoopCounts: new Uint32Array(holeLoopCountsList),
+      holeOwners: holeOwnersList,
+      faceMaterials: faceMaterialsList,
+      faceOpeningIds: faceOpeningIdsList,
+      triPositions: raw.positions,
+      triNormals: raw.normals,
+      triIndices: raw.indices,
+      featureEdges: raw.edgesBuffer,
+    };
+  }
+
+  /**
+   * Rehydrates a fully functional, editable PolyMesh B-Rep from GeometryIR.
+   */
+  public static fromGeometryIR(ir: GeometryIR, id: string = 'mesh_from_ir', renderOffset?: Vec3): PolyMesh {
+    const mesh = new PolyMesh(id);
+    const ox = renderOffset ? renderOffset.x : 0;
+    const oy = renderOffset ? renderOffset.y : 0;
+    const oz = renderOffset ? renderOffset.z : 0;
+
+    if (ir.positions && ir.faceLoopOffsets && ir.faceLoopCounts) {
+      const numFaces = ir.faceLoopCounts.length;
+      let currentHoleIdx = 0;
+
+      for (let f = 0; f < numFaces; f++) {
+        const offset = ir.faceLoopOffsets[f] * 3;
+        const count = ir.faceLoopCounts[f];
+        const outerPts: Vec3[] = [];
+
+        for (let i = 0; i < count; i++) {
+          const px = ir.positions[offset + i * 3] + ox;
+          const py = ir.positions[offset + i * 3 + 1] + oy;
+          const pz = ir.positions[offset + i * 3 + 2] + oz;
+          outerPts.push(new Vec3(px, py, pz));
+        }
+
+        const numHoles = ir.holeCounts ? ir.holeCounts[f] : 0;
+        const faceHoles: Vec3[][] = [];
+        const faceHoleOwners: (string | null)[] = [];
+
+        for (let h = 0; h < numHoles; h++) {
+          if (ir.holeLoopOffsets && ir.holeLoopCounts) {
+            const hOffset = ir.holeLoopOffsets[currentHoleIdx] * 3;
+            const hCount = ir.holeLoopCounts[currentHoleIdx];
+            const hOwner = ir.holeOwners ? ir.holeOwners[currentHoleIdx] : null;
+            const holePts: Vec3[] = [];
+
+            for (let j = 0; j < hCount; j++) {
+              const hx = ir.positions[hOffset + j * 3] + ox;
+              const hy = ir.positions[hOffset + j * 3 + 1] + oy;
+              const hz = ir.positions[hOffset + j * 3 + 2] + oz;
+              holePts.push(new Vec3(hx, hy, hz));
+            }
+
+            faceHoles.push(holePts);
+            faceHoleOwners.push(hOwner);
+          }
+          currentHoleIdx++;
+        }
+
+        const face = mesh.addFace(
+          outerPts,
+          undefined,
+          faceHoles.length > 0 ? faceHoles : undefined,
+          faceHoleOwners.length > 0 ? faceHoleOwners : undefined
+        );
+
+        if (ir.faceMaterials && ir.faceMaterials[f]) {
+          face.materialId = ir.faceMaterials[f];
+        }
+        if (ir.faceOpeningIds && ir.faceOpeningIds[f]) {
+          face.openingId = ir.faceOpeningIds[f];
+        }
+      }
+    } else if (ir.triPositions && ir.triIndices) {
+      // Fallback: Reconstruct from triangulated buffer if boundary loops are absent
+      const triCount = ir.triIndices.length / 3;
+      for (let t = 0; t < triCount; t++) {
+        const i0 = ir.triIndices[t * 3] * 3;
+        const i1 = ir.triIndices[t * 3 + 1] * 3;
+        const i2 = ir.triIndices[t * 3 + 2] * 3;
+
+        const p0 = new Vec3(ir.triPositions[i0] + ox, ir.triPositions[i0 + 1] + oy, ir.triPositions[i0 + 2] + oz);
+        const p1 = new Vec3(ir.triPositions[i1] + ox, ir.triPositions[i1 + 1] + oy, ir.triPositions[i1 + 2] + oz);
+        const p2 = new Vec3(ir.triPositions[i2] + ox, ir.triPositions[i2 + 1] + oy, ir.triPositions[i2 + 2] + oz);
+
+        mesh.addFace([p0, p1, p2]);
+      }
+    }
+
+    return mesh;
   }
 
   /**
@@ -1702,6 +2022,849 @@ export class PolyMesh {
     this.rebuildTopology();
     return true;
   }
+
+﻿  // â”€â”€â”€ 3-Way Push/Pull Extrusion Engine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  /**
+   * Extrude a planar face along its normal by a given distance.
+   */
+  extrudeFace(faceId: string, distance: number): ExtrudeResult {
+    const originalFace = this.faces.get(faceId);
+    if (!originalFace || Math.abs(distance) < 1e-5) {
+      return { sideFaces: [] };
+    }
+
+    const originalNormal = originalFace.normal;
+    const offsetVector = originalNormal.scale(distance);
+    const basePositions = originalFace.getPositions();
+    const n = basePositions.length;
+
+    // 1. Check if this face is a sub-face on a larger surface (has coplanar neighbor faces)
+    const coplanarNeighbors = Array.from(this.faces.values()).filter((f) => {
+      return f.id !== faceId &&
+        Math.abs(f.normal.dot(originalNormal)) > 0.95 &&
+        Math.abs(f.plane.distanceToPoint(originalFace.plane.origin)) < GeometryTolerance.POINT_ON_PLANE;
+    });
+    const isSubFace = coplanarNeighbors.length > 0;
+
+    // 2. Check if this face is connected to a 3D solid (shares vertices with faces of different/perpendicular normals)
+    const faceVerts = originalFace.getVertices();
+    const isSolid = Array.from(this.faces.values()).some((f) => {
+      if (f.id === faceId) return false;
+      const isPerpendicular = Math.abs(f.normal.dot(originalNormal)) < 0.8;
+      if (!isPerpendicular) return false;
+      return f.getVertices().some((v) => faceVerts.includes(v));
+    });
+
+    const isSheet = !isSolid && !isSubFace;
+
+    if (isSheet) {
+      const originalMaterialId = originalFace.materialId;
+      const topPositions = basePositions.map((p) => p.add(offsetVector));
+      const originalHoles = originalFace.holes || [];
+      this.removeFace(faceId);
+
+      const effectiveNormal = distance >= 0 ? originalNormal : originalNormal.negate();
+      const bottomWinding = distance >= 0 ? [...basePositions].reverse() : basePositions;
+      const topWinding = distance >= 0 ? topPositions : [...topPositions].reverse();
+
+      const bottomHoles = originalHoles.map((hole) =>
+        distance >= 0 ? [...hole].reverse() : [...hole]
+      );
+      const topHoles = originalHoles.map((hole) => {
+        const shifted = hole.map((p) => p.add(offsetVector));
+        return distance >= 0 ? shifted : [...shifted].reverse();
+      });
+
+      const bottomFace = this.addFace(bottomWinding, effectiveNormal.negate(), bottomHoles.length > 0 ? bottomHoles : undefined);
+      const topFace = this.addFace(topWinding, effectiveNormal, topHoles.length > 0 ? topHoles : undefined);
+
+      if (originalMaterialId) {
+        bottomFace.materialId = originalMaterialId;
+        topFace.materialId = originalMaterialId;
+      }
+
+      const sideFaces: Face[] = [];
+      for (let i = 0; i < n; i++) {
+        const next = (i + 1) % n;
+        const quad = distance >= 0
+          ? [basePositions[i], basePositions[next], topPositions[next], topPositions[i]]
+          : [basePositions[next], basePositions[i], topPositions[i], topPositions[next]];
+
+        const sf = this.addFace(quad);
+        if (originalMaterialId) sf.materialId = originalMaterialId;
+        sideFaces.push(sf);
+      }
+
+      // Paredes interiores para agujeros pasantes
+      for (const hole of originalHoles) {
+        const m = hole.length;
+        const topHoleVerts = hole.map((p) => p.add(offsetVector));
+        for (let j = 0; j < m; j++) {
+          const next = (j + 1) % m;
+          const quadHole = distance >= 0
+            ? [hole[next], hole[j], topHoleVerts[j], topHoleVerts[next]]
+            : [hole[j], hole[next], topHoleVerts[next], topHoleVerts[j]];
+          const sfHole = this.addFace(quadHole);
+          if (originalMaterialId) sfHole.materialId = originalMaterialId;
+          sideFaces.push(sfHole);
+        }
+      }
+
+      this.rebuildTopology();
+      return { topFace, sideFaces };
+    }
+
+    if (isSubFace) {
+      // â”€â”€â”€ Direct Sub-Face Extrusion / Through-Cutout on a 3D Solid â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      const faceCenter = basePositions.reduce((acc, v) => acc.add(v), Vec3.ZERO).scale(1 / n);
+      const rayDir = originalNormal.negate();
+      let backFace: Face | null = null;
+      let solidThickness = Infinity;
+
+      for (const f of this.faces.values()) {
+        if (f.id === faceId || coplanarNeighbors.some((c) => c.id === f.id)) continue;
+        if (f.normal.dot(rayDir) > 0.8) {
+          const hit = f.plane.intersectRay(faceCenter, rayDir);
+          if (hit) {
+            const d = faceCenter.distanceTo(hit);
+            if (d < solidThickness && d > 1e-4) {
+              solidThickness = d;
+              backFace = f;
+            }
+          }
+        }
+      }
+
+      // Classify edges into inner dividing edges (shared with coplanar faces) and outer perimeter edges
+      const isInnerEdge = (vA: Vec3, vB: Vec3) => {
+        const mid = vA.add(vB).scale(0.5);
+        return coplanarNeighbors.some((c) => {
+          const loops = [c.getPositions(), ...c.holes];
+          for (const cVerts of loops) {
+            const cN = cVerts.length;
+            for (let k = 0; k < cN; k++) {
+              const cA = cVerts[k];
+              const cB = cVerts[(k + 1) % cN];
+              const ab = cB.sub(cA);
+              const l2 = ab.lengthSq();
+              if (l2 > 1e-6) {
+                const t = Math.max(0, Math.min(1, mid.sub(cA).dot(ab) / l2));
+                const proj = cA.add(ab.scale(t));
+                if (proj.distanceTo(mid) < GeometryTolerance.COINCIDENT_VERTEX) return true;
+              }
+            }
+          }
+          return false;
+        });
+      };
+
+      const innerEdges: { a: Vec3; b: Vec3 }[] = [];
+      const outerEdges: { a: Vec3; b: Vec3 }[] = [];
+
+      for (let i = 0; i < n; i++) {
+        const a = basePositions[i];
+        const b = basePositions[(i + 1) % n];
+        if (isInnerEdge(a, b)) {
+          innerEdges.push({ a, b });
+        } else {
+          outerEdges.push({ a, b });
+        }
+      }
+
+      if (originalFace.holes) {
+        for (const hole of originalFace.holes) {
+          const m = hole.length;
+          for (let i = 0; i < m; i++) {
+            const a = hole[i];
+            const b = hole[(i + 1) % m];
+            if (isInnerEdge(a, b)) {
+              innerEdges.push({ a, b });
+            } else {
+              outerEdges.push({ a, b });
+            }
+          }
+        }
+      }
+
+      const isThroughCut = distance < 0 && solidThickness < Infinity && Math.abs(distance) >= solidThickness - 0.05;
+
+      if (isThroughCut && backFace) {
+        const backOffset = rayDir.scale(solidThickness);
+        const backPositions = basePositions.map((p) => p.add(backOffset));
+
+        if (outerEdges.length === 0) {
+          // â”€â”€â”€ 1A. INTERIOR THROUGH-HOLE (Window / Door Opening) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+          // Add hole to back face
+          backFace.addHole(backPositions);
+
+          // Add hole to front coplanar face
+          if (coplanarNeighbors.length > 0) {
+            coplanarNeighbors[0].addHole(basePositions);
+          }
+
+          // Add tunnel wall faces
+          for (let i = 0; i < n; i++) {
+            const next = (i + 1) % n;
+            const tunnelQuad = [
+              basePositions[i],
+              basePositions[next],
+              backPositions[next],
+              backPositions[i],
+            ];
+            this.addFace(tunnelQuad);
+          }
+
+          // Remove the pushed front face
+          this.removeFace(faceId);
+
+          this.rebuildTopology();
+          return { sideFaces: [] };
+        } else {
+          // â”€â”€â”€ 1B. PERIMETER CORNER / NOTCH CUTOUT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+          const backFaceId = backFace.id;
+
+          // 1. Cut the front coplanar neighbor faces using PlanarGraph
+          for (const cFace of coplanarNeighbors) {
+            const frontGraph = new PlanarGraph(cFace.plane.origin, cFace.normal);
+            frontGraph.addPolygon3D(cFace.getPositions());
+            for (const h of cFace.holes) frontGraph.addPolygon3D(h);
+            frontGraph.addSegments3D(innerEdges);
+            const extractedFront = frontGraph.extractFaces3D();
+            if (extractedFront.length >= 1) {
+              this.removeFace(cFace.id);
+              for (const ef of extractedFront) {
+                this.addFace(ef.positions, cFace.normal, ef.holes);
+              }
+            }
+          }
+
+          // 2. Cut the back face using PlanarGraph with all projected inner edges
+          const backGraph = new PlanarGraph(backFace.plane.origin, backFace.normal);
+          backGraph.addPolygon3D(backFace.getPositions());
+          for (const hole of backFace.holes) {
+            backGraph.addPolygon3D(hole);
+          }
+          const backSegs = innerEdges.map((inEdge) => ({
+            a: inEdge.a.add(backOffset),
+            b: inEdge.b.add(backOffset),
+          }));
+          backGraph.addSegments3D(backSegs);
+
+          const extractedBack = backGraph.extractFaces3D();
+          if (extractedBack.length >= 2) {
+            this.removeFace(backFaceId);
+            const projCenter = faceCenter.add(backOffset);
+            let closestFaceIdx = 0;
+            let closestDist = Infinity;
+
+            for (let k = 0; k < extractedBack.length; k++) {
+              const ef = extractedBack[k];
+              const efCenter = ef.positions.reduce((acc, v) => acc.add(v), Vec3.ZERO).scale(1 / ef.positions.length);
+              const d = efCenter.distanceTo(projCenter);
+              if (d < closestDist) {
+                closestDist = d;
+                closestFaceIdx = k;
+              }
+            }
+
+            // Add all extracted faces EXCEPT the discarded corner
+            for (let k = 0; k < extractedBack.length; k++) {
+              if (k !== closestFaceIdx) {
+                this.addFace(extractedBack[k].positions, extractedBack[k].normal, extractedBack[k].holes);
+              }
+            }
+          }
+
+          // 3. Remove the top corner sub-face
+          this.removeFace(faceId);
+
+          // 4. Cut and remove all side wall sub-faces that belong to the removed corner
+          const cornerVertices = [...basePositions, ...backPositions];
+          const sidePlaneTol = GeometryTolerance.POINT_ON_PLANE;
+
+          for (const [sId, sf] of Array.from(this.faces.entries())) {
+            if (Math.abs(sf.normal.dot(originalNormal)) < GeometryTolerance.COPLANAR_NORMAL) {
+              const incidentVerts: Vec3[] = [];
+              for (const bp of basePositions) {
+                if (Math.abs(sf.plane.distanceToPoint(bp)) <= sidePlaneTol) {
+                  if (!incidentVerts.some((iv) => iv.distanceTo(bp) < GeometryTolerance.COINCIDENT_VERTEX)) {
+                    incidentVerts.push(bp);
+                  }
+                }
+              }
+
+              if (incidentVerts.length >= 2) {
+                const cutFootprint3D = [
+                  ...incidentVerts,
+                  ...[...incidentVerts].reverse().map((iv) => iv.add(backOffset)),
+                ];
+                const sfBasis = PolygonClipping.getLocalBasis(sf.plane.origin, sf.normal);
+                const cutFootprint2D = cutFootprint3D.map((p) => PolygonClipping.projectTo2D(p, sfBasis));
+
+                const sideGraph = new PlanarGraph(sf.plane.origin, sf.normal);
+                sideGraph.addPolygon3D(sf.getPositions());
+                for (const h of sf.holes) sideGraph.addPolygon3D(h);
+
+                const sideSegs = incidentVerts.map((bp) => ({
+                  a: bp,
+                  b: bp.add(backOffset),
+                }));
+                sideGraph.addSegments3D(sideSegs);
+                const extractedSide = sideGraph.extractFaces3D();
+
+                if (extractedSide.length >= 2) {
+                  this.removeFace(sId);
+                  for (const ef of extractedSide) {
+                    const efCenter = ef.positions.reduce((acc, v) => acc.add(v), Vec3.ZERO).scale(1 / ef.positions.length);
+                    const efCenter2D = PolygonClipping.projectTo2D(efCenter, sfBasis);
+
+                    const isInsideCut = PolygonClipping.pointInPolygon2D(efCenter2D, cutFootprint2D);
+                    if (!isInsideCut) {
+                      this.addFace(ef.positions, sf.normal, ef.holes);
+                    }
+                  }
+                } else {
+                  const fVerts = sf.getPositions();
+                  const isCornerWall = fVerts.every((fv) =>
+                    cornerVertices.some((cv) => cv.distanceTo(fv) < GeometryTolerance.COINCIDENT_VERTEX)
+                  );
+                  if (isCornerWall) {
+                    this.removeFace(sId);
+                  }
+                }
+              } else {
+                const fVerts = sf.getPositions();
+                const isCornerWall = fVerts.every((fv) =>
+                  cornerVertices.some((cv) => cv.distanceTo(fv) < GeometryTolerance.COINCIDENT_VERTEX)
+                );
+                if (isCornerWall) {
+                  this.removeFace(sId);
+                }
+              }
+            }
+          }
+
+          // 5. Add the through-cut wall quads connecting front inner edges to back inner edges
+          for (const inEdge of innerEdges) {
+            const { quad, normal } = this.createRiserQuad(
+              inEdge.a,
+              inEdge.b,
+              backOffset,
+              basePositions,
+              originalFace.holes,
+              originalNormal
+            );
+            this.addFace(quad, normal);
+          }
+
+          this.coalesceCoplanarFaces();
+          this.rebuildTopology();
+          return { sideFaces: [] };
+        }
+      } else {
+        // â”€â”€â”€ 2. STEP UP OR PARTIAL STEP DOWN (Recess/Boss) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        const topPositions = basePositions.map((p) => p.add(offsetVector));
+        const newHoles = originalFace.holes.map((h) => h.map((p) => p.add(offsetVector)));
+
+        // Add vertical riser walls for inner dividing edges
+        const sideFaces: Face[] = [];
+        for (const inEdge of innerEdges) {
+          const { quad, normal } = this.createRiserQuad(
+            inEdge.a,
+            inEdge.b,
+            offsetVector,
+            basePositions,
+            originalFace.holes,
+            originalNormal
+          );
+          const sf = this.addFace(quad, normal);
+          sideFaces.push(sf);
+        }
+
+        // Update outer side wall / adjacent perpendicular faces
+        for (const outEdge of outerEdges) {
+          for (const [fId, f] of this.faces) {
+            if (fId === faceId || coplanarNeighbors.some((c) => c.id === fId)) continue;
+            if (Math.abs(f.normal.dot(originalNormal)) < 0.2) {
+              const fVerts = f.getPositions();
+              const updatedVerts = this.updateAdjacentFaceLoop(fVerts, outEdge.a, outEdge.b, offsetVector, coplanarNeighbors);
+              if (updatedVerts && updatedVerts.length >= 3) {
+                this.removeFace(fId);
+                this.addFace(updatedVerts, f.normal, f.holes);
+              }
+            }
+          }
+        }
+
+        // Move sub-face to new height
+        this.removeFace(faceId);
+        const topFace = this.addFace(topPositions, originalNormal, newHoles);
+
+        this.rebuildTopology();
+        return { topFace, sideFaces };
+      }
+    }
+
+    // Extruding a whole face on an existing 3D Solid (Standard Solid Push/Pull):
+    const topPositions = basePositions.map((p) => p.add(offsetVector));
+    const newHoles = originalFace.holes.map((h) => h.map((p) => p.add(offsetVector)));
+
+    // Tolerancias geomÃ©tricas adaptativas proporcionales a la escala y desplazamiento de extrusiÃ³n
+    const charScale = GeometryTolerance.computeCharacteristicScale(basePositions);
+    const scaleTol = GeometryTolerance.getModelScaleTolerance(Math.min(charScale, Math.max(1e-4, Math.abs(distance))));
+    const vertexTol = scaleTol.vertexTol;
+    const planeTol = Math.max(1e-5, Math.min(GeometryTolerance.POINT_ON_PLANE, Math.abs(distance) * 0.05));
+
+    // 1. Update all adjacent faces that share boundary or hole vertices with the moving face
+    const facesToUpdate = new Map<string, { verts: Vec3[]; normal?: Vec3; holes?: Vec3[][] }>();
+
+    for (const [fId, f] of this.faces) {
+      if (fId === faceId) continue;
+      const fVerts = f.getPositions();
+      let modified = false;
+
+      const updatedVerts = fVerts.map((p) => {
+        // Match outer boundary vertices
+        for (let i = 0; i < n; i++) {
+          if (p.distanceTo(basePositions[i]) <= vertexTol) {
+            modified = true;
+            return topPositions[i];
+          }
+        }
+        // Match hole vertices
+        if (originalFace.hasHoles()) {
+          for (let hIdx = 0; hIdx < originalFace.holes.length; hIdx++) {
+            const oldH = originalFace.holes[hIdx];
+            const newH = newHoles[hIdx];
+            for (let k = 0; k < oldH.length; k++) {
+              if (p.distanceTo(oldH[k]) <= vertexTol) {
+                modified = true;
+                return newH[k];
+              }
+            }
+          }
+        }
+        return p;
+      });
+
+      // Also update f.holes if any vertex in f.holes matched moving basePositions
+      let holesModified = false;
+      const updatedHoles = f.holes.map((h) =>
+        h.map((p) => {
+          for (let i = 0; i < n; i++) {
+            if (p.distanceTo(basePositions[i]) <= vertexTol) {
+              holesModified = true;
+              return topPositions[i];
+            }
+          }
+          return p;
+        })
+      );
+
+      if (modified || holesModified) {
+        facesToUpdate.set(fId, {
+          verts: updatedVerts,
+          normal: f.normal,
+          holes: updatedHoles,
+        });
+      }
+    }
+
+    // Apply vertex updates to all adjacent and tunnel faces (preserving face IDs)
+    for (const [fId, data] of facesToUpdate) {
+      this.removeFace(fId);
+      const newF = this.addFace(data.verts, data.normal, data.holes);
+      this.faces.delete(newF.id);
+      newF.id = fId;
+      this.faces.set(fId, newF);
+    }
+
+    // 2. Re-create the moving face at its new position with updated holes (preserving face ID)
+    this.removeFace(faceId);
+    let topFace: Face | undefined = this.addFace(topPositions, originalNormal, newHoles);
+    this.faces.delete(topFace.id);
+    topFace.id = faceId;
+    this.faces.set(faceId, topFace);
+
+    // 2.1 Coincident Face Annihilation & Notch Cutout
+    // If topFace arrives at an existing boundary face of the solid sharing the same plane:
+    if (topFace) {
+      for (const [otherId, otherFace] of Array.from(this.faces.entries())) {
+        if (otherId === faceId || !topFace) continue;
+
+        const originDist = Math.abs(otherFace.plane.distanceToPoint(topPositions[0]));
+        if (originDist <= planeTol) {
+          const dotN = topFace.normal.dot(otherFace.normal);
+          if (Math.abs(dotN) > 0.95) {
+            // Coplanar faces
+            const topVerts = topFace.getPositions();
+            const otherVerts = otherFace.getPositions();
+
+            if (PolygonClipping.polygonsOverlapOnPlane(otherVerts, topVerts, otherFace.holes, otherFace.normal)) {
+              const otherBasis = PolygonClipping.getLocalBasis(otherVerts[0], otherFace.normal);
+              const other2D = otherVerts.map((p) => PolygonClipping.projectTo2D(p, otherBasis));
+              const top2D = topVerts.map((p) => PolygonClipping.projectTo2D(p, otherBasis));
+
+              const otherFullyInTop = other2D.every((p) => PolygonClipping.isPointInOrOnPolygon2D(p, top2D));
+              const topFullyInOther = top2D.every((p) => PolygonClipping.isPointInOrOnPolygon2D(p, other2D));
+
+              if (otherFullyInTop && topFullyInOther) {
+                // Total annihilation: both faces cancel each other out completely (muro/losa colapsada)
+                this.removeFace(faceId);
+                this.removeFace(otherId);
+                topFace = undefined;
+                break;
+              } else if (topFullyInOther) {
+                // Partial annihilation (Notch cutout): subtract topFace from otherFace
+                const graph = new PlanarGraph(otherFace.plane.origin, otherFace.normal);
+                graph.addPolygon3D(otherVerts);
+                for (const h of otherFace.holes) graph.addPolygon3D(h);
+                graph.addPolygon3D(topVerts);
+
+                const extracted = graph.extractFaces3D();
+                const topCenter = topVerts.reduce((acc, v) => acc.add(v), Vec3.ZERO).scale(1 / topVerts.length);
+                const remaining = extracted.filter((ef) => {
+                  const efCenter = ef.positions.reduce((acc, v) => acc.add(v), Vec3.ZERO).scale(1 / ef.positions.length);
+                  return efCenter.distanceTo(topCenter) > vertexTol;
+                });
+
+                if (remaining.length > 0) {
+                  this.removeFace(faceId);
+                  this.removeFace(otherId);
+                  for (const rem of remaining) {
+                    this.addFace(rem.positions, otherFace.normal, rem.holes);
+                  }
+                  topFace = undefined;
+                  break;
+                }
+              } else if (otherFullyInTop) {
+                // otherFace is completely inside topFace
+                this.removeFace(faceId);
+                this.removeFace(otherId);
+                topFace = undefined;
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 2.2 PlanarGraph Boundary Hole Absorption
+    // Only applies if a hole in face.holes actually touches or coincides with the outer perimeter:
+    const isPointOnPolyBoundary = (pt: Vec3, poly: Vec3[]): boolean => {
+      const pN = poly.length;
+      for (let i = 0; i < pN; i++) {
+        const a = poly[i];
+        const b = poly[(i + 1) % pN];
+        const ab = b.sub(a);
+        const l2 = ab.lengthSq();
+        if (l2 > 1e-6) {
+          const t = Math.max(0, Math.min(1, pt.sub(a).dot(ab) / l2));
+          const proj = a.add(ab.scale(t));
+          if (proj.distanceTo(pt) < GeometryTolerance.COINCIDENT_VERTEX) return true;
+        }
+      }
+      return false;
+    };
+
+    for (const [fId, f] of Array.from(this.faces.entries())) {
+      if (!f.hasHoles()) continue;
+      const outerPoly = f.getPositions();
+      const hasBoundaryHole = f.holes.some((h) => h.some((pt) => isPointOnPolyBoundary(pt, outerPoly)));
+      if (!hasBoundaryHole) continue;
+
+      const graph = new PlanarGraph(f.plane.origin, f.normal);
+      graph.addPolygon3D(outerPoly);
+      for (const h of f.holes) {
+        graph.addPolygon3D(h);
+      }
+      const extracted = graph.extractFaces3D();
+      // Find the extracted face that contains the original outer perimeter corners (not hole vertices)
+      if (extracted.length >= 1) {
+        const mainExtracted = extracted.find((ef) => {
+          return outerPoly.some(
+            (op) => !f.holes.some((h) => h.some((hp) => hp.distanceTo(op) < GeometryTolerance.COINCIDENT_VERTEX)) &&
+                    ef.positions.some((ep) => ep.distanceTo(op) < GeometryTolerance.COINCIDENT_VERTEX)
+          );
+        }) || extracted[0];
+
+        this.removeFace(fId);
+        const newF = this.addFace(mainExtracted.positions, f.normal, mainExtracted.holes);
+        this.faces.delete(newF.id);
+        newF.id = fId;
+        this.faces.set(fId, newF);
+      }
+    }
+
+    // 3. Heal/close/simplify any hole and remove collapsed faces exclusively on affected faces
+    const affectedFaceIds = new Set<string>();
+    if (topFace) affectedFaceIds.add(topFace.id);
+    for (const fId of facesToUpdate.keys()) {
+      affectedFaceIds.add(fId);
+    }
+
+    const facesToDelete: string[] = [];
+    for (const fId of affectedFaceIds) {
+      const f = this.faces.get(fId);
+      if (!f) continue;
+      if (f.getArea() <= GeometryTolerance.MIN_FACE_AREA) {
+        facesToDelete.push(fId);
+        continue;
+      }
+
+      if (!f.hasHoles()) continue;
+      const remainingHoles: Vec3[][] = [];
+      for (const h of f.holes) {
+        const cleaned = PolyMesh.cleanPolygon(h);
+        if (cleaned.length >= 3) {
+          const h0 = cleaned[0];
+          let hArea = 0;
+          for (let i = 1; i < cleaned.length - 1; i++) {
+            hArea += cleaned[i].sub(h0).cross(cleaned[i + 1].sub(h0)).length() * 0.5;
+          }
+          if (hArea > GeometryTolerance.MIN_FACE_AREA) {
+            remainingHoles.push(cleaned);
+          }
+        }
+      }
+      f.holes = remainingHoles;
+    }
+
+    for (const fId of facesToDelete) {
+      this.removeFace(fId);
+    }
+
+    // 4. Rebuild full half-edge & edge topology to ensure 100% complete and connected edge graph
+    this.rebuildTopology();
+
+    return { topFace, sideFaces: [] };
+  }
+
+  /**
+   * Generates a vertical quad face connecting a dividing edge [a, b] to [a + offsetVector, b + offsetVector].
+   * Evaluates point-in-polygon with holes to ensure the quad normal points strictly outward from the face interior.
+   */
+  private createRiserQuad(
+    a: Vec3,
+    b: Vec3,
+    offsetVector: Vec3,
+    faceOuter: Vec3[],
+    faceHoles: Vec3[][],
+    faceNormal: Vec3
+  ): { quad: Vec3[]; normal: Vec3 } {
+    const ab = b.sub(a);
+    if (ab.lengthSq() < GeometryTolerance.MATH_EPSILON || offsetVector.lengthSq() < GeometryTolerance.MATH_EPSILON) {
+      return { quad: [a, b, b.add(offsetVector), a.add(offsetVector)], normal: faceNormal };
+    }
+
+    const mid = a.add(b).scale(0.5);
+    const vPerp = faceNormal.cross(ab).normalize();
+    const testDist = Math.min(0.005, ab.length() * 0.1);
+    const testPoint = mid.add(vPerp.scale(testDist));
+
+    const insideFace = PolygonClipping.pointInPolygonWithHoles(testPoint, faceOuter, faceHoles || [], faceNormal);
+    const outwardDir = insideFace ? vPerp.negate() : vPerp;
+
+    const isExtrudingOutward = offsetVector.dot(faceNormal) >= 0;
+    const targetNormal = isExtrudingOutward ? outwardDir : outwardDir.negate();
+
+    const b1 = a;
+    const b2 = b;
+    const b3 = b.add(offsetVector);
+    const b4 = a.add(offsetVector);
+
+    const normal1 = ab.cross(offsetVector);
+    if (normal1.dot(targetNormal) > 0) {
+      return { quad: [b1, b2, b3, b4], normal: targetNormal };
+    } else {
+      return { quad: [b2, b1, b4, b3], normal: targetNormal };
+    }
+  }
+
+  /**
+   * Update the boundary loop of an adjacent perpendicular face when one of its outer edges is displaced.
+   * Transforms the edge into an orthogonal step (e.g. converting a rectangle into an L-shaped polygon).
+   */
+  private updateAdjacentFaceLoop(
+    fVerts: Vec3[],
+    a: Vec3,
+    b: Vec3,
+    offset: Vec3,
+    coplanarNeighbors?: Face[]
+  ): Vec3[] | null {
+    const k = fVerts.length;
+    if (k < 3) return null;
+
+    const isPointSharedWithCoplanar = (pt: Vec3): boolean => {
+      if (!coplanarNeighbors || coplanarNeighbors.length === 0) return false;
+      return coplanarNeighbors.some((c) => {
+        const loops = [c.getPositions(), ...c.holes];
+        for (const cVerts of loops) {
+          const cN = cVerts.length;
+          for (let idx = 0; idx < cN; idx++) {
+            const cA = cVerts[idx];
+            const cB = cVerts[(idx + 1) % cN];
+            const ab = cB.sub(cA);
+            const l2 = ab.lengthSq();
+            if (l2 < 1e-8) {
+              if (pt.distanceTo(cA) <= GeometryTolerance.COINCIDENT_VERTEX) return true;
+              continue;
+            }
+            const t = pt.sub(cA).dot(ab) / l2;
+            if (t >= -0.01 && t <= 1.01) {
+              const proj = cA.add(ab.scale(Math.max(0, Math.min(1, t))));
+              if (proj.distanceTo(pt) <= GeometryTolerance.COINCIDENT_VERTEX) return true;
+            }
+          }
+        }
+        return false;
+      });
+    };
+
+    const pointOnSegment = (p: Vec3, p1: Vec3, p2: Vec3): { onSeg: boolean; t: number } => {
+      const d = p2.sub(p1);
+      const l2 = d.lengthSq();
+      if (l2 < 1e-8) return { onSeg: p.distanceTo(p1) < GeometryTolerance.COINCIDENT_VERTEX, t: 0 };
+      const t = p.sub(p1).dot(d) / l2;
+      if (t >= -0.01 && t <= 1.01) {
+        const proj = p1.add(d.scale(Math.max(0, Math.min(1, t))));
+        if (proj.distanceTo(p) < GeometryTolerance.COINCIDENT_VERTEX) {
+          return { onSeg: true, t: Math.max(0, Math.min(1, t)) };
+        }
+      }
+      return { onSeg: false, t: -1 };
+    };
+
+    for (let i = 0; i < k; i++) {
+      const p1 = fVerts[i];
+      const p2 = fVerts[(i + 1) % k];
+
+      const resA = pointOnSegment(a, p1, p2);
+      const resB = pointOnSegment(b, p1, p2);
+
+      if (resA.onSeg && resB.onSeg) {
+        const result: Vec3[] = [];
+
+        for (let j = 0; j <= i; j++) {
+          result.push(fVerts[j]);
+        }
+
+        const isABOrder = resA.t <= resB.t;
+        const first = isABOrder ? a : b;
+        const second = isABOrder ? b : a;
+        const firstT = isABOrder ? resA.t : resB.t;
+        const secondT = isABOrder ? resB.t : resA.t;
+
+        const isFirstCorner = firstT < 0.02;
+        const isSecondCorner = secondT > 0.98;
+
+        const isFirstShared = isPointSharedWithCoplanar(first);
+        const isSecondShared = isPointSharedWithCoplanar(second);
+
+        // 1. Punto de inicio del escalÃ³n (first):
+        // Si first coincide con la esquina (p1) pero estÃ¡ compartido con una cara coplanar vecina,
+        // NO se debe descartar (no hacer pop), ya que representa la base del escalÃ³n ortogonal.
+        if (isFirstCorner) {
+          if (!isFirstShared) {
+            result.pop();
+          }
+        } else {
+          result.push(first);
+        }
+
+        // 2. Desplazamiento del escalÃ³n ortogonal a 90Â°
+        result.push(first.add(offset), second.add(offset));
+
+        // 3. Punto de fin del escalÃ³n (second):
+        // Si second estÃ¡ compartido con una cara coplanar vecina o no coincide con la esquina (p2),
+        // se debe registrar second para cerrar el escalÃ³n ortogonal en la base.
+        if (isSecondCorner) {
+          if (isSecondShared) {
+            result.push(second);
+          }
+        } else {
+          result.push(second);
+        }
+
+        // 4. ContinuaciÃ³n del lazo poligonal
+        const nextJ = isSecondCorner ? i + 2 : i + 1;
+        for (let j = nextJ; j < k; j++) {
+          result.push(fVerts[j]);
+        }
+
+        return PolyMesh.cleanPolygon(result);
+      }
+    }
+
+    return null;
+  }
+
+  // â”€â”€â”€ Polygon Geometry Calculations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  static computePolygonArea(pts: Vec3[]): number {
+    if (pts.length < 3) return 0;
+    const p0 = pts[0];
+    let totalCross = Vec3.ZERO;
+    const n = pts.length;
+    for (let i = 1; i < n - 1; i++) {
+      totalCross = totalCross.add(pts[i].sub(p0).cross(pts[i + 1].sub(p0)));
+    }
+    return totalCross.length() * 0.5;
+  }
+
+  // â”€â”€â”€ Polygon Cleanup & Simplification â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  static cleanPolygon(pts: Vec3[]): Vec3[] {
+    if (pts.length < 3) return pts;
+    const n = pts.length;
+
+    // 1. Remove duplicate consecutive vertices
+    const deduped: Vec3[] = [];
+    for (let i = 0; i < n; i++) {
+      const p = pts[i];
+      const prev = deduped[deduped.length - 1];
+      if (!prev || prev.distanceTo(p) > GeometryTolerance.COINCIDENT_POINT) {
+        deduped.push(p);
+      }
+    }
+    if (deduped.length >= 3 && deduped[0].distanceTo(deduped[deduped.length - 1]) < GeometryTolerance.COINCIDENT_POINT) {
+      deduped.pop();
+    }
+    if (deduped.length < 3) return deduped;
+
+    // 2. Remove collinear intermediate vertices
+    const result: Vec3[] = [];
+    const m = deduped.length;
+    for (let i = 0; i < m; i++) {
+      const prev = deduped[(i - 1 + m) % m];
+      const curr = deduped[i];
+      const next = deduped[(i + 1) % m];
+
+      const v1 = curr.sub(prev).normalize();
+      const v2 = next.sub(curr).normalize();
+      // If angle is near 0 or 180 degrees (collinear)
+      if (Math.abs(v1.dot(v2)) > 1 - GeometryTolerance.MATH_EPSILON * 1e5) {
+        continue; // Skip redundant collinear vertex
+      }
+      result.push(curr);
+    }
+
+    return result.length >= 3 ? result : [];
+  }
+
+
+  toSceneEntity(): PolyMeshSceneData {
+    const sceneFaces: PolyMeshFaceData[] = [];
+    const allEdges: PolyMeshEdgeData[] = [];
+    const allVertices: Vec3[] = [];
+    for (const v of this.vertices.values()) allVertices.push(v.position);
+    for (const edge of this.edges.values()) allEdges.push({ a: edge.vA.position, b: edge.vB.position, hidden: edge.hidden });
+    for (const [faceId, face] of this.faces) {
+      const faceVerts = face.getPositions();
+      const faceEdges: PolyMeshEdgeData[] = [];
+      for (const he of face.getHalfEdges()) faceEdges.push({ a: he.origin.position, b: he.target.position });
+      sceneFaces.push({ id: faceId, faceId, polyMeshId: this.id, vertices: faceVerts, holes: face.holes ? face.holes.map(h => [...h]) : [], normal: face.normal, plane: face.plane, edges: faceEdges, hidden: face.hidden, openingId: face.openingId, materialId: face.materialId ?? undefined });
+    }
+    return { id: this.id, type: 'GEOMETRY_ENTITY', faces: sceneFaces, vertices: allVertices, edges: allEdges };
+  }
+  transformByMatrix(matrix: THREE.Matrix4): void { this.applyMatrix4(matrix); }
 }
-
-

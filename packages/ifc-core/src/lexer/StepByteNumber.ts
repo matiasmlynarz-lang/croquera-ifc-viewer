@@ -307,7 +307,6 @@ export class StepByteNumber {
     let sigDigits = 0;
     let hasDot = false;
     let fracDigits = 0;
-    let hasExp = false;
     let exp = 0;
     let hasNonZero = false;
 
@@ -359,7 +358,6 @@ export class StepByteNumber {
 
     // Check optional scientific exponent: 'E' (69) or 'e' (101)
     if (p < end && (buf[p] === 69 || buf[p] === 101)) {
-      hasExp = true;
       p++;
       let expNegative = false;
       if (p < end && buf[p] === 45) { // '-'

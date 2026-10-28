@@ -57,6 +57,7 @@ export interface IfcWorkerParseRequest {
   streamingMode?: 'FULL' | 'PHASE_1_STRUCTURAL' | 'PHASE_2_INSTANCES';
   phase1EntityIds?: string[];
   forcePhases?: boolean;
+  lightweightBounds?: boolean;
 }
 
 export interface IfcWorkerResolvePsetsRequest {
@@ -69,12 +70,51 @@ export interface IfcWorkerInitCoordinatorRequest {
   type: 'INIT_COORDINATOR';
   stepBuffer: SharedArrayBuffer | ArrayBuffer;
   forcePhases?: boolean;
+  lightweightBounds?: boolean;
 }
 
 export interface IfcWorkerInitTessellatorRequest {
   type: 'INIT_TESSELLATOR';
   scannerState: SharedScannerState;
   forcePhases?: boolean;
+}
+
+export interface IfcGridAxisDTO {
+  tag: string;
+  sameSense?: boolean;
+  uvStart: [number, number, number];
+  uvEnd: [number, number, number];
+}
+
+export interface IfcGridDTO {
+  id: string;
+  stepId: number;
+  name: string;
+  uAxes: IfcGridAxisDTO[];
+  vAxes: IfcGridAxisDTO[];
+  wAxes?: IfcGridAxisDTO[];
+}
+
+export interface CachedOpeningDTO {
+  openingGuid: string;
+  openingStepId: number;
+  hostStepId?: number;
+  hostGuid?: string;
+  fillerStepId?: number;
+  fillerGuid?: string;
+  matrix: Float32Array; // 16 floats
+  volumeIR: GeometryIR;
+}
+
+export interface IfcWorkerEditorPostprocessRequest {
+  type: 'RUN_EDITOR_POSTPROCESS';
+  batchSize?: number;
+}
+
+export interface IfcWorkerHydrateBrepRequest {
+  type: 'HYDRATE_BREP';
+  stepIds: number[];
+  coalesceFaces?: boolean;
 }
 
 export interface IfcWorkerTessellateBatchRequest {
@@ -91,7 +131,9 @@ export type IfcWorkerRequest =
   | IfcWorkerResolvePsetsRequest
   | IfcWorkerInitCoordinatorRequest
   | IfcWorkerInitTessellatorRequest
-  | IfcWorkerTessellateBatchRequest;
+  | IfcWorkerTessellateBatchRequest
+  | IfcWorkerEditorPostprocessRequest
+  | IfcWorkerHydrateBrepRequest;
 
 export interface SpatialNodeDTO {
   id: string;
@@ -243,6 +285,26 @@ export interface StageBatchCompletePayload {
   elementsProcessed: number;
 }
 
+export interface StageEditorPostprocessBatchPayload {
+  type: 'STAGE_EDITOR_POSTPROCESS_BATCH';
+  psetsByStepId: Record<number, Record<string, Record<string, any>>>;
+  grids: IfcGridDTO[];
+  openings: CachedOpeningDTO[];
+  openingToHostStepMap: Record<number, number>;
+  fillToOpeningStepMap: Record<number, number>;
+}
+
+export interface HydratedBrepDTO {
+  stepId: number;
+  id: string;
+  geometryIR: GeometryIR;
+}
+
+export interface StageHydrateBrepPayload {
+  type: 'STAGE_HYDRATE_BREP';
+  elements: HydratedBrepDTO[];
+}
+
 export type IfcWorkerResponse =
   | Stage1SpatialPayload
   | Stage2BoundsPayload
@@ -254,4 +316,6 @@ export type IfcWorkerResponse =
   | ResolvedPsetsPayload
   | StageCoordinatorReadyPayload
   | StageTessellatorReadyPayload
-  | StageBatchCompletePayload;
+  | StageBatchCompletePayload
+  | StageEditorPostprocessBatchPayload
+  | StageHydrateBrepPayload;

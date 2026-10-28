@@ -10,7 +10,12 @@
  */
 
 import { IfcWorkerClient } from './IfcWorkerClient';
-import type { IfcWorkerResponse, Stage2BoundsPayload } from '../types/IfcWorkerProtocol';
+import type {
+  IfcWorkerResponse,
+  Stage2BoundsPayload,
+  StageEditorPostprocessBatchPayload,
+  HydratedBrepDTO,
+} from '../types/IfcWorkerProtocol';
 
 export interface AdaptivePoolOptions {
   workerFactory?: () => Worker;
@@ -79,12 +84,13 @@ export class IfcAdaptiveWorkerPool {
   public async parseFile(
     stepBuffer: ArrayBuffer | SharedArrayBuffer,
     chunkSize: number = 200,
-    onMessage: (response: IfcWorkerResponse) => void
+    onMessage: (response: IfcWorkerResponse) => void,
+    lightweightBounds?: boolean
   ): Promise<void> {
     const isMulti = this.isMultiThreaded && this.workers.length > 1;
 
     if (!isMulti) {
-      return this.primaryClient.parseFile(stepBuffer as ArrayBuffer, chunkSize, onMessage);
+      return this.primaryClient.parseFile(stepBuffer as ArrayBuffer, chunkSize, onMessage, lightweightBounds);
     }
 
     const startTime = performance.now();
@@ -97,7 +103,7 @@ export class IfcAdaptiveWorkerPool {
       sharedBuffer = new SharedArrayBuffer(stepBuffer.byteLength);
       new Uint8Array(sharedBuffer).set(new Uint8Array(stepBuffer));
     } else {
-      return this.primaryClient.parseFile(stepBuffer as ArrayBuffer, chunkSize, onMessage);
+      return this.primaryClient.parseFile(stepBuffer as ArrayBuffer, chunkSize, onMessage, lightweightBounds);
     }
 
     let chunkCount = 0;
@@ -132,7 +138,7 @@ export class IfcAdaptiveWorkerPool {
 
     // 2. Step 1 & 2: Coordinator (Worker 0) scans file, extracts spatial hierarchy & bounds
     const coordinator = this.workers[0];
-    const coordReady = await coordinator.initCoordinator(sharedBuffer, forwardMessage);
+    const coordReady = await coordinator.initCoordinator(sharedBuffer, forwardMessage, false, lightweightBounds);
 
     // 3. Tessellators (Workers 1..N-1) zero-copy hydration over shared scanner state
     const tessellators = this.workers.slice(1);
@@ -220,6 +226,22 @@ export class IfcAdaptiveWorkerPool {
    */
   public async resolveProperties(stepId: number): Promise<Record<string, Record<string, any>>> {
     return this.primaryClient.resolveProperties(stepId);
+  }
+
+  /**
+   * Executes deep editor post-process on the Coordinator worker (Phase 6 - Bloque 3.5).
+   */
+  public async runEditorPostprocess(batchSize?: number): Promise<StageEditorPostprocessBatchPayload> {
+    const coordinator = this.workers[0] || this.primaryClient;
+    return coordinator.runEditorPostprocess(batchSize);
+  }
+
+  /**
+   * Requests on-demand B-Rep PolyMesh hydration for the specified STEP IDs (JIT).
+   */
+  public async hydrateBrep(stepIds: number[], coalesceFaces: boolean = true): Promise<HydratedBrepDTO[]> {
+    const coordinator = this.workers[0] || this.primaryClient;
+    return coordinator.hydrateBrep(stepIds, coalesceFaces);
   }
 
   /**

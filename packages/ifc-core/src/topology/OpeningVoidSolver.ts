@@ -50,7 +50,6 @@ export class OpeningVoidSolver {
 
     for (const hostFace of hostMesh.faces.values()) {
       if (hostFace.openingId && hostFace.openingId === openingGroupId) continue;
-      const hostPositions = hostFace.getPositions();
       const hostNormal = hostFace.normal;
       const hostCentroid = hostFace.centroid;
 
@@ -81,7 +80,8 @@ export class OpeningVoidSolver {
     openingGroupId: string,
     matrix: THREE.Matrix4 = new THREE.Matrix4(),
     isIdentity: boolean = true,
-    requireThrough: boolean = false
+    requireThrough: boolean = false,
+    deferRebuildTopology: boolean = false
   ): boolean {
     // Early exit if the opening void is already fully carved into the host solid topology
     const alreadyTagged = this.tagExistingJambas(hostMesh, openingMesh, openingGroupId, matrix, isIdentity);
@@ -149,14 +149,30 @@ export class OpeningVoidSolver {
       return false;
     }
 
-    // Boundary roof trim & top cut detection:
-    // If the opening reaches or exceeds the highest elevation of the host solid,
+    // Boundary roof trim & top cut detection on walls:
+    // If the host solid is a vertical element (e.g. wall where largest faces are vertical),
+    // and the opening reaches or exceeds the highest elevation of the host solid,
     // a 2D interior face-loop cannot remove the top cap of the wall.
     // Dispatch immediately to exact 3D B-Rep BooleanCSGKernel.subtract.
+    // For horizontal elements (slabs, foundations), vertical penetration along Y is normal through-hole.
+    let maxFaceArea = 0;
+    let isVerticalHostSolid = true;
+    for (const f of hostMesh.faces.values()) {
+      if (f.openingId) continue;
+      const basis = PolygonClipping.getLocalBasis(f.plane.origin, f.normal);
+      const pts2D = f.getPositions().map((p: Vec3) => PolygonClipping.projectTo2D(p, basis));
+      const area = Math.abs(PolygonClipping.signedArea2D(pts2D));
+      if (area > maxFaceArea) {
+        maxFaceArea = area;
+        isVerticalHostSolid = Math.abs(f.normal.y) < 0.5;
+      }
+    }
+
     const hostMaxY = maxAy;
     const opMaxY = maxBy;
 
-    const isTopBoundaryCut = opMaxY >= hostMaxY - GeometryTolerance.COINCIDENT_VERTEX * 10;
+    const isTopBoundaryCut = isVerticalHostSolid && (opMaxY >= hostMaxY - GeometryTolerance.COINCIDENT_VERTEX * 10);
+
     if (isTopBoundaryCut) {
       try {
         const subtracted = BooleanCSGKernel.subtract(hostMesh, openingMesh, {
@@ -278,23 +294,38 @@ export class OpeningVoidSolver {
     let p2: PiercedFace | null = null;
 
     if (piercedHostFaces.length >= 2) {
-      let bestVerticalDist = Infinity;
+      let bestDist = Infinity;
+      let bestIsContained = false;
+      let bestIsVertical = false;
+
       for (let i = 0; i < piercedHostFaces.length; i++) {
         for (let j = i + 1; j < piercedHostFaces.length; j++) {
           const fA = piercedHostFaces[i];
           const fB = piercedHostFaces[j];
           if (fA.face.normal.dot(fB.face.normal) < GeometryTolerance.OPENING_OPPOSITE_NORMAL_DOT) {
-            const isVerticalPair =
+            const isContained = fA.allVertsIn && fB.allVertsIn;
+            const isVertical =
               Math.abs(fA.face.normal.y) < GeometryTolerance.OPENING_VERTICAL_NORMAL_DOT &&
               Math.abs(fB.face.normal.y) < GeometryTolerance.OPENING_VERTICAL_NORMAL_DOT;
             const dist = Math.abs(fA.face.plane.distanceToPoint(fB.face.plane.origin));
-            if (isVerticalPair) {
-              if (dist < bestVerticalDist) {
-                bestVerticalDist = dist;
-                p1 = fA;
-                p2 = fB;
+
+            let isBetter = false;
+            if (dist < bestDist - GeometryTolerance.COINCIDENT_VERTEX) {
+              isBetter = true;
+            } else if (Math.abs(dist - bestDist) <= GeometryTolerance.COINCIDENT_VERTEX) {
+              if (isContained && !bestIsContained) {
+                isBetter = true;
+              } else if (isContained === bestIsContained) {
+                if (isVertical && !bestIsVertical) {
+                  isBetter = true;
+                }
               }
-            } else if (!p1 && !p2) {
+            }
+
+            if (isBetter) {
+              bestIsContained = isContained;
+              bestIsVertical = isVertical;
+              bestDist = dist;
               p1 = fA;
               p2 = fB;
             }
@@ -386,7 +417,9 @@ export class OpeningVoidSolver {
           jamba.openingId = openingGroupId;
         }
 
-        hostMesh.rebuildTopology();
+        if (!deferRebuildTopology) {
+          hostMesh.rebuildTopology();
+        }
         return true;
       }
     } else if (!requireThrough && piercedHostFaces.length >= 1) {
@@ -428,7 +461,9 @@ export class OpeningVoidSolver {
           jamba.openingId = openingGroupId;
         }
 
-        hostMesh.rebuildTopology();
+        if (!deferRebuildTopology) {
+          hostMesh.rebuildTopology();
+        }
         return true;
       }
     }
@@ -571,24 +606,73 @@ export class OpeningVoidSolver {
 
       hostMesh.removeFace(targetFace.id);
 
-      for (const piece of pieces2D) {
-        const piece3D = piece.map((p2d) => PolygonClipping.unprojectTo3D(p2d, basis));
-        const pieceHoles: Vec3[][] = [];
-        const pieceOwners: (string | null)[] = [];
-        for (let hIdx = 0; hIdx < preservedHoles.length; hIdx++) {
-          const h = preservedHoles[hIdx];
-          const hCenter = h.reduce((a, b) => a.add(b), Vec3.ZERO).scale(1 / h.length);
-          const hCenter2D = PolygonClipping.projectTo2D(hCenter, basis);
-          if (PolygonClipping.pointInPolygon2D(hCenter2D, piece)) {
-            pieceHoles.push(h);
-            pieceOwners.push(preservedOwners[hIdx] ?? null);
+      interface FinalPiece {
+        poly: Vec2D[];
+        holes: Vec3[][];
+        owners: (string | null)[];
+      }
+
+      let finalPieces: FinalPiece[] = pieces2D.map((p) => ({ poly: p, holes: [], owners: [] }));
+
+      for (let hIdx = 0; hIdx < preservedHoles.length; hIdx++) {
+        const h3D = preservedHoles[hIdx];
+        const hOwner = preservedOwners[hIdx] ?? null;
+        const h2D = h3D.map((p) => PolygonClipping.projectTo2D(p, basis));
+        const hCenter = h3D.reduce((a, b) => a.add(b), Vec3.ZERO).scale(1 / h3D.length);
+        const hCenter2D = PolygonClipping.projectTo2D(hCenter, basis);
+
+        const nextFinalPieces: FinalPiece[] = [];
+
+        for (const fp of finalPieces) {
+          const piece = fp.poly;
+          const anyVertIn = h2D.some(
+            (p) =>
+              PolygonClipping.pointInPolygon2D(p, piece) ||
+              OpeningVoidSolver.isOnPolygonBoundary2D(p, piece, GeometryTolerance.COINCIDENT_VERTEX)
+          );
+          const centerIn = PolygonClipping.pointInPolygon2D(hCenter2D, piece);
+
+          if (!anyVertIn && !centerIn) {
+            nextFinalPieces.push(fp);
+            continue;
+          }
+
+          const isStrict = h2D.every(
+            (p) =>
+              PolygonClipping.pointInPolygon2D(p, piece) &&
+              !OpeningVoidSolver.isOnPolygonBoundary2D(p, piece, GeometryTolerance.COINCIDENT_VERTEX)
+          );
+
+          if (isStrict) {
+            fp.holes.push(h3D);
+            fp.owners.push(hOwner);
+            nextFinalPieces.push(fp);
+          } else {
+            const subCutouts = PolygonClipping.partitionPolygonWithCutout(piece, h2D);
+            if (subCutouts && subCutouts.length > 0) {
+              for (const sub of subCutouts) {
+                nextFinalPieces.push({
+                  poly: sub,
+                  holes: [...fp.holes],
+                  owners: [...fp.owners],
+                });
+              }
+            } else {
+              nextFinalPieces.push(fp);
+            }
           }
         }
+
+        finalPieces = nextFinalPieces;
+      }
+
+      for (const fp of finalPieces) {
+        const piece3D = fp.poly.map((p2d) => PolygonClipping.unprojectTo3D(p2d, basis));
         const newFace = hostMesh.addFace(
           piece3D,
           oldNormal,
-          pieceHoles.length > 0 ? pieceHoles : undefined,
-          pieceOwners.length > 0 ? pieceOwners : undefined
+          fp.holes.length > 0 ? fp.holes : undefined,
+          fp.owners.length > 0 ? fp.owners : undefined
         );
         if (oldMatId) newFace.materialId = oldMatId;
       }

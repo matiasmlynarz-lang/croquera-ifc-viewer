@@ -152,7 +152,6 @@ export class MaterialManager {
       }
     }
     if (!record) return materialId;
-    if (record.textureBlob) return record.id;
     const color = (record.baseColor || record.colorHex || '#f5f6f8').toUpperCase();
     const opacity = record.opacity !== undefined ? Math.round(record.opacity * 100) : 100;
     const roughness = record.roughness !== undefined ? Math.round(record.roughness * 100) : 70;
